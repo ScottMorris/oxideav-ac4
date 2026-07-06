@@ -39,11 +39,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
      since we don't need those rendering hints and the block's length is
      self-declared.
 
-  Still open: `audio_data_ajoc()` / `var_channel_element()` (the actual
-  per-frame object audio-data walk) and `oamd_dyndata_single()` (object
-  position/gain metadata) aren't wired up yet, so a real object-coded
-  frame still won't decode end-to-end — `parse_substream_group_info()`
-  still returns `Error::unsupported` for `b_channel_coded == false`.
+  Still open at the time: `audio_data_ajoc()` / `var_channel_element()`
+  (the actual per-frame object audio-data walk) and
+  `oamd_dyndata_single()` (object position/gain metadata) weren't wired
+  up yet, so a real object-coded frame still wouldn't decode end-to-end
+  — `parse_substream_group_info()` still returned `Error::unsupported`
+  for `b_channel_coded == false`.
+
+- ac4 round 391 — **`var_channel_element()`** (§6.2.4.4), the A-JOC
+  downmix signals' spectral frontend: reuses the existing
+  `parse_mono_data`/`parse_two_channel_data`/`parse_three_channel_data`
+  primitives from `mch.rs` for the mono/pair/odd-tail dispatch
+  (`n_dmx_signals` even → all pairs; odd + `n_dmx_signals == 1` → a
+  single `mono_data(0)`; odd otherwise → `n_pairs - 1` leading pairs
+  then a `var_coding_config`-selected two-plus-mono or three-channel
+  tail), plus the `aspx_config`/`companding_control` gates when
+  `var_codec_mode == ASPX`. Every field up to the A-SPX data trailer is
+  real, tested parsing (6 tests covering the even/odd/single/LFE
+  dispatch shapes and the aspx-mode gate) — the trailing
+  `aspx_data_2ch()`/`aspx_data_1ch()` elements are variable-length
+  Huffman data that `decoder.rs` currently only composes inline per
+  dispatch path rather than through one reusable function, so
+  `parse_var_channel_element` returns `Error::unsupported` at that exact
+  point rather than guessing. `audio_data_ajoc()` and
+  `oamd_dyndata_single()` are still open.
 
 - ac4 round 389 — **inter-frame (P-frame, `b_iframe = 0`) support
   end-to-end** (ETSI TS 103 190-1 §4.2.6.x Tables 25/33, §4.2.12.3/4

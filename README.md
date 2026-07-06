@@ -165,13 +165,21 @@ an S16 `AudioFrame`:
 
 - **Object-coded (A-JOC) substream decode end-to-end** — the substream
   descriptor layer (`ac4_substream_info_ajoc`, `bed_dyn_obj_assignment`,
-  `oamd_common_data`) and the A-JOC Huffman/matrix decode (`ajoc_huff_data`,
-  `differential_decode_*`, `ajoc_reconstruct`) are landed, but nothing
-  wires them to an actual per-frame walk yet: `audio_data_ajoc()` /
-  `var_channel_element()` (§6.2.3.4 / §6.2.4.4 — the downmix signals'
-  spectral-frontend decode) and `oamd_dyndata_single()` (§6.2.8.3 —
-  per-object gain/position metadata, including real 3D position fields)
-  aren't implemented, so `parse_substream_group_info()` still returns
+  `oamd_common_data`), the A-JOC Huffman/matrix decode (`ajoc_huff_data`,
+  `differential_decode_*`, `ajoc_reconstruct`), and now the downmix
+  signals' spectral frontend (`parse_var_channel_element`, §6.2.4.4 —
+  dispatches to the existing mono/two/three-channel ASF primitives by
+  signal count/parity, plus the `aspx_config`/`companding_control` gates)
+  are landed, but nothing wires them into an actual per-frame walk yet:
+  `parse_var_channel_element` itself stops at the A-SPX data trailer
+  (`aspx_data_2ch()`/`aspx_data_1ch()` — variable-length Huffman data
+  that `decoder.rs` only composes inline per dispatch path today, not
+  through one reusable function, so there's nothing to call yet) with
+  `Error::unsupported` rather than guessing, `audio_data_ajoc()` itself
+  (§6.2.3.4, the function that would call `var_channel_element` then
+  `ajoc()`) isn't implemented, and neither is `oamd_dyndata_single()`
+  (§6.2.8.3 — per-object gain/position metadata, including real 3D
+  position fields). `parse_substream_group_info()` still returns
   `Error::unsupported` the moment it sees `b_channel_coded == false`.
   Note that `oamd_dyndata_single`'s position metadata implies object-coded
   content may need actual spatial *rendering* (objects + 3D positions →

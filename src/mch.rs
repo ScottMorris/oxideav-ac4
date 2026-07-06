@@ -51,8 +51,9 @@
 //! parse the outer shells and leave the per-channel slot `None`.
 
 use oxideav_core::bits::BitReader;
-use oxideav_core::Result;
+use oxideav_core::{Error, Result};
 
+use crate::aspx::{parse_aspx_config, parse_companding_control, AspxConfig, CompandingControl};
 use crate::asf::{
     decode_asf_long_lfe_body_with_max_sfb_lfe, decode_asf_long_mono_body_with_max_sfb,
     parse_asf_psy_info, parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info,
@@ -1466,6 +1467,113 @@ pub fn parse_7x_audio_data_outer(
         }
     }
     Ok(())
+}
+
+// =====================================================================
+// §6.2.4.4 var_channel_element — A-JOC downmix spectral frontend
+// =====================================================================
+
+/// Parsed `var_channel_element()` (ETSI TS 103 190-2 §6.2.4.4) — the
+/// downmix-signal spectral frontend for an A-JOC object-coded substream.
+/// Reuses the same mono/two/three-channel ASF primitives as the
+/// channel-coded path (`parse_mono_data`, `parse_two_channel_data`,
+/// `parse_three_channel_data`).
+#[derive(Debug, Clone, Default)]
+pub struct VarChannelElement {
+    /// `var_codec_mode == ASPX`.
+    pub aspx_mode: bool,
+    /// Present only when `aspx_mode` and `b_iframe`.
+    pub aspx_config: Option<AspxConfig>,
+    /// Present only when `aspx_mode` and `n_dmx_signals <= 5`.
+    pub companding_control: Option<CompandingControl>,
+    /// `mono_data(1)` when `b_has_lfe`.
+    pub lfe: Option<MonoLfeData>,
+    /// The sole signal's `mono_data(0)` when `n_dmx_signals == 1` (the
+    /// only case with no pairs and no three-channel tail at all).
+    pub single_mono: Option<MonoLfeData>,
+    /// The `n_pairs` (or `n_pairs - 1` in the odd/two-channel-tail case)
+    /// leading `two_channel_data()` elements.
+    pub pairs: Vec<TwoChannelData>,
+    /// Odd-count tail when `var_coding_config == 0`: one more
+    /// `two_channel_data()` plus a trailing `mono_data(0)`.
+    pub odd_tail_two_and_mono: Option<(TwoChannelData, MonoLfeData)>,
+    /// Odd-count tail when `var_coding_config == 1`: one
+    /// `three_channel_data()` instead.
+    pub odd_tail_three: Option<ThreeChannelData>,
+}
+
+/// `var_channel_element(b_iframe, n_dmx_signals, b_has_lfe)` (§6.2.4.4).
+///
+/// `frame_len_base` is the same per-frame transform-length base the
+/// channel-coded path derives from `fs_index`/`frame_rate_index` and
+/// threads into `parse_asf_transform_info` throughout this module.
+///
+/// **Not yet complete:** when `aspx_mode` is set, the trailing
+/// `aspx_data_2ch()`/`aspx_data_1ch()` bandwidth-extension elements
+/// (variable-length, Huffman-coded — not skippable) aren't composed
+/// here yet. `decoder.rs` builds that exact element inline per dispatch
+/// path (`dispatch_5x_cfg*_simple_aspx` etc.) rather than through one
+/// reusable function, so wiring it in needs that composition factored
+/// out first. Every field up to that point is parsed for real; the
+/// function only errors once it actually reaches the unimplemented
+/// trailer, so the bitstream position of every preceding field is
+/// exercised and testable in isolation.
+pub fn parse_var_channel_element(
+    br: &mut BitReader<'_>,
+    b_iframe: bool,
+    n_dmx_signals: u32,
+    b_has_lfe: bool,
+    frame_len_base: u32,
+) -> Result<VarChannelElement> {
+    let mut out = VarChannelElement {
+        aspx_mode: br.read_bit()?,
+        ..Default::default()
+    };
+    let b_isodd = n_dmx_signals % 2 == 1;
+    let n_pairs = n_dmx_signals / 2;
+
+    if out.aspx_mode {
+        if b_iframe {
+            out.aspx_config = Some(parse_aspx_config(br)?);
+        }
+        if n_dmx_signals <= 5 {
+            out.companding_control = Some(parse_companding_control(br, n_dmx_signals)?);
+        }
+    }
+
+    if b_has_lfe {
+        out.lfe = Some(parse_mono_data(br, true, frame_len_base)?);
+    }
+
+    if b_isodd {
+        if n_dmx_signals == 1 {
+            out.single_mono = Some(parse_mono_data(br, false, frame_len_base)?);
+        } else {
+            for _ in 0..n_pairs.saturating_sub(1) {
+                out.pairs.push(parse_two_channel_data(br, frame_len_base)?);
+            }
+            let var_coding_config = br.read_bit()?;
+            if !var_coding_config {
+                let two = parse_two_channel_data(br, frame_len_base)?;
+                let mono = parse_mono_data(br, false, frame_len_base)?;
+                out.odd_tail_two_and_mono = Some((two, mono));
+            } else {
+                out.odd_tail_three = Some(parse_three_channel_data(br, frame_len_base)?);
+            }
+        }
+    } else {
+        for _ in 0..n_pairs {
+            out.pairs.push(parse_two_channel_data(br, frame_len_base)?);
+        }
+    }
+
+    if out.aspx_mode {
+        return Err(Error::unsupported(
+            "ac4: var_channel_element A-SPX data trailer (aspx_data_2ch/1ch) not yet composed",
+        ));
+    }
+
+    Ok(out)
 }
 
 // =====================================================================
@@ -3323,5 +3431,106 @@ mod tests {
         );
         assert!(tools.five_channel_data.is_none());
         assert!(tools.seven_x_additional_channel_data.is_none());
+    }
+
+    /// Generous zero-padding after the leading control bits — every
+    /// `mono_data`/`two_channel_data`/`three_channel_data` call's outer
+    /// shell (transform_info/psy_info/chparam) reads real required
+    /// fields, but their inner `sf_data` spectral body is try-and-bail
+    /// (leaves `scaled_spec` as `None` rather than erroring on garbage),
+    /// so this just needs to be long enough, not bit-exact.
+    fn padded_var_channel_bits(leading: &[u8]) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        for &b in leading {
+            bw.write_bit(b != 0);
+        }
+        for _ in 0..2000 {
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        bw.finish()
+    }
+
+    #[test]
+    fn var_channel_element_even_pairs_no_lfe() {
+        // aspx_mode = 0, n_dmx_signals = 4 (even) -> 2 pairs, no LFE.
+        let bytes = padded_var_channel_bits(&[0]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 4, false, 1920).unwrap();
+        assert!(!out.aspx_mode);
+        assert!(out.lfe.is_none());
+        assert!(out.single_mono.is_none());
+        assert_eq!(out.pairs.len(), 2);
+        assert!(out.odd_tail_two_and_mono.is_none());
+        assert!(out.odd_tail_three.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_single_signal_is_mono_only() {
+        // n_dmx_signals = 1 -> single_mono, nothing else.
+        let bytes = padded_var_channel_bits(&[0]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 1, false, 1920).unwrap();
+        assert!(out.single_mono.is_some());
+        assert!(out.pairs.is_empty());
+        assert!(out.odd_tail_two_and_mono.is_none());
+        assert!(out.odd_tail_three.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_odd_var_coding_config_0_gives_two_and_mono_tail() {
+        // n_dmx_signals = 3 (odd, n_pairs = 1): 0 leading pairs, then
+        // var_coding_config = 0 -> two_channel_data + mono_data tail.
+        let bytes = padded_var_channel_bits(&[0, 0]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 3, false, 1920).unwrap();
+        assert!(out.pairs.is_empty());
+        assert!(out.odd_tail_two_and_mono.is_some());
+        assert!(out.odd_tail_three.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_odd_var_coding_config_1_gives_three_channel_tail() {
+        // Same shape, but var_coding_config = 1 -> three_channel_data tail.
+        let bytes = padded_var_channel_bits(&[0, 1]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 3, false, 1920).unwrap();
+        assert!(out.pairs.is_empty());
+        assert!(out.odd_tail_two_and_mono.is_none());
+        assert!(out.odd_tail_three.is_some());
+    }
+
+    #[test]
+    fn var_channel_element_with_lfe_parses_lfe_first() {
+        // n_dmx_signals = 2 (even), b_has_lfe = true -> lfe then 1 pair.
+        // The LFE's own mono_data(1) call requires b_long_frame = 1
+        // (asf_psy_info_lfe rejects short transforms for LFE), so that
+        // bit can't be part of the generic zero padding.
+        let bytes = padded_var_channel_bits(&[0, 1]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 2, true, 1920).unwrap();
+        assert!(out.lfe.is_some());
+        assert_eq!(out.pairs.len(), 1);
+    }
+
+    #[test]
+    fn var_channel_element_aspx_mode_errors_at_unimplemented_trailer() {
+        // aspx_mode = 1, n_dmx_signals = 2, b_iframe = false so no
+        // aspx_config read, and n_dmx_signals <= 5 so companding_control
+        // is read. Everything up to the trailer should parse; the
+        // function should error only once it reaches the not-yet-landed
+        // aspx_data trailer, not before.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // aspx_mode = 1
+        bw.write_bit(true); // companding_control: sync_flag = true (num_chan=2 > 1)
+        bw.write_bit(true); // b_compand_on[0] = true (sync -> single flag, all on)
+        for _ in 0..2000 {
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let err = parse_var_channel_element(&mut br, false, 2, false, 1920).unwrap_err();
+        assert!(err.to_string().contains("aspx_data"));
     }
 }
