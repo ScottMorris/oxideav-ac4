@@ -56,8 +56,9 @@ use oxideav_core::{Error, Result};
 use crate::aspx::{parse_aspx_config, parse_companding_control, AspxConfig, CompandingControl};
 use crate::asf::{
     decode_asf_long_lfe_body_with_max_sfb_lfe, decode_asf_long_mono_body_with_max_sfb,
-    parse_asf_psy_info, parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info,
-    AsfPsyInfo, AsfTransformInfo, ChparamInfo, SubstreamTools,
+    parse_aspx_data_1ch_body, parse_aspx_data_2ch_body, parse_asf_psy_info,
+    parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info, AsfPsyInfo,
+    AsfTransformInfo, ChparamInfo, SubstreamTools,
 };
 use crate::tables;
 
@@ -1500,6 +1501,12 @@ pub struct VarChannelElement {
     /// Odd-count tail when `var_coding_config == 1`: one
     /// `three_channel_data()` instead.
     pub odd_tail_three: Option<ThreeChannelData>,
+    /// `n_pairs` `aspx_data_2ch()` trailers (present iff `aspx_mode`) —
+    /// note this loop always runs `n_pairs` times regardless of parity,
+    /// independent of how the core data above grouped channels.
+    pub aspx_pair_trailers: Vec<SubstreamTools>,
+    /// The trailing `aspx_data_1ch()` when `aspx_mode && b_isodd`.
+    pub aspx_single_trailer: Option<SubstreamTools>,
 }
 
 /// `var_channel_element(b_iframe, n_dmx_signals, b_has_lfe)` (§6.2.4.4).
@@ -1508,16 +1515,22 @@ pub struct VarChannelElement {
 /// channel-coded path derives from `fs_index`/`frame_rate_index` and
 /// threads into `parse_asf_transform_info` throughout this module.
 ///
-/// **Not yet complete:** when `aspx_mode` is set, the trailing
-/// `aspx_data_2ch()`/`aspx_data_1ch()` bandwidth-extension elements
-/// (variable-length, Huffman-coded — not skippable) aren't composed
-/// here yet. `decoder.rs` builds that exact element inline per dispatch
-/// path (`dispatch_5x_cfg*_simple_aspx` etc.) rather than through one
-/// reusable function, so wiring it in needs that composition factored
-/// out first. Every field up to that point is parsed for real; the
-/// function only errors once it actually reaches the unimplemented
-/// trailer, so the bitstream position of every preceding field is
-/// exercised and testable in isolation.
+/// The trailing `aspx_data_2ch()`/`aspx_data_1ch()` bandwidth-extension
+/// elements (when `aspx_mode`) reuse `asf::parse_aspx_data_2ch_body` /
+/// `asf::parse_aspx_data_1ch_body` — the same production parsers the
+/// channel-coded path's `walk_ac4_substream_sticky` calls — each fed a
+/// fresh [`SubstreamTools`] rather than the caller's shared one, since
+/// this loop can run more than once (`n_pairs` times, always — that
+/// count is independent of how the core data above grouped channels
+/// into pairs/mono/three-channel elements) and those functions' fields
+/// hold one call's result at a time.
+///
+/// **Known limitation:** on a non-I-frame (`!b_iframe`), `aspx_config()`
+/// is never read (per spec, it's only present on I-frames) and the
+/// channel-coded path's answer — a per-substream "sticky" config
+/// carried across frames — isn't threaded into this AJOC downmix path
+/// yet. That case returns `Error::unsupported` rather than guessing;
+/// every I-frame call is real, tested parsing.
 pub fn parse_var_channel_element(
     br: &mut BitReader<'_>,
     b_iframe: bool,
@@ -1568,9 +1581,22 @@ pub fn parse_var_channel_element(
     }
 
     if out.aspx_mode {
-        return Err(Error::unsupported(
-            "ac4: var_channel_element A-SPX data trailer (aspx_data_2ch/1ch) not yet composed",
-        ));
+        let cfg = out.aspx_config.clone().ok_or_else(|| {
+            Error::unsupported(
+                "ac4: var_channel_element non-I-frame A-SPX trailer needs a sticky aspx_config, \
+                 not yet threaded through for the A-JOC downmix path",
+            )
+        })?;
+        for _ in 0..n_pairs {
+            let mut tools = SubstreamTools::default();
+            parse_aspx_data_2ch_body(br, &mut tools, &cfg, b_iframe, frame_len_base)?;
+            out.aspx_pair_trailers.push(tools);
+        }
+        if b_isodd {
+            let mut tools = SubstreamTools::default();
+            parse_aspx_data_1ch_body(br, &mut tools, &cfg, b_iframe, frame_len_base)?;
+            out.aspx_single_trailer = Some(tools);
+        }
     }
 
     Ok(out)
@@ -3514,12 +3540,12 @@ mod tests {
     }
 
     #[test]
-    fn var_channel_element_aspx_mode_errors_at_unimplemented_trailer() {
-        // aspx_mode = 1, n_dmx_signals = 2, b_iframe = false so no
-        // aspx_config read, and n_dmx_signals <= 5 so companding_control
-        // is read. Everything up to the trailer should parse; the
-        // function should error only once it reaches the not-yet-landed
-        // aspx_data trailer, not before.
+    fn var_channel_element_aspx_non_iframe_errors_on_missing_sticky_config() {
+        // aspx_mode = 1, n_dmx_signals = 2, b_iframe = false: aspx_config()
+        // is never read (only present on I-frames per spec), and this
+        // path doesn't yet thread a sticky config through for the AJOC
+        // downmix case, so it should report that specific limitation
+        // rather than guess.
         let mut bw = BitWriter::new();
         bw.write_bit(true); // aspx_mode = 1
         bw.write_bit(true); // companding_control: sync_flag = true (num_chan=2 > 1)
@@ -3531,6 +3557,85 @@ mod tests {
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
         let err = parse_var_channel_element(&mut br, false, 2, false, 1920).unwrap_err();
-        assert!(err.to_string().contains("aspx_data"));
+        assert!(err.to_string().contains("sticky aspx_config"));
+    }
+
+    fn minimal_test_aspx_cfg() -> crate::aspx::AspxConfig {
+        crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        }
+    }
+
+    #[test]
+    fn var_channel_element_aspx_iframe_real_trailer_roundtrips() {
+        // n_dmx_signals = 2 (even, aspx_mode = 1, b_iframe = true):
+        // aspx_config, then companding_control (n_dmx_signals <= 5),
+        // then the core two_channel_data pair (padded — try-and-bail),
+        // then exactly one real aspx_data_2ch() trailer (n_pairs = 1)
+        // built with the crate's own minimal encoder helper and parsed
+        // back through the same production parser the channel-coded
+        // path uses.
+        let cfg = minimal_test_aspx_cfg();
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // aspx_mode = 1
+        crate::encoder_acpl3::write_aspx_config(&mut bw, &cfg);
+        bw.write_bit(true); // companding_control: sync_flag = true
+        bw.write_bit(true); // b_compand_on[0] = true
+                            // Core two_channel_data pair: enough zero padding for its
+                            // outer shell; the inner sf_data is try-and-bail.
+        for _ in 0..200 {
+            bw.write_bit(false);
+        }
+        crate::encoder_acpl3::write_aspx_data_2ch_minimal(&mut bw, &cfg).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let out = parse_var_channel_element(&mut br, true, 2, false, 1920).unwrap();
+        assert!(out.aspx_mode);
+        assert!(out.aspx_config.is_some());
+        assert!(out.companding_control.is_some());
+        assert_eq!(out.pairs.len(), 1);
+        assert_eq!(out.aspx_pair_trailers.len(), 1);
+        assert!(out.aspx_single_trailer.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_aspx_iframe_odd_gets_pair_plus_single_trailer() {
+        // n_dmx_signals = 3 (odd, n_pairs = 1): the ASPX trailer loop
+        // still runs n_pairs = 1 times regardless of parity, plus one
+        // more aspx_data_1ch() because b_isodd — independent of how the
+        // core data above split into a two+mono or three-channel tail.
+        let cfg = minimal_test_aspx_cfg();
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // aspx_mode = 1
+        crate::encoder_acpl3::write_aspx_config(&mut bw, &cfg);
+        bw.write_bit(true); // companding_control: sync_flag = true (num_chan=3)
+        bw.write_bit(true); // b_compand_on[0] = true (sync -> single flag)
+                            // Core: n_pairs - 1 = 0 leading pairs, then var_coding_config
+                            // = 0 -> two_channel_data + mono_data(0), padded.
+        bw.write_bit(false); // var_coding_config = 0
+        for _ in 0..200 {
+            bw.write_bit(false);
+        }
+        crate::encoder_acpl3::write_aspx_data_2ch_minimal(&mut bw, &cfg).unwrap();
+        crate::encoder_acpl3::write_aspx_data_1ch_minimal(&mut bw, &cfg).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let out = parse_var_channel_element(&mut br, true, 3, false, 1920).unwrap();
+        assert!(out.odd_tail_two_and_mono.is_some());
+        assert_eq!(out.aspx_pair_trailers.len(), 1);
+        assert!(out.aspx_single_trailer.is_some());
     }
 }

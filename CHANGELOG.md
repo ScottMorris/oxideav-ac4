@@ -47,21 +47,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for `b_channel_coded == false`.
 
 - ac4 round 391 — **`var_channel_element()`** (§6.2.4.4), the A-JOC
-  downmix signals' spectral frontend: reuses the existing
+  downmix signals' spectral frontend — **complete for I-frames**,
+  including the A-SPX bandwidth-extension trailer: reuses the existing
   `parse_mono_data`/`parse_two_channel_data`/`parse_three_channel_data`
   primitives from `mch.rs` for the mono/pair/odd-tail dispatch
   (`n_dmx_signals` even → all pairs; odd + `n_dmx_signals == 1` → a
   single `mono_data(0)`; odd otherwise → `n_pairs - 1` leading pairs
   then a `var_coding_config`-selected two-plus-mono or three-channel
-  tail), plus the `aspx_config`/`companding_control` gates when
-  `var_codec_mode == ASPX`. Every field up to the A-SPX data trailer is
-  real, tested parsing (6 tests covering the even/odd/single/LFE
-  dispatch shapes and the aspx-mode gate) — the trailing
-  `aspx_data_2ch()`/`aspx_data_1ch()` elements are variable-length
-  Huffman data that `decoder.rs` currently only composes inline per
-  dispatch path rather than through one reusable function, so
-  `parse_var_channel_element` returns `Error::unsupported` at that exact
-  point rather than guessing. `audio_data_ajoc()` and
+  tail), the `aspx_config`/`companding_control` gates when
+  `var_codec_mode == ASPX`, and — initially assumed missing, but found
+  on closer reading of `asf.rs` rather than only `decoder.rs` — the
+  trailing `aspx_data_2ch()`/`aspx_data_1ch()` elements themselves via
+  the crate's own production parsers `asf::parse_aspx_data_2ch_body` /
+  `asf::parse_aspx_data_1ch_body` (the same functions
+  `walk_ac4_substream_sticky` calls for the channel-coded path), fed a
+  fresh `SubstreamTools` per call since the trailer loop always runs
+  `n_pairs` times regardless of parity (independent of how the core
+  data grouped channels). Two new tests build a real trailer with the
+  crate's own minimal encoder helpers (`encoder_acpl3::write_aspx_data_2ch_minimal`
+  / `_1ch_minimal`, widened to `pub(crate)`) and decode it back through
+  the same parser, for both the even-pairs and odd-pair-plus-single
+  shapes — 8 tests total. **Known limitation:** non-I-frames don't read
+  `aspx_config()` at all (spec-correct — it's I-frame-only) and this
+  path doesn't yet thread a sticky config across frames the way the
+  channel-coded path's `StickyConfig` does, so that case returns
+  `Error::unsupported` rather than guessing. `audio_data_ajoc()` and
   `oamd_dyndata_single()` are still open.
 
 - ac4 round 389 — **inter-frame (P-frame, `b_iframe = 0`) support

@@ -722,7 +722,7 @@ fn write_stereo_split_data(
 /// The frequency-table derivation runs the existing
 /// [`aspx::derive_aspx_frequency_tables`] internally so the emitted bit
 /// counts line up with whatever the decoder rederives.
-fn write_aspx_data_2ch_minimal(
+pub(crate) fn write_aspx_data_2ch_minimal(
     bw: &mut BitWriter,
     cfg: &aspx::AspxConfig,
 ) -> Result<(), &'static str> {
@@ -3505,7 +3505,7 @@ pub fn write_aspx_hfgen_iwc_2ch(
 /// `aspx_freq_res[0]` bit, so the parser's `freq_res` vector is empty
 /// and the SIGNAL ec_data falls back to the **high-res** subband count.
 /// We therefore drive the writer with `num_sbg_sig_highres`.
-fn write_aspx_data_1ch_minimal(
+pub(crate) fn write_aspx_data_1ch_minimal(
     bw: &mut BitWriter,
     cfg: &aspx::AspxConfig,
 ) -> Result<(), &'static str> {
