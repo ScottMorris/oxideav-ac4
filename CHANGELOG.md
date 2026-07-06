@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Grouped/short-frame `sf_data(ASF)` decode never handled multi-window
+  groups, and never IMDCT'd the result** — the two biggest remaining
+  real-content gaps, fixed together.
+
+  First, a genuine bitstream-correctness bug: real content overwhelmingly
+  uses actual scale-factor *grouping* (multiple physical transform
+  windows sharing one group's side info — `num_windows=8,
+  num_window_groups=4` shows up constantly), not the degenerate
+  "every window is its own group" case. Per §4.3.6.2.6 Pseudocode 4, a
+  group with `num_win_in_group[g]` windows carries
+  `num_win_in_group[g]` times as much `asf_section_data()` /
+  `asf_spectral_data()` payload as a single-window group
+  (`sect_sfb_offset[g][sfb] = group_offset + sfb_offset[sfb] *
+  num_win_in_group[g]`). `mch.rs`'s grouped-body decoder didn't widen
+  anything — it treated every group as exactly one window wide, *and*
+  called the single-group `asf_scalefac_data`/`asf_snf_data` parsers
+  inside its own per-group loop, re-reading the shared
+  `reference_scale_factor`(8)/`b_snf_data_exists`(1) header fields once
+  per group instead of once for the whole body (Tables 41/42 read
+  these once, then loop). Any real group wider than one window
+  desynced the bitreader from that point on.
+
+  Fixed by deriving `num_win_in_group[g]` (§4.3.6.2.6 Pseudocode 3/4,
+  now exposed from `asf::derive_per_group_with_max_sfb`), widening the
+  `sfb_offset` table passed to the Huffman decode by that factor per
+  group, and routing through the existing `_grouped` wrapper functions
+  (which already read the shared header fields correctly). The
+  widened, band-major/window-minor per-group spectrum is then
+  de-interleaved back into individual per-window spectra via the
+  dedicated §5.1.5 "spectral ungrouping tool" (Pseudocode 25) — new
+  `mch::decode_asf_grouped_body_windows`, replacing the old
+  `decode_asf_grouped_mono_body_with_max_sfb`.
+
+  Second, decoder.rs never IMDCT'd any of this even when it *was*
+  correctly decoded: every main-channel dispatch function
+  (`dispatch_5x_cfg0/1/2/3_simple_aspx`) guards on
+  `transform_length_0 == samples` and only ever exercised the
+  single-long-frame-spectrum path — short/grouped bodies always
+  no-op'd there regardless of how correctly they parsed. Added a
+  generic `imdct_grouped_channel_f32` (mirrors `run_ssf_channel`'s
+  per-block accumulation: IMDCT each window in turn, sharing the
+  channel's overlap-add state, concatenating into the full frame) and
+  wired it as a fallback in all four `Cfg0`/`Cfg1`/`Cfg2`/`Cfg3`
+  branches, using each config's existing Table 180 channel-to-slot
+  mapping.
+
+  `TwoChannelData`/`ThreeChannelData`/`FourChannelData`/
+  `FiveChannelData`/`MonoLfeData` each gained a parallel
+  `scaled_spec_windows(_per_channel)` field for the grouped case,
+  leaving the existing long-frame-only `scaled_spec(_per_channel)`
+  field's contract unchanged (still `None` for grouped bodies — it was
+  never correct for them anyway, and every consumer already gated on
+  `b_long_frame`).
+
+  Verified against real content: slot-0 (L) nonzero-PCM rate rose from
+  31.2% to **60.2%**, and main-soundstage (any of slots 0..4) activity
+  rose to **88.5%** of all 1571 real frames tested — up from a
+  situation where 100% of short/grouped-frame bodies were silent
+  regardless of `coding_config`. The remaining ~11.5% silent frames no
+  longer cluster on any single `coding_config` or on grouped-vs-long-frame
+  — consistent with a mix of genuine quiet passages and smaller,
+  not-yet-isolated residual edge cases rather than one dominant bug.
+
 - **7_X SIMPLE/ASPX main-channel (slots 0..4) dispatch only wired
   `Cfg3Five`** — `Cfg0Stereo2plusMono`/`Cfg1ThreeStereo`/`Cfg2FourMono`
   were parsed correctly (real, non-silent spectral data landed in

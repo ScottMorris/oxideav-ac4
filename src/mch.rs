@@ -145,6 +145,12 @@ pub struct MonoLfeData {
     /// is reserved for a future round), for SSF-frontend mono channels,
     /// or for any short / grouped / Huffman-error case.
     pub scaled_spec: Option<Vec<f32>>,
+    /// Per-window de-grouped spectra (§5.1.5 ungrouping already
+    /// applied) for the non-LFE, ASF-frontend, short/grouped
+    /// (`num_window_groups > 1`) case — see [`WindowSpectrum`]. `None`
+    /// whenever `scaled_spec` would be populated instead (long-frame),
+    /// or for LFE / SSF-frontend / Huffman-error cases.
+    pub scaled_spec_windows: Option<Vec<WindowSpectrum>>,
 }
 
 /// Parsed `three_channel_info()` per Table 30: 4-bit `chel_matsel` +
@@ -196,8 +202,14 @@ pub struct TwoChannelData {
     pub chparam: Option<ChparamInfo>,
     /// Per-channel scaled MDCT spectra. Length = 2 once the body has
     /// been walked. Each entry's `Vec<f32>` is `sfb_offset[max_sfb]`
-    /// long.
+    /// long. Only populated for the long-frame, single-window-group
+    /// case — see `scaled_spec_windows_per_channel` for grouped bodies.
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra (§5.1.5 ungrouping
+    /// applied) for the short/grouped (`num_window_groups > 1`) case.
+    /// `None` per channel whenever `scaled_spec_per_channel` would be
+    /// populated instead.
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 /// Parsed `three_channel_data()` outer shell + per-channel sf_data
@@ -214,6 +226,8 @@ pub struct ThreeChannelData {
     pub info: Option<ThreeChannelInfo>,
     /// Per-channel scaled MDCT spectra (length 3). See [`TwoChannelData`].
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra. See [`TwoChannelData`].
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 /// Parsed `four_channel_data()` outer shell + per-channel sf_data
@@ -226,6 +240,8 @@ pub struct FourChannelData {
     pub info: Option<FourChannelInfo>,
     /// Per-channel scaled MDCT spectra (length 4). See [`TwoChannelData`].
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra. See [`TwoChannelData`].
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 /// Parsed `five_channel_data()` outer shell + per-channel sf_data
@@ -238,6 +254,8 @@ pub struct FiveChannelData {
     pub info: Option<FiveChannelInfo>,
     /// Per-channel scaled MDCT spectra (length 5). See [`TwoChannelData`].
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra. See [`TwoChannelData`].
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 // =====================================================================
@@ -324,13 +342,10 @@ pub fn parse_mono_data(
                 out.scaled_spec = Some(scaled);
             }
         } else if psy.num_window_groups > 0 {
-            if let Some(scaled) = decode_asf_grouped_mono_body_with_max_sfb(
-                br,
-                &ti,
-                psy.max_sfb_0,
-                psy.num_window_groups,
-            ) {
-                out.scaled_spec = Some(scaled);
+            if let Some(windows) =
+                decode_asf_grouped_body_windows(br, &ti, &psy, psy.max_sfb_0)
+            {
+                out.scaled_spec_windows = Some(windows);
             }
         }
     } else if b_lfe {
@@ -361,12 +376,13 @@ pub fn parse_two_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let chparam = parse_chparam_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
     Ok(TwoChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         chparam: Some(chparam),
         scaled_spec_per_channel: scaled,
+        scaled_spec_windows_per_channel: scaled_windows,
     })
 }
 
@@ -429,12 +445,13 @@ pub fn parse_three_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let info = parse_three_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 3);
+    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 3);
     Ok(ThreeChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
         scaled_spec_per_channel: scaled,
+        scaled_spec_windows_per_channel: scaled_windows,
     })
 }
 
@@ -447,12 +464,13 @@ pub fn parse_four_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let info = parse_four_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 4);
+    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 4);
     Ok(FourChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
         scaled_spec_per_channel: scaled,
+        scaled_spec_windows_per_channel: scaled_windows,
     })
 }
 
@@ -465,12 +483,13 @@ pub fn parse_five_channel_data(
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let max_sfb_g = psy.max_sfb_0;
     let info = parse_five_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 5);
+    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 5);
     Ok(FiveChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
         scaled_spec_per_channel: scaled,
+        scaled_spec_windows_per_channel: scaled_windows,
     })
 }
 
@@ -505,12 +524,19 @@ pub fn parse_five_channel_data(
 /// group; per-group `max_sfb` selection (Pseudocode 5
 /// `get_max_sfb(g)`) collapses to that single value for the
 /// non-side-channel multichannel path.
+/// A single physical window's decoded, de-grouped spectrum:
+/// `(transform_length, spectrum)`. `spectrum.len() ==
+/// sfb_offset_48(transform_length)[max_sfb]` — the same width a
+/// long-frame single-window channel would produce, ready for a
+/// straight per-window IMDCT.
+pub(crate) type WindowSpectrum = (u32, Vec<f32>);
+
 pub(crate) fn decode_mch_sf_data_channels(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
     psy: &AsfPsyInfo,
     n_channels: usize,
-) -> Vec<Option<Vec<f32>>> {
+) -> (Vec<Option<Vec<f32>>>, Vec<Option<Vec<WindowSpectrum>>>) {
     let mut out = vec![None; n_channels];
     if ti.b_long_frame && psy.num_window_groups == 1 {
         // Long-frame, 1 window group — walk one body chain per channel.
@@ -520,65 +546,151 @@ pub(crate) fn decode_mch_sf_data_channels(
                 None => break,
             }
         }
-        return out;
+        return (out, vec![None; n_channels]);
     }
     if psy.num_window_groups == 0 {
-        return out;
+        return (out, vec![None; n_channels]);
     }
-    // Short / grouped frame walker.
-    for slot in out.iter_mut() {
-        match decode_asf_grouped_mono_body_with_max_sfb(
-            br,
-            ti,
-            psy.max_sfb_0,
-            psy.num_window_groups,
-        ) {
+    // Short / grouped frame walker: per-channel, per-window spectra
+    // (widened Huffman decode + §5.1.5 ungrouping — see
+    // `decode_asf_grouped_body_windows`). The old flat, group-major
+    // `Vec<f32>` output stays `None` here — it was never correct for
+    // real grouped content (see that function's docs) and every
+    // consumer already gates on `ti.b_long_frame` before touching it.
+    let mut windows_out: Vec<Option<Vec<WindowSpectrum>>> = vec![None; n_channels];
+    for slot in windows_out.iter_mut() {
+        match decode_asf_grouped_body_windows(br, ti, psy, psy.max_sfb_0) {
             Some(v) => *slot = Some(v),
             None => break,
         }
     }
-    out
+    (out, windows_out)
 }
 
-/// Walk one `sf_data(ASF)` body for the grouped / short-frame case
-/// where `num_window_groups > 1`. Per spec §4.2.8 (Tables 39-42) and
-/// §5.4.4.4 the body fires `num_window_groups` independent
-/// `(section + spectral + scalefac + snf)` cycles back-to-back; the
-/// per-group spectrum is `sfb_offset[max_sfb]` long at the per-window
-/// transform length. The returned vector concatenates the
-/// `num_window_groups` per-group spectra (group-major).
+/// Decode one channel's grouped/short-frame `sf_data(ASF)` body —
+/// `num_window_groups > 1` — including the §5.1.5 Pseudocode 25
+/// spectral-ungrouping step, and return one `(transform_length,
+/// spectrum)` pair per **physical window** (not per group), in window
+/// order, ready for individual per-window IMDCT.
+///
+/// This replaces an earlier implementation that treated every group as
+/// exactly one window wide and re-read the shared
+/// `reference_scale_factor(8)` / `b_snf_data_exists(1)` header fields
+/// once *per group* instead of once for the whole body. Real content
+/// commonly packs more than one window into a single group (e.g.
+/// `num_windows=8, num_window_groups=4` shows up constantly) —
+/// §4.3.6.2.6 Pseudocode 4 requires widening each group's
+/// `asf_section_data()` / `asf_spectral_data()` payload by
+/// `num_win_in_group[g]` (`sect_sfb_offset[g][sfb] = group_offset +
+/// sfb_offset[sfb] * num_win_in_group[g]`), so decoding with the
+/// unwidened table desyncs the bitreader position the moment any real
+/// group has more than one window. Fixed by widening the `sfb_offset`
+/// table passed to the Huffman decode by `num_win_in_group[g]`, then
+/// applying §5.1.5 Pseudocode 25 to de-interleave each group's widened
+/// (band-major, window-minor) spectrum back into individual per-window
+/// spectra.
 ///
 /// Returns `None` on the first Huffman / bit-stream miss; partial
 /// per-group output is dropped because the bitreader position is
 /// indeterminate after a mid-body miss.
-fn decode_asf_grouped_mono_body_with_max_sfb(
+pub(crate) fn decode_asf_grouped_body_windows(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
     max_sfb_in: u32,
-    num_window_groups: u32,
-) -> Option<Vec<f32>> {
-    let tl = ti.transform_length_0;
-    let tl_idx = ti.transf_length[0];
-    let max_sfb_cap = crate::tables::num_sfb_48(tl)?;
-    let max_sfb = max_sfb_in.min(max_sfb_cap);
-    if max_sfb == 0 {
+) -> Option<Vec<WindowSpectrum>> {
+    if psy.num_window_groups <= 1 {
         return None;
     }
-    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
-    let per_group_len = sfbo[max_sfb as usize] as usize;
-    let total_len = per_group_len.checked_mul(num_window_groups as usize)?;
-    let mut out = Vec::with_capacity(total_len);
-    for _g in 0..num_window_groups {
-        let sections = crate::asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
-        let (qspec, mqi) =
-            crate::asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
-        let sf_gain =
-            crate::asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-        let _snf = crate::asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-        let scaled = crate::asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
-        out.extend_from_slice(&scaled);
+    let (tl_idx_per_g, tl_per_g, max_sfb_per_g, num_win_in_group_per_g) =
+        crate::asf::derive_per_group_with_max_sfb(ti, psy, max_sfb_in, max_sfb_in);
+    let n = tl_per_g.len();
+    let mut base_sfbo_per_g: Vec<&'static [u16]> = Vec::with_capacity(n);
+    let mut widened_sfbo_per_g: Vec<Vec<u16>> = Vec::with_capacity(n);
+    let mut max_sfb_capped: Vec<u32> = Vec::with_capacity(n);
+    for g in 0..n {
+        let tl = tl_per_g[g];
+        let cap = crate::tables::num_sfb_48(tl)?;
+        let m = max_sfb_per_g[g].min(cap);
+        if m == 0 {
+            return None;
+        }
+        let base = crate::sfb_offset::sfb_offset_48(tl)?;
+        let nwig = num_win_in_group_per_g[g].max(1);
+        let widened: Vec<u16> = base
+            .iter()
+            .map(|&x| x.saturating_mul(nwig as u16))
+            .collect();
+        max_sfb_capped.push(m);
+        base_sfbo_per_g.push(base);
+        widened_sfbo_per_g.push(widened);
     }
-    Some(out)
+    let widened_refs: Vec<&[u16]> = widened_sfbo_per_g.iter().map(|v| v.as_slice()).collect();
+
+    let sections = crate::asf_data::parse_asf_section_data_grouped(
+        br,
+        &tl_idx_per_g,
+        &tl_per_g,
+        &max_sfb_capped,
+    )
+    .ok()?;
+    let (qspec_per_g, mqi_per_g) = crate::asf_data::parse_asf_spectral_data_grouped(
+        br,
+        &sections,
+        &widened_refs,
+        &max_sfb_capped,
+    )
+    .ok()?;
+    let sf_gain_per_g = crate::asf_data::parse_asf_scalefac_data_grouped(
+        br,
+        &sections,
+        &mqi_per_g,
+        &max_sfb_capped,
+        &tl_per_g,
+    )
+    .ok()?;
+    let _snf = crate::asf_data::parse_asf_snf_data_grouped(
+        br,
+        &sections,
+        &mqi_per_g,
+        &max_sfb_capped,
+        &tl_per_g,
+    )
+    .ok()?;
+
+    // §5.1.5 Pseudocode 25: for each group, walk band-major then
+    // window-minor through the widened (dequantised + scaled) spectrum,
+    // de-interleaving it into `num_win_in_group[g]` per-window vectors
+    // each `base_sfbo[max_sfb]` long.
+    let mut windows: Vec<WindowSpectrum> = Vec::new();
+    for g in 0..n {
+        let widened_scaled = crate::asf_data::dequantise_and_scale(
+            &qspec_per_g[g],
+            &sf_gain_per_g[g],
+            widened_refs[g],
+            max_sfb_capped[g],
+        );
+        let win_width = base_sfbo_per_g[g][max_sfb_capped[g] as usize] as usize;
+        let nwig = num_win_in_group_per_g[g].max(1) as usize;
+        let mut k = 0usize;
+        let mut per_window: Vec<Vec<f32>> = vec![vec![0.0f32; win_width]; nwig];
+        for sfb in 0..max_sfb_capped[g] as usize {
+            let band_start = base_sfbo_per_g[g][sfb] as usize;
+            let band_end = base_sfbo_per_g[g][sfb + 1] as usize;
+            for pw in per_window.iter_mut() {
+                for l in band_start..band_end {
+                    if k < widened_scaled.len() && l < win_width {
+                        pw[l] = widened_scaled[k];
+                    }
+                    k += 1;
+                }
+            }
+        }
+        for pw in per_window {
+            windows.push((tl_per_g[g], pw));
+        }
+    }
+    Some(windows)
 }
 
 // =====================================================================
@@ -1674,6 +1786,40 @@ mod tests {
         bw.write_bit(false);
     }
 
+    /// Write a whole grouped `sf_data(ASF)` body (§4.2.8, Tables 39-42)
+    /// for one channel spanning `num_groups` window groups, all-zero
+    /// (`sect_cb == 0` for every band in every group). Unlike calling
+    /// [`write_zero_sf_data_body`] `num_groups` times — which duplicates
+    /// a full `reference_scale_factor`(8) + `b_snf_data_exists`(1)
+    /// header per group, matching the *old*, incorrect per-group-header
+    /// assumption — this writes the section data once per group but the
+    /// `reference_scale_factor` / `b_snf_data_exists` header only once
+    /// for the whole body, per Tables 41/42's real syntax.
+    fn write_zero_sf_data_body_grouped(
+        bw: &mut BitWriter,
+        max_sfb: u32,
+        transf_length_idx: u32,
+        num_groups: u32,
+    ) {
+        let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
+            (3, 7)
+        } else {
+            (5, 31)
+        };
+        for _ in 0..num_groups {
+            bw.write_u32(0, 4); // sect_cb = 0
+            let mut remaining = max_sfb.saturating_sub(1);
+            while remaining >= sect_esc_val {
+                bw.write_u32(sect_esc_val, n_sect_bits);
+                remaining -= sect_esc_val;
+            }
+            bw.write_u32(remaining, n_sect_bits);
+        }
+        // asf_spectral_data: nothing (cb=0 in every group).
+        bw.write_u32(120, 8); // reference_scale_factor, once.
+        bw.write_bit(false); // b_snf_data_exists, once.
+    }
+
     #[test]
     fn five_x_codec_mode_round_trip() {
         assert_eq!(FiveXCodecMode::from_u32(0), FiveXCodecMode::Simple);
@@ -2232,7 +2378,7 @@ mod tests {
             num_window_groups: 1,
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
+        let (out, _windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
         assert_eq!(out.len(), 2);
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
         let expected_len = sfbo[8] as usize;
@@ -2265,9 +2411,9 @@ mod tests {
             num_window_groups: 2,
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 5);
-        assert_eq!(out.len(), 5);
-        assert!(out.iter().all(|c| c.is_none()));
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 5);
+        assert_eq!(windows.len(), 5);
+        assert!(windows.iter().all(|c| c.is_none()));
     }
 
     /// `parse_three_channel_data` populates all three
@@ -2429,12 +2575,10 @@ mod tests {
         let max_sfb = 8u32;
         let tl_idx = 2u32; // matches transf_length=2 (tl=480 short-frame).
         let mut bw = BitWriter::new();
-        // Channel 0: two grouped bodies.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        // Channel 1: two grouped bodies.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        // Channel 0: one grouped body spanning both window groups.
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, tl_idx, 2);
+        // Channel 1: ditto.
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, tl_idx, 2);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2451,15 +2595,18 @@ mod tests {
             scale_factor_grouping: vec![0],
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
-        assert_eq!(out.len(), 2);
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
+        assert_eq!(windows.len(), 2);
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let per_group_len = sfbo[max_sfb as usize] as usize;
-        let expected_total = per_group_len * 2; // num_window_groups
-        for slot in &out {
+        let per_window_len = sfbo[max_sfb as usize] as usize;
+        for slot in &windows {
             let v = slot.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
-            assert!(v.iter().all(|&s| s == 0.0));
+            assert_eq!(v.len(), 2); // num_windows (one window per group here)
+            for (tl, spec) in v {
+                assert_eq!(*tl, 480);
+                assert_eq!(spec.len(), per_window_len);
+                assert!(spec.iter().all(|&s| s == 0.0));
+            }
         }
     }
 
@@ -2471,9 +2618,7 @@ mod tests {
         let max_sfb = 6u32;
         let tl_idx = 2u32;
         let mut bw = BitWriter::new();
-        for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        }
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, tl_idx, 3);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2490,11 +2635,15 @@ mod tests {
             scale_factor_grouping: vec![0, 0],
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
-        assert_eq!(out.len(), 1);
-        let v = out[0].as_ref().expect("decode succeeds");
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
+        assert_eq!(windows.len(), 1);
+        let v = windows[0].as_ref().expect("decode succeeds");
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        assert_eq!(v.len(), 3 * sfbo[max_sfb as usize] as usize);
+        assert_eq!(v.len(), 3); // 3 window groups, 1 window each
+        for (tl, spec) in v {
+            assert_eq!(*tl, 480);
+            assert_eq!(spec.len(), sfbo[max_sfb as usize] as usize);
+        }
     }
 
     /// `parse_three_channel_data` correctly drives the grouped path
@@ -2527,11 +2676,11 @@ mod tests {
         bw.write_u32(0, 4);
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        // Three channels x two window groups of sf_data(ASF) bodies.
+        // Three channels, each one grouped body spanning both window
+        // groups (num_win_in_group == [2, 2] — a *real* multi-window
+        // group, not the degenerate 1-window-per-group case).
         for _ in 0..3 {
-            for _ in 0..2 {
-                write_zero_sf_data_body(&mut bw, max_sfb, 2);
-            }
+            write_zero_sf_data_body_grouped(&mut bw, max_sfb, 2, 2);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2539,14 +2688,20 @@ mod tests {
         let d = parse_three_channel_data(&mut br, 1920).unwrap();
         let psy = d.psy_info.as_ref().unwrap();
         assert_eq!(psy.num_window_groups, 2);
+        assert_eq!(psy.num_windows, 4);
         assert!(!d.transform_info.as_ref().unwrap().b_long_frame);
-        assert_eq!(d.scaled_spec_per_channel.len(), 3);
+        assert_eq!(d.scaled_spec_windows_per_channel.len(), 3);
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let expected_total = (sfbo[max_sfb as usize] as usize) * 2;
-        for ch in &d.scaled_spec_per_channel {
+        let expected_win_len = sfbo[max_sfb as usize] as usize;
+        for ch in &d.scaled_spec_windows_per_channel {
             let v = ch.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
-            assert!(v.iter().all(|&s| s == 0.0));
+            // 2 groups x 2 windows each (num_win_in_group == [2, 2]).
+            assert_eq!(v.len(), 4);
+            for (tl, spec) in v {
+                assert_eq!(*tl, 480);
+                assert_eq!(spec.len(), expected_win_len);
+                assert!(spec.iter().all(|&s| s == 0.0));
+            }
         }
     }
 
@@ -2567,11 +2722,9 @@ mod tests {
         bw.write_u32(0, 1);
         // chparam_info: sap_mode=0.
         bw.write_u32(0, 2);
-        // 2 channels x 4 window groups of bodies.
+        // 2 channels, each one grouped body spanning 4 window groups.
         for _ in 0..2 {
-            for _ in 0..4 {
-                write_zero_sf_data_body(&mut bw, max_sfb, 2);
-            }
+            write_zero_sf_data_body_grouped(&mut bw, max_sfb, 2, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2579,12 +2732,16 @@ mod tests {
         let d = parse_two_channel_data(&mut br, 1920).unwrap();
         let psy = d.psy_info.as_ref().unwrap();
         assert_eq!(psy.num_window_groups, 4);
-        assert_eq!(d.scaled_spec_per_channel.len(), 2);
+        assert_eq!(d.scaled_spec_windows_per_channel.len(), 2);
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let expected_total = (sfbo[max_sfb as usize] as usize) * 4;
-        for ch in &d.scaled_spec_per_channel {
+        let expected_win_len = sfbo[max_sfb as usize] as usize;
+        for ch in &d.scaled_spec_windows_per_channel {
             let v = ch.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
+            assert_eq!(v.len(), 4); // 4 window groups, 1 window each
+            for (tl, spec) in v {
+                assert_eq!(*tl, 480);
+                assert_eq!(spec.len(), expected_win_len);
+            }
         }
     }
 
@@ -2614,13 +2771,13 @@ mod tests {
             scale_factor_grouping: vec![0],
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
-        assert_eq!(out.len(), 1);
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
+        assert_eq!(windows.len(), 1);
         // Single channel: with only 1 of 2 groups present, the second
         // group attempt should bail (Huffman miss on garbage / EOF).
         // We allow either Some (if zero-padding accidentally validates
         // as a section header) or None — but we must NOT panic.
-        let _ = &out[0];
+        let _ = &windows[0];
     }
 
     // =================================================================

@@ -2310,36 +2310,50 @@ pub(crate) fn capture_aspx_data_1ch_trailer(
     trailer
 }
 
-/// Derive per-window-group `(transf_length_idx, transform_length, max_sfb)`
-/// arrays from a parsed `(ti, psy)` pair, per Pseudocodes 2 and 5 +
-/// Pseudocode 3 (`window_to_group[]`) — for the **non-side-channel /
+/// Derive per-window-group `(transf_length_idx, transform_length, max_sfb,
+/// num_win_in_group)` arrays from a parsed `(ti, psy)` pair, per
+/// Pseudocodes 2, 3, 4 and 5 — for the **non-side-channel /
 /// non-side-limited** path. `b_dual_maxsfb` and `b_side_channel`
 /// callers (joint-MDCT side residual) should pass an explicit
 /// `max_sfb_in` and use [`derive_per_group_with_max_sfb`] instead.
 ///
 /// Returns `(transf_length_idx_per_group, transform_length_per_group,
-/// max_sfb_per_group)`. All three vectors have length
-/// `psy.num_window_groups`.
+/// max_sfb_per_group, num_win_in_group_per_group)`. All four vectors
+/// have length `psy.num_window_groups`.
 ///
-/// For the equal-transform-length (no `b_different_framing`) case all
-/// three vectors collapse to the single transform / max_sfb value
-/// repeated `num_window_groups` times. For `b_different_framing` the
-/// first half-frame's groups use `transf_length[0]` / `max_sfb_0` and
-/// the second half's use `transf_length[1]` / `max_sfb_1`.
-fn derive_per_group(ti: &AsfTransformInfo, psy: &AsfPsyInfo) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+/// For the equal-transform-length (no `b_different_framing`) case the
+/// first three vectors collapse to the single transform / max_sfb
+/// value repeated `num_window_groups` times. For `b_different_framing`
+/// the first half-frame's groups use `transf_length[0]` / `max_sfb_0`
+/// and the second half's use `transf_length[1]` / `max_sfb_1`.
+///
+/// `num_win_in_group[g]` (Pseudocode 4) is the count of physical
+/// windows sharing group `g`'s side info — real content commonly packs
+/// more than one window per group (a group of 4 windows sharing one
+/// group is at least as common as one window per group), and each
+/// extra window in a group widens that group's `asf_section_data()` /
+/// `asf_spectral_data()` / `asf_scalefac_data()` / `asf_snf_data()`
+/// payload by a factor of `num_win_in_group[g]` (§4.3.6.2.6 Pseudocode
+/// 4: `sect_sfb_offset[g][sfb] = group_offset + sfb_offset[sfb] *
+/// num_win_in_group[g]`). Callers that don't widen their `sfb_offset`
+/// table by this factor before driving the per-group Huffman decode
+/// will desync the bitreader the moment any real group has more than
+/// one window in it.
+fn derive_per_group(ti: &AsfTransformInfo, psy: &AsfPsyInfo) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
     derive_per_group_with_max_sfb(ti, psy, psy.max_sfb_0, psy.max_sfb_1)
 }
 
-/// Derive per-group `(transf_length_idx, transform_length, max_sfb)`
-/// arrays with explicit per-half-frame `max_sfb_a` / `max_sfb_b`
-/// overrides. Used by joint-MDCT side-channel decoders that want
-/// `max_sfb_side[0/1]` instead of `max_sfb[0/1]`.
-fn derive_per_group_with_max_sfb(
+/// Derive per-group `(transf_length_idx, transform_length, max_sfb,
+/// num_win_in_group)` arrays with explicit per-half-frame `max_sfb_a` /
+/// `max_sfb_b` overrides. Used by joint-MDCT side-channel decoders that
+/// want `max_sfb_side[0/1]` instead of `max_sfb[0/1]`. See
+/// [`derive_per_group`] for the full contract.
+pub(crate) fn derive_per_group_with_max_sfb(
     ti: &AsfTransformInfo,
     psy: &AsfPsyInfo,
     max_sfb_a: u32,
     max_sfb_b: u32,
-) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
     let n = psy.num_window_groups.max(1) as usize;
     let mut tl_idx = Vec::with_capacity(n);
     let mut tl = Vec::with_capacity(n);
@@ -2351,7 +2365,24 @@ fn derive_per_group_with_max_sfb(
             tl.push(ti.transform_length_0);
             msfb.push(max_sfb_a);
         }
-        return (tl_idx, tl, msfb);
+        // window_to_group[] directly from scale_factor_grouping bits
+        // (Pseudocode 3, no different-framing boundary injection
+        // needed); num_win_in_group[g] (Pseudocode 4) is just the
+        // per-group tally.
+        let mut num_win_in_group = vec![0u32; n];
+        let mut g = 0usize;
+        if n > 0 {
+            num_win_in_group[0] += 1;
+        }
+        for &b in &psy.scale_factor_grouping {
+            if b == 0 {
+                g += 1;
+            }
+            if g < n {
+                num_win_in_group[g] += 1;
+            }
+        }
+        return (tl_idx, tl, msfb, num_win_in_group);
     }
     // Pseudocode 2 / 3: groups < window_to_group[num_windows_0] use
     // transf_length[0]; the rest use transf_length[1]. We don't carry
@@ -2386,6 +2417,12 @@ fn derive_per_group_with_max_sfb(
     } else {
         psy.num_window_groups
     };
+    let mut num_win_in_group = vec![0u32; n];
+    for &grp in &wtg {
+        if (grp as usize) < n {
+            num_win_in_group[grp as usize] += 1;
+        }
+    }
     for grp in 0..n as u32 {
         if grp < split_group {
             tl_idx.push(ti.transf_length[0]);
@@ -2397,7 +2434,7 @@ fn derive_per_group_with_max_sfb(
             msfb.push(max_sfb_b);
         }
     }
-    (tl_idx, tl, msfb)
+    (tl_idx, tl, msfb, num_win_in_group)
 }
 
 /// Decode the `sf_data(ASF)` body for a mono, **short-frame / grouped**
@@ -2421,7 +2458,7 @@ pub(crate) fn decode_asf_grouped_mono_body_with_max_sfb(
     if psy.num_window_groups <= 1 {
         return None;
     }
-    let (tl_idx_per_g, tl_per_g, max_sfb_per_g) =
+    let (tl_idx_per_g, tl_per_g, max_sfb_per_g, _num_win_in_group_per_g) =
         derive_per_group_with_max_sfb(ti, psy, max_sfb_a, max_sfb_b);
     // Resolve sfb_offset table per group.
     let mut sfbo_per_g: Vec<&'static [u16]> = Vec::with_capacity(tl_per_g.len());
@@ -2496,7 +2533,7 @@ fn decode_asf_grouped_stereo_joint_body(
     if psy.num_window_groups <= 1 {
         return None;
     }
-    let (tl_idx_per_g, tl_per_g, max_sfb_per_g) = derive_per_group(ti, psy);
+    let (tl_idx_per_g, tl_per_g, max_sfb_per_g, _num_win_in_group_per_g) = derive_per_group(ti, psy);
     let mut sfbo_per_g: Vec<&'static [u16]> = Vec::with_capacity(tl_per_g.len());
     let mut max_sfb_capped: Vec<u32> = Vec::with_capacity(tl_per_g.len());
     for g in 0..tl_per_g.len() {

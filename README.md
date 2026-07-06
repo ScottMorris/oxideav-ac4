@@ -80,11 +80,22 @@ an S16 `AudioFrame`:
   routing all three through the existing `dispatch_5x_cfg0/1/2_simple_aspx`
   helpers (already used by the real 5_X path); slot-0 nonzero rate rose
   from 11.2% to 31.2% of all real frames. This surfaced a fourth,
-  larger, still-open gap: **every** main-channel dispatch function
-  only handles the single long-frame (`transform_length_0 == 2048`)
-  case — short-frame/grouped-window main-channel bodies (52% of real
-  frames) are silently dropped, 100% of the time, regardless of
-  coding_config. See Changelog for the full trail.
+  larger gap — **every** main-channel dispatch function only handled
+  the single long-frame (`transform_length_0 == 2048`) case, and the
+  grouped/short-frame *parser* itself (`mch.rs`) never widened its
+  Huffman decode by `num_win_in_group[g]` (§4.3.6.2.6 Pseudocode 4 —
+  real content overwhelmingly uses actual multi-window groups, not the
+  degenerate one-window-per-group case) and mis-read the shared
+  scalefactor/SNF header once per group instead of once per body. Fixed
+  both: widened the grouped Huffman decode correctly, added the §5.1.5
+  "spectral ungrouping tool" (Pseudocode 25) to de-interleave each
+  group's widened spectrum back into individual per-window spectra, and
+  wired a generic per-window IMDCT accumulator (mirrors
+  `run_ssf_channel`'s block-by-block pattern) into all four
+  `Cfg0`/`Cfg1`/`Cfg2`/`Cfg3` main-channel dispatchers. Slot-0 (L)
+  nonzero rate rose again, from 31.2% to **60.2%**, and main-soundstage
+  activity (any of slots 0..4) now reaches **88.5%** of all 1571 real
+  frames tested. See Changelog for the full trail.
 
 - **`examples/ac4info.rs`** — a small mediainfo-style CLI, since stock
   `ffprobe`/`mediainfo` don't parse AC-4's TOC at all (they just report
