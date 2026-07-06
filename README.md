@@ -47,6 +47,26 @@ an S16 `AudioFrame`:
   now parse with 100% success and fully consistent `sample_rate`/
   `channels` across every frame.
 
+- **Real, non-silent PCM decoded from real Tidal AC-4 content** — a
+  second bug, one layer below `emdf_reserved()`, meant `receive_frame()`
+  always fed the channel-coded walker `substream_sizes[0]` regardless of
+  which physical substream the TOC actually pointed at.
+  `ac4_substream_info_chan()`/`ac4_substream_info_ajoc()` (§6.2.1.8/.9)
+  each carry an explicit `substream_index` into
+  `substream_index_table()` on `b_substreams_present` frames, and for
+  every real frame tested this session that index is **1**, not 0 — the
+  decoder was silently decoding the wrong (small, companion) physical
+  substream. It didn't error; it just produced confidently-shaped
+  silence. `substream_index` is now threaded through
+  `SubstreamInfoChan`/`SubstreamInfoAjoc`/`SubstreamGroupSummary` up to
+  `Ac4FrameInfo`, and `receive_frame()` skips forward by the correct
+  number of bytes before handing the substream to the walker. Real
+  7.1 (channel_mode 6, 3/4/0.1) I-frames now decode to genuinely
+  non-silent S16 PCM. A second, distinct, data-dependent
+  `asf_psy_info_lfe` bug (likely a bit-misalignment in the preceding
+  `aspx_config`/A-CPL config read for at least one `SevenXCodecMode`)
+  still fails roughly half of real I-frames — see Changelog.
+
 - **ASF coefficient pipeline** — `asf_section_data()`,
   `asf_spectral_data()` (HCB 1..11 + the codebook-11 escape),
   `asf_scalefac_data()`, and `asf_snf_data()` for mono, stereo (split +

@@ -1791,21 +1791,34 @@ impl Decoder for Ac4Decoder {
                 info.frame_length
             }
         };
-        // Best-effort walk of the first substream. The exact byte offset
-        // of substream 0 is `toc_len + payload_base`, where `toc_len` is
-        // the length of the byte-aligned ac4_toc() element. We don't
-        // currently track `toc_len` out of [`toc::parse_ac4_toc`]; as a
-        // cheap approximation we try the first substream size if the
-        // substream_index_table exposed one, carving the tail of the
-        // packet. This is fine for single-substream frames (the
-        // overwhelmingly common case).
+        // Best-effort walk of our substream group's audio substream. The
+        // exact byte offset of substream 0 is `toc_len + payload_base`,
+        // where `toc_len` is the length of the byte-aligned ac4_toc()
+        // element. We don't currently track `toc_len` out of
+        // [`toc::parse_ac4_toc`]; as a cheap approximation we start from
+        // that offset and walk `substream_sizes` forward.
+        //
+        // Critically, on `b_substreams_present` frames the group's audio
+        // is *not* necessarily physical substream 0 — `ac4_substream_info_chan`
+        // / `ac4_substream_info_ajoc` each carry an explicit
+        // `substream_index` into `substream_index_table()`'s size list,
+        // and other physical substreams (e.g. a small companion
+        // substream) can legitimately sit before it. Skip forward by the
+        // sizes of every substream ahead of that index.
         let substream_try = {
-            // Substream 0 starts at toc_size + payload_base.
-            let start = (info.toc_size + info.payload_base) as usize;
-            let first_size = info.substream_sizes.first().copied();
+            let base = (info.toc_size + info.payload_base) as usize;
+            let idx = info.substream_index.unwrap_or(0) as usize;
+            let start = base
+                + info
+                    .substream_sizes
+                    .iter()
+                    .take(idx)
+                    .map(|&s| s as usize)
+                    .sum::<usize>();
+            let size = info.substream_sizes.get(idx).copied();
             if start >= raw.len() {
                 None
-            } else if let Some(sz) = first_size {
+            } else if let Some(sz) = size {
                 let sz = sz as usize;
                 let end = start.saturating_add(sz).min(raw.len());
                 if sz > 0 {

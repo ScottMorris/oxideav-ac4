@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`ac4_substream_info_chan()` / `ac4_substream_info_ajoc()` dropped
+  `substream_index`** (§6.2.1.8/.9) — on `b_substreams_present` frames,
+  each substream descriptor carries an explicit index into
+  `substream_index_table()`'s size list telling the decoder *which*
+  physical substream actually holds its audio. The parser read this
+  field (`si`/`substream_index`) correctly but threw it away, and
+  `decoder.rs`'s `receive_frame()` unconditionally grabbed
+  `substream_sizes[0]` instead. For every real Tidal AC-4 frame tested
+  this session, the true audio substream was index **1**, not 0 — the
+  end-to-end decoder was feeding the wrong physical substream (a small,
+  10-byte companion substream) to the channel-coded walker, which
+  happened to parse *without erroring* (there just wasn't much to
+  parse) but produced silent, 1-plane-shaped garbage output disguised
+  as a valid decode. This was invisible at the TOC level, since
+  `parse_ac4_toc`'s own `channels`/`channel_mode`/`channel_coded`
+  fields never depended on which physical substream carried the audio
+  — only `decoder.rs`'s byte-slicing of `raw` did.
+
+  Fixed by threading `substream_index` through `SubstreamInfoChan` →
+  `SubstreamInfoAjoc` → `SubstreamGroupSummary` → the new
+  `Ac4FrameInfo::substream_index`, and rewriting `receive_frame()`'s
+  substream-selection to skip forward by the summed sizes of every
+  substream ahead of that index rather than always taking substream 0.
+  Verified against real content: `decode_real_pcm` now produces
+  genuinely non-silent PCM (`nonzero_ch0=true`, real sample magnitudes)
+  for I-frames that parse cleanly, versus 100% silent output for every
+  frame before the fix.
+
+  A second, distinct bug surfaced once real substream bytes were
+  actually being decoded: roughly half of I-frames fail with
+  `asf_psy_info_lfe: transform_length not permitted for LFE` inside
+  `parse_7x_audio_data_outer`'s LFE `mono_data(1)` read, which
+  immediately follows the per-mode `aspx_config`/`acpl_config_1ch_*`
+  read when `b_iframe`. This is data-dependent (some I-frames decode
+  cleanly, most don't), which points at a bit-misalignment bug in the
+  preceding `aspx_config`/A-CPL config parse for at least one
+  `SevenXCodecMode` variant rather than a genuine short-frame LFE
+  encode — not yet root-caused. Tracked as the next real-PCM blocker.
+
 - **`emdf_reserved()` bitstream bug** (§4.2.3.12, Table 80) — the
   long-standing implementation read a nonexistent `b_more_bits` flag
   followed by a `variable_bits(5)`-encoded skip count. The real syntax

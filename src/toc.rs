@@ -173,19 +173,23 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
     // streams; for this foundation we treat them as opaque — the field is
     // still consumed correctly so downstream bit-alignment is preserved.
     //
-    // We read up to 7 bits; on the 0b1111111 escape the caller is expected
-    // to run `variable_bits(2)` to extend the encoded index.
+    // Returns `(channels, channel_mode)` — the second value is the real
+    // Table 85 index (not a bit count, as it used to be), since three
+    // distinct 7.1 layouts (channel_mode 6/8/10 — 3/4/0.1, 5/2/0.1,
+    // 3/2/2.1) all report the same channel count and can only be told
+    // apart by this index. On the `0b1111111` escape the returned index
+    // already folds in the `variable_bits(2)` extension.
     let b0 = br.read_u32(1)?;
     if b0 == 0 {
-        return Ok((1, 1));
+        return Ok((1, 0));
     }
     let b1 = br.read_u32(1)?;
     if b1 == 0 {
-        return Ok((2, 2));
+        return Ok((2, 1));
     }
     let nx = br.read_u32(2)?;
     if nx != 0b11 {
-        // 4-bit prefix group: 1100 / 1101 / 1110.
+        // 4-bit prefix group: 1100 / 1101 / 1110 -> channel_mode 2/3/4.
         return Ok((
             match nx {
                 0b00 => 3,
@@ -193,11 +197,12 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
                 0b10 => 6,
                 _ => 0,
             },
-            4,
+            nx + 2,
         ));
     }
-    // 7-bit prefix group: 1111xxx.
+    // 7-bit prefix group: 1111xxx -> channel_mode 5..=12.
     let tail = br.read_u32(3)?;
+    let channel_mode = 5 + tail;
     let channels = match tail {
         0b000 => 7, // channel_mode 5 — 7.0 (3/4/0)
         0b001 => 8, // channel_mode 6 — 7.1 (3/4/0.1)
@@ -207,14 +212,14 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
         0b101 => 8, // channel_mode 10 — 7.1 (3/2/2.1)
         0b110 => 7, // channel_mode 11 — 7.0.4
         0b111 => {
-            // 1111111 — escape. Caller reads variable_bits(2); we leave
-            // channel count unknown.
-            let _ext = variable_bits(br, 2)?;
-            return Ok((0, 7 + 3));
+            // 1111111 — escape. The extension folds into the index; we
+            // leave channel count unknown for these IFM-only modes.
+            let ext = variable_bits(br, 2)?;
+            return Ok((0, 12 + ext));
         }
         _ => unreachable!("3-bit tail is 0..=7"),
     };
-    Ok((channels, 7))
+    Ok((channels, channel_mode))
 }
 
 /// Parsed AC-4 frame information — the result of running
@@ -263,6 +268,38 @@ pub struct Ac4FrameInfo {
     /// first substream starts at `toc_size + payload_base` bytes into
     /// the `raw_ac4_frame()` payload.
     pub toc_size: u32,
+    /// Full `ac4_substream_info_ajoc()` descriptor for the first
+    /// A-JOC-coded substream (bitstream_version >= 2 only) — the
+    /// bed/dynamic-object/ISF breakdown behind `channels`. `None` for
+    /// channel-coded frames, or when no A-JOC substream was found.
+    pub ajoc_info: Option<SubstreamInfoAjoc>,
+    /// Whether the first substream group's `b_channel_coded` flag was
+    /// set — `true` means `channels` came from the plain channel-coded
+    /// path (already fully decodable by the existing ASF/A-SPX/A-CPL
+    /// pipeline), regardless of `bitstream_version`. A v2-syntax frame
+    /// can still carry a plain channel-coded bed rather than A-JOC
+    /// objects; this is the only reliable way to tell which.
+    pub channel_coded: bool,
+    /// The first substream group's real Table 85 `channel_mode` index
+    /// (only when `channel_coded`) — distinguishes the three
+    /// same-channel-count 7.1 layouts. See
+    /// `SubstreamGroupSummary::channel_mode`.
+    pub channel_mode: Option<u32>,
+    /// Every `ac4_substream_group_info()` in this frame (bitstream_version
+    /// >= 2 only) — a frame can carry more than one (the classic Dolby
+    /// Atmos "bed + objects" model: a channel-coded group for the static
+    /// bed, a separate A-JOC group for dynamic objects). Empty for
+    /// bitstream_version <= 1 frames.
+    pub substream_groups: Vec<SubstreamGroupSummary>,
+    /// The first substream group's physical substream index (into
+    /// `substream_sizes`) — the byte offset of the actual audio for
+    /// `channels`/`channel_mode` is *not* necessarily substream 0;
+    /// `b_substreams_present` frames carry an explicit index that must
+    /// be honoured, or decode silently reads the wrong physical
+    /// substream. `None` on single-substream frames (`b_substreams_present
+    /// == false`), where the substream implicitly follows the TOC, and
+    /// for bitstream_version <= 1 frames (no substream_groups tracked).
+    pub substream_index: Option<u32>,
 }
 
 /// Per-presentation information we extract from `ac4_presentation_info()`.
@@ -351,6 +388,14 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     // path; >= 2 runs `ac4_presentation_v1_info()` per presentation followed
     // by `ac4_substream_group_info()` × `total_n_substream_groups`.
     let mut presentations = Vec::with_capacity(n_presentations as usize);
+    let mut ajoc_info: Option<SubstreamInfoAjoc> = None;
+    // `ac4_presentation_info()` (bitstream_version <= 1) always calls the
+    // plain channel-coded `ac4_substream_info()` — that path structurally
+    // cannot carry A-JOC/object content at all.
+    let mut channel_coded = bitstream_version <= 1;
+    let mut channel_mode: Option<u32> = None;
+    let mut substream_index: Option<u32> = None;
+    let mut substream_groups: Vec<SubstreamGroupSummary> = Vec::new();
     if bitstream_version <= 1 {
         for _ in 0..n_presentations {
             let pi = parse_presentation_info(&mut br, fs_index, frame_rate_index)?;
@@ -375,29 +420,33 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
             total_n_substream_groups += n_sg;
             presentations.push(pi);
         }
-        // §6.3.2.5 ac4_substream_group_info() loop. The walker returns
-        // the first substream's `(channels, sf_multiplier)` so we can
-        // back-fill the leading presentation's `channels` field — for
-        // single-substream-group v2 frames this is the only path the
-        // channel count comes through.
-        let mut first_group_channels: u16 = 0;
-        let mut first_group_sf_mul: u32 = 0;
-        for j in 0..total_n_substream_groups {
+        // §6.3.2.5 ac4_substream_group_info() loop. A frame can carry
+        // more than one group (bed + objects), so every group's summary
+        // is kept — the leading presentation's `channels`/`sf_multiplier`
+        // back-fill, and the top-level `ajoc_info`/`channel_coded`, still
+        // reflect the first group specifically, for single-group frames
+        // (the overwhelmingly common case) where that's the whole story.
+        let mut groups: Vec<SubstreamGroupSummary> = Vec::with_capacity(total_n_substream_groups as usize);
+        for _ in 0..total_n_substream_groups {
             let g =
                 parse_substream_group_info(&mut br, bitstream_version, fs_index, frame_rate_index)?;
-            if j == 0 {
-                first_group_channels = g.first_channels;
-                first_group_sf_mul = g.first_sf_multiplier;
-            }
+            groups.push(g);
         }
-        if let Some(p) = presentations.first_mut() {
-            if p.channels == 0 {
-                p.channels = first_group_channels;
+        if let Some(first) = groups.first() {
+            if let Some(p) = presentations.first_mut() {
+                if p.channels == 0 {
+                    p.channels = first.channels;
+                }
+                if p.sf_multiplier == 0 {
+                    p.sf_multiplier = first.sf_multiplier;
+                }
             }
-            if p.sf_multiplier == 0 {
-                p.sf_multiplier = first_group_sf_mul;
-            }
+            ajoc_info = first.ajoc_info.clone();
+            channel_coded = first.channel_coded;
+            channel_mode = first.channel_mode;
+            substream_index = first.substream_index;
         }
+        substream_groups = groups;
     }
 
     // substream_index_table().
@@ -437,6 +486,11 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         payload_base,
         presentations,
         toc_size,
+        ajoc_info,
+        channel_coded,
+        channel_mode,
+        substream_groups,
+        substream_index,
     })
 }
 
@@ -944,8 +998,11 @@ fn parse_substream_group_info(
             let chan =
                 parse_substream_info_chan(br, fs_index, frame_rate_index, b_substreams_present)?;
             if sus == 0 {
-                summary.first_channels = chan.channels;
-                summary.first_sf_multiplier = chan.sf_multiplier;
+                summary.channels = chan.channels;
+                summary.sf_multiplier = chan.sf_multiplier;
+                summary.channel_coded = true;
+                summary.channel_mode = Some(chan.channel_mode);
+                summary.substream_index = chan.substream_index;
             }
             if b_hsf_ext && b_substreams_present {
                 let si = br.read_u32(2)?;
@@ -974,8 +1031,11 @@ fn parse_substream_group_info(
                 if sus == 0 {
                     let upmix_channels =
                         ajoc_info.n_fullband_upmix_signals + u32::from(ajoc_info.b_lfe);
-                    summary.first_channels = upmix_channels as u16;
-                    summary.first_sf_multiplier = ajoc_info.sf_multiplier;
+                    summary.channels = upmix_channels as u16;
+                    summary.sf_multiplier = ajoc_info.sf_multiplier;
+                    summary.substream_index = ajoc_info.substream_index;
+                    summary.ajoc_info = Some(ajoc_info.clone());
+                    summary.channel_coded = false;
                 }
                 if b_hsf_ext && b_substreams_present {
                     let si = br.read_u32(2)?;
@@ -1011,7 +1071,7 @@ fn parse_substream_info_chan(
     frame_rate_index: u32,
     b_substreams_present: bool,
 ) -> Result<SubstreamInfoChan> {
-    let (channels, _mode_bits) = decode_channel_mode(br)?;
+    let (channels, channel_mode) = decode_channel_mode(br)?;
     let mut sf_multiplier = 0;
     if fs_index == 1 {
         let b_sf_multiplier = br.read_bit()?;
@@ -1026,21 +1086,26 @@ fn parse_substream_info_chan(
             let _ = br.read_u32(2)?;
         }
     }
-    // §6.2.1.8 add_ch_base bit gate — skipped for the v2 walker for the
-    // same reason as the v0 walker (we don't surface raw channel_mode).
+    // §6.2.1.8 add_ch_base bit gate — not yet consumed; only reachable
+    // for the wide add-channel-form channel_mode values (16..=19).
     let factor = frame_rate_factor(frame_rate_index, false, 0);
     for _ in 0..factor.max(1) {
         let _b_audio_ndot = br.read_bit()?;
     }
-    if b_substreams_present {
-        let si = br.read_u32(2)?;
+    let substream_index = if b_substreams_present {
+        let mut si = br.read_u32(2)?;
         if si == 3 {
-            let _ = variable_bits(br, 2)?;
+            si += variable_bits(br, 2)?;
         }
-    }
+        Some(si)
+    } else {
+        None
+    };
     Ok(SubstreamInfoChan {
         channels: channels as u16,
         sf_multiplier,
+        channel_mode,
+        substream_index,
     })
 }
 
@@ -1048,12 +1113,48 @@ fn parse_substream_info_chan(
 struct SubstreamInfoChan {
     channels: u16,
     sf_multiplier: u32,
+    /// The real Table 85 `channel_mode` index (see `decode_channel_mode`)
+    /// — distinguishes the three same-channel-count 7.1 layouts.
+    channel_mode: u32,
+    /// Physical substream this descriptor's audio actually lives in,
+    /// indexing into `substream_index_table()`'s size list — `None`
+    /// when `b_substreams_present` is false (single-substream frame,
+    /// audio implicitly follows the TOC in bitstream order).
+    substream_index: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct SubstreamGroupSummary {
-    first_channels: u16,
-    first_sf_multiplier: u32,
+/// Summary of one `ac4_substream_group_info()` (§6.3.2.5) — a frame can
+/// carry more than one of these (the classic Dolby Atmos "bed +
+/// objects" model: one channel-coded group for the static bed, a
+/// separate A-JOC group for dynamic objects layered on top), so
+/// `Ac4FrameInfo::substream_groups` holds one entry per group rather
+/// than only the first.
+#[derive(Debug, Clone, Default)]
+pub struct SubstreamGroupSummary {
+    pub channels: u16,
+    pub sf_multiplier: u32,
+    /// Full `ac4_substream_info_ajoc()` descriptor for the first
+    /// A-JOC-coded substream in this group, if any — this is where the
+    /// actual bed-channel-vs-dynamic-object breakdown lives.
+    pub ajoc_info: Option<SubstreamInfoAjoc>,
+    /// Whether this group's `b_channel_coded` flag was set — `channels`
+    /// came from the plain channel-coded path (`ac4_substream_info_chan`)
+    /// rather than A-JOC when this is `true`, regardless of
+    /// `bitstream_version`.
+    pub channel_coded: bool,
+    /// The real Table 85 `channel_mode` index (only meaningful when
+    /// `channel_coded`) — distinguishes the three same-channel-count
+    /// 7.1 layouts (6/8/10 — 3/4/0.1, 5/2/0.1, 3/2/2.1) that `channels`
+    /// alone can't tell apart. `None` for A-JOC-coded groups.
+    pub channel_mode: Option<u32>,
+    /// Physical substream index (into `substream_index_table()`'s size
+    /// list) that carries this group's first substream's audio data —
+    /// `None` on single-substream frames (`b_substreams_present ==
+    /// false`), where the substream implicitly follows the TOC. This is
+    /// distinct from the *ordinal* position of the substream within the
+    /// group: a group's audio is not necessarily the first entry in
+    /// `substream_sizes`.
+    pub substream_index: Option<u32>,
 }
 
 // ---------------------------------------------------------------------
@@ -1227,6 +1328,10 @@ pub struct SubstreamInfoAjoc {
     pub n_fullband_upmix_signals: u32,
     pub umx_objs: Vec<ObjDescriptor>,
     pub sf_multiplier: u32,
+    /// Physical substream this descriptor's audio actually lives in,
+    /// indexing into `substream_index_table()`'s size list — mirrors
+    /// the same field on the channel-coded substream descriptor.
+    pub substream_index: Option<u32>,
 }
 
 pub fn parse_substream_info_ajoc(
@@ -1274,12 +1379,15 @@ pub fn parse_substream_info_ajoc(
     for _ in 0..factor.max(1) {
         let _b_audio_ndot = br.read_bit()?;
     }
-    if b_substreams_present {
-        let si = br.read_u32(2)?;
+    let substream_index = if b_substreams_present {
+        let mut si = br.read_u32(2)?;
         if si == 3 {
-            let _ = variable_bits(br, 2)?;
+            si += variable_bits(br, 2)?;
         }
-    }
+        Some(si)
+    } else {
+        None
+    };
 
     Ok(SubstreamInfoAjoc {
         b_lfe,
@@ -1289,6 +1397,7 @@ pub fn parse_substream_info_ajoc(
         n_fullband_upmix_signals,
         umx_objs,
         sf_multiplier,
+        substream_index,
     })
 }
 
@@ -1596,20 +1705,38 @@ mod tests {
 
     #[test]
     fn channel_mode_mono_stereo_51() {
-        // Mono prefix: 0.
+        // Mono prefix: 0 -> channel_mode 0.
         let bytes = [0b0_0000000];
         let mut br = BitReader::new(&bytes);
-        assert_eq!(decode_channel_mode(&mut br).unwrap(), (1, 1));
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (1, 0));
 
-        // Stereo prefix: 10.
+        // Stereo prefix: 10 -> channel_mode 1.
         let bytes = [0b10_000000];
         let mut br = BitReader::new(&bytes);
-        assert_eq!(decode_channel_mode(&mut br).unwrap(), (2, 2));
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (2, 1));
 
-        // 5.1 prefix: 1110.
+        // 5.1 prefix: 1110 -> channel_mode 4.
         let bytes = [0b1110_0000];
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_channel_mode(&mut br).unwrap(), (6, 4));
+    }
+
+    #[test]
+    fn channel_mode_distinguishes_same_channel_count_71_layouts() {
+        // channel_mode 6 (3/4/0.1): prefix 1111 001 -> tail 0b001.
+        let bytes = [0b1111_001_0];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (8, 6));
+
+        // channel_mode 8 (5/2/0.1): prefix 1111 011 -> tail 0b011.
+        let bytes = [0b1111_011_0];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (8, 8));
+
+        // channel_mode 10 (3/2/2.1): prefix 1111 101 -> tail 0b101.
+        let bytes = [0b1111_101_0];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (8, 10));
     }
 
     #[test]
@@ -1790,6 +1917,7 @@ mod tests {
                 b_ajoc_coded: false,
             }],
             sf_multiplier: 0,
+            substream_index: None,
         };
 
         let mut bw = BitWriter::new();
@@ -1932,7 +2060,7 @@ mod tests {
         let mut br = BitReader::new(&bytes);
 
         let summary = parse_substream_group_info(&mut br, 2, 0, 4).unwrap();
-        assert_eq!(summary.first_channels, 2);
+        assert_eq!(summary.channels, 2);
     }
 
     // Regression coverage for the emdf_reserved() bitstream bug found by
