@@ -163,31 +163,40 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **Object-coded (A-JOC) substream decode end-to-end** — the substream
-  descriptor layer (`ac4_substream_info_ajoc`, `bed_dyn_obj_assignment`,
-  `oamd_common_data`), the A-JOC Huffman/matrix decode (`ajoc_huff_data`,
-  `differential_decode_*`, `ajoc_reconstruct`), the downmix signals'
-  spectral frontend (`parse_var_channel_element`, §6.2.4.4 — dispatches
-  to the existing mono/two/three-channel ASF primitives by signal
-  count/parity, the `aspx_config`/`companding_control` gates, **and**
-  the A-SPX bandwidth-extension trailer itself via the crate's existing
-  `asf::parse_aspx_data_2ch_body`/`_1ch_body` — real, tested, I-frame
-  decode, not a stub), and the OAMD dynamic per-object metadata
-  (`oamd.rs`: `parse_oamd_dyndata_single` + its `object_info_block`/
-  `object_basic_info`/`object_render_info` tree, including real 3D
-  `pos3D_X/Y/Z` position and gain, §6.2.8.3/.5-.7) are all landed, but
-  nothing wires them into an actual per-frame walk yet: `audio_data_ajoc()`
-  itself (§6.2.3.4, the function that would call `var_channel_element`
-  then `ajoc()` then `oamd_dyndata_single()` twice) isn't implemented.
-  `parse_substream_group_info()` still returns `Error::unsupported` the
-  moment it sees `b_channel_coded == false`.
-  Non-I-frame `var_channel_element` calls also still return
-  `Error::unsupported` — the sticky cross-frame `aspx_config` the
-  channel-coded path threads through `StickyConfig` isn't threaded into
-  this A-JOC downmix path yet. Two rare, deeply-nested OAMD sub-elements
-  (`add_per_object_md()`, `ext_prec_alt_pos()`) do the same, since their
-  skip length is spec-defined *in terms of* their own (unimplemented)
-  bit consumption rather than a plain declared byte count.
+- **Object-coded (A-JOC) substream decode, parsed end-to-end but not yet
+  wired into the live decoder** — every piece of `audio_data_ajoc()`
+  (§6.2.3.4) is landed and integration-tested: the substream descriptor
+  layer (`ac4_substream_info_ajoc`, `bed_dyn_obj_assignment`,
+  `oamd_common_data`), the downmix signals' spectral frontend
+  (`parse_var_channel_element`, §6.2.4.4 — real I-frame A-SPX trailer
+  decode via the crate's existing `asf::parse_aspx_data_2ch_body`/
+  `_1ch_body`, not a stub), the OAMD dynamic per-object metadata
+  (`oamd.rs`, including real 3D `pos3D_X/Y/Z` position and gain), the
+  A-JOC Huffman/matrix decode (`ajoc::parse_ajoc`/`parse_ajoc_data` —
+  `ajoc_huff_data` through `differential_decode_*` and `dequantize_*`
+  to `ajoc_reconstruct`), and `toc::parse_audio_data_ajoc` itself tying
+  all of it together in the right order (`var_channel_element` →
+  `oamd_timing_data` + `oamd_dyndata_single` → the OAMD-extension skip
+  → `ajoc()` + `ajoc_dmx_de_data()` → `oamd_timing_data` +
+  `oamd_dyndata_single` again). A single hand-built-bitstream
+  integration test drives the whole chain and checks results at every
+  stage.
+
+  What's still missing is the **wiring**: nothing in `decoder.rs` calls
+  `parse_audio_data_ajoc` yet, so `parse_substream_group_info()` still
+  returns `Error::unsupported` the moment it sees `b_channel_coded ==
+  false` — a real object-coded frame from a real file won't decode
+  until that connection is made. Two narrower gaps also remain by
+  design rather than by guesswork: the `b_static_dmx` path
+  (`audio_data_chan(5.0/5.1)` for a plain fixed bed) isn't implemented,
+  and neither is a non-timed frame (`b_dmx_timing`/`b_umx_timing == 0`,
+  which needs a sticky `num_obj_info_blocks` from a previous frame —
+  the same kind of cross-frame state the channel-coded path's
+  `StickyConfig` provides, not yet threaded into this path). Two rare,
+  deeply-nested OAMD sub-elements (`add_per_object_md()`,
+  `ext_prec_alt_pos()`) do the same, since their skip length is
+  spec-defined *in terms of* their own (unimplemented) bit consumption
+  rather than a plain declared byte count.
   Note that `oamd_dyndata_single`'s position metadata implies object-coded
   content may need actual spatial *rendering* (objects + 3D positions →
   final output channels) on top of decoding — the object-audio renderer

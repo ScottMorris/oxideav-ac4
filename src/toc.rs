@@ -1266,6 +1266,160 @@ pub fn parse_substream_info_ajoc(
     })
 }
 
+/// Result of `audio_data_ajoc()` (§6.2.3.4): everything decoded from one
+/// A-JOC object-coded substream's audio-data element.
+#[derive(Debug, Clone)]
+pub struct AudioDataAjoc {
+    pub var_channel: crate::mch::VarChannelElement,
+    pub dmx_dyndata: crate::oamd::OamdDyndataSingle,
+    pub ajoc: crate::ajoc::AjocParsed,
+    pub dmx_de_data: crate::ajoc::AjocDmxDeData,
+    pub umx_dyndata: crate::oamd::OamdDyndataSingle,
+}
+
+/// `audio_data_ajoc(n_fb_upmix_signals, b_static_dmx, n_fb_dmx_signals,
+/// b_lfe, b_iframe)` (§6.2.3.4) — the top-level per-frame walk for an
+/// A-JOC object-coded substream, tying together `var_channel_element`,
+/// `ajoc()`, `ajoc_dmx_de_data()`, and two calls to
+/// `oamd_dyndata_single()` (once for the downmix signal set, once for
+/// the upmix/output set).
+///
+/// `b_alternative` and `frame_len_base` are threaded in from outside
+/// this substream descriptor: `b_alternative` comes from the enclosing
+/// `ac4_presentation_substream_info()`, and `frame_len_base` from the
+/// TOC's `fs_index`/`frame_rate_index` — the same value the
+/// channel-coded path derives and threads into
+/// `parse_asf_transform_info` throughout `mch.rs`/`asf.rs`.
+///
+/// **Not yet supported:** the `b_static_dmx` path (`audio_data_chan(5.0
+/// or 5.1, b_iframe)` — a plain fixed 5-channel bed using the
+/// channel-coded decode machinery directly) isn't wired up, nor is a
+/// non-timed downmix/upmix frame (`b_dmx_timing`/`b_umx_timing == 0`),
+/// which per spec relies on a sticky `num_obj_info_blocks` from a
+/// previous frame that isn't threaded through yet — both return
+/// `Error::unsupported` rather than guessing.
+pub fn parse_audio_data_ajoc(
+    br: &mut BitReader<'_>,
+    info: &SubstreamInfoAjoc,
+    b_iframe: bool,
+    b_alternative: bool,
+    frame_len_base: u32,
+) -> Result<AudioDataAjoc> {
+    if info.b_static_dmx {
+        return Err(Error::unsupported(
+            "ac4: audio_data_ajoc static-downmix path (audio_data_chan) not implemented",
+        ));
+    }
+
+    let b_some_signals_inactive = br.read_bit()?;
+    if b_some_signals_inactive {
+        let _dmx_active_signals_mask = br.read_u32(info.n_fullband_dmx_signals)?;
+    }
+
+    let var_channel = crate::mch::parse_var_channel_element(
+        br,
+        b_iframe,
+        info.n_fullband_dmx_signals,
+        info.b_lfe,
+        frame_len_base,
+    )?;
+
+    let b_dmx_timing = br.read_bit()?;
+    let num_obj_info_blocks_dmx = if b_dmx_timing {
+        crate::oamd::parse_oamd_timing_data(br)?.num_obj_info_blocks
+    } else {
+        return Err(Error::unsupported(
+            "ac4: audio_data_ajoc non-timed downmix frame (sticky num_obj_info_blocks) \
+             not implemented",
+        ));
+    };
+
+    // An A-JOC bed object can't itself carry an LFE (see `ObjDescriptor`'s
+    // doc) — `ac4_substream_info_ajoc`'s own `b_lfe` flag is instead
+    // represented as an extra leading signal here (`is_lfe[0] = 1`),
+    // ahead of `bed_dyn_obj_assignment`'s own descriptors.
+    let (obj_type_dmx, is_lfe_dmx) = lfe_prefixed_descriptors(info.b_lfe, &info.dmx_objs);
+    let dmx_dyndata = crate::oamd::parse_oamd_dyndata_single(
+        br,
+        num_obj_info_blocks_dmx,
+        b_iframe,
+        b_alternative,
+        &obj_type_dmx,
+        &is_lfe_dmx,
+    )?;
+
+    let b_oamd_extension_present = br.read_bit()?;
+    if b_oamd_extension_present {
+        let declared_bits = (variable_bits(br, 3)? + 1) * 8;
+        let bed_info = crate::ajoc::parse_ajoc_bed_info(br)?;
+        let remaining = declared_bits.checked_sub(bed_info.bits_read).ok_or_else(|| {
+            Error::invalid(
+                "ac4: audio_data_ajoc oamd extension: ajoc_bed_info overran its declared \
+                 skip budget",
+            )
+        })?;
+        br.skip(remaining)?;
+    }
+
+    let ajoc = crate::ajoc::parse_ajoc(
+        br,
+        info.n_fullband_dmx_signals,
+        info.n_fullband_upmix_signals,
+    )?;
+    let dmx_de_data = crate::ajoc::parse_ajoc_dmx_de_data(
+        br,
+        info.n_fullband_dmx_signals,
+        info.n_fullband_upmix_signals,
+    )?;
+
+    let b_umx_timing = br.read_bit()?;
+    let num_obj_info_blocks_umx = if b_umx_timing {
+        crate::oamd::parse_oamd_timing_data(br)?.num_obj_info_blocks
+    } else {
+        // "Derive timing from dmx": the spec names this bit but doesn't
+        // spell out the derivation beyond that; reusing the downmix
+        // side's block count is the most direct reading of "derive ...
+        // from dmx" available from the syntax table alone.
+        let _b_derive_timing_from_dmx = br.read_bit()?;
+        num_obj_info_blocks_dmx
+    };
+
+    let (obj_type_umx, is_lfe_umx) = lfe_prefixed_descriptors(info.b_lfe, &info.umx_objs);
+    let umx_dyndata = crate::oamd::parse_oamd_dyndata_single(
+        br,
+        num_obj_info_blocks_umx,
+        b_iframe,
+        b_alternative,
+        &obj_type_umx,
+        &is_lfe_umx,
+    )?;
+
+    Ok(AudioDataAjoc {
+        var_channel,
+        dmx_dyndata,
+        ajoc,
+        dmx_de_data,
+        umx_dyndata,
+    })
+}
+
+/// Build the combined `(obj_type, is_lfe)` arrays `oamd_dyndata_single`
+/// expects: an optional leading LFE entry (`ac4_substream_info_ajoc`'s
+/// own `b_lfe` flag) ahead of `bed_dyn_obj_assignment`'s descriptors.
+fn lfe_prefixed_descriptors(b_lfe: bool, objs: &[ObjDescriptor]) -> (Vec<ObjType>, Vec<bool>) {
+    let mut obj_type = Vec::with_capacity(objs.len() + 1);
+    let mut is_lfe = Vec::with_capacity(objs.len() + 1);
+    if b_lfe {
+        obj_type.push(ObjType::Bed);
+        is_lfe.push(true);
+    }
+    for o in objs {
+        obj_type.push(o.obj_type);
+        is_lfe.push(o.b_lfe);
+    }
+    (obj_type, is_lfe)
+}
+
 /// `frame_rate_fractions_info()` per ETSI TS 103 190-2 §6.2.1.4 — gated
 /// on `frame_rate_index`. Consumes 0, 1, or 2 bits depending on the
 /// frame-rate slot.
@@ -1582,5 +1736,141 @@ mod tests {
         assert_eq!(info.n_fullband_upmix_signals, 2);
         assert_eq!(info.umx_objs.len(), 2);
         assert!(info.umx_objs.iter().all(|o| o.obj_type == ObjType::Dyn));
+    }
+
+    /// The simplest possible `audio_data_ajoc()`: 1 downmix signal, 1
+    /// upmix signal, no LFE, no decorrelators, non-ASPX, non-alternative,
+    /// no OAMD extension, `b_keep_dmx_de_coeffs` — exercises every stage
+    /// of the chain (`var_channel_element` -> `oamd_timing_data` ->
+    /// `oamd_dyndata_single` -> `ajoc` -> `ajoc_dmx_de_data` ->
+    /// `oamd_timing_data` -> `oamd_dyndata_single` again) end to end.
+    #[test]
+    fn audio_data_ajoc_minimal_one_signal_each_side() {
+        use oxideav_core::bits::BitWriter;
+
+        let info = SubstreamInfoAjoc {
+            b_lfe: false,
+            b_static_dmx: false,
+            n_fullband_dmx_signals: 1,
+            dmx_objs: vec![ObjDescriptor {
+                obj_type: ObjType::Dyn,
+                b_lfe: false,
+                b_ajoc_coded: false,
+            }],
+            n_fullband_upmix_signals: 1,
+            umx_objs: vec![ObjDescriptor {
+                obj_type: ObjType::Dyn,
+                b_lfe: false,
+                b_ajoc_coded: false,
+            }],
+            sf_multiplier: 0,
+        };
+
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_some_signals_inactive
+
+        // var_channel_element(b_iframe=true, n_dmx_signals=1, b_has_lfe=false):
+        // var_codec_mode = 0 (non-ASPX), n_dmx_signals == 1 -> mono_data(0).
+        bw.write_bit(false); // var_codec_mode
+                             // mono_data(0): spec_frontend_bit(1) + transform_info(1, long-frame
+                             // at frame_len_base=1920) + psy_info max_sfb_0(6 bits at this
+                             // transform length) — empirically exactly 8 bits total, and
+                             // max_sfb_0 = 0 means the sf_data body decode consumes nothing
+                             // further (no scalefactor bands to read), so nothing to pad here.
+        bw.write_bit(false); // spec_frontend_bit = 0 (ASF)
+        bw.write_bit(true); // transform_info: b_long_frame = 1 (frame_len_base >= 1536)
+        bw.write_u32(0, 6); // psy_info: max_sfb_0 = 0
+
+        bw.write_bit(true); // b_dmx_timing = 1
+                            // oamd_timing_data(): oa_sample_offset_type=0, num_obj_info_blocks=1,
+                            // one block with a simple (non-0b11) ramp_duration_code.
+        bw.write_bit(false);
+        bw.write_u32(1, 3);
+        bw.write_u32(0, 6); // block_offset_factor
+        bw.write_u32(0b01, 2); // ramp_duration_code != 0b11
+
+        // oamd_dyndata_single(n_dmx=1, n_blocks=1, iframe, !alternative,
+        // [Dyn], [false]): object_info_block(b_no_delta=true, dynamic=true).
+        bw.write_bit(false); // b_object_not_active = 0
+        bw.write_bit(true); // b_default_basic_info_md = 1 (basic_info: nothing else)
+                            // render_info ALL_NEW: position + zone + otherprops all present.
+        bw.write_u32(1, 6); // pos3D_X
+        bw.write_u32(2, 6); // pos3D_Y
+        bw.write_bit(false); // pos3D_Z_sign
+        bw.write_u32(3, 4); // pos3D_Z
+        bw.write_bit(true); // b_grouped_zone_defaults
+        bw.write_bit(true); // b_grouped_other_defaults
+        bw.write_bit(false); // b_add_table_data = 0
+                             // b_alternative = false -> nothing more for oamd_dyndata_single.
+
+        bw.write_bit(false); // b_oamd_extension_present = 0
+
+        // ajoc(num_dmx_signals=1, num_umx_signals=1):
+        bw.write_u32(0, 3); // ajoc_num_decorr = 0
+                            // ajoc_ctrl_info: decorr_enable has 0 entries.
+        bw.write_bit(true); // object_present[0] = true
+        bw.write_u32(1, 2); // ajoc_data_point_info: num_dpoints = 1
+        bw.write_u32(0, 5); // start_pos[0]
+        bw.write_u32(0, 6); // ramp_len_minus1[0]
+        bw.write_u32(7, 3); // num_bands_code = 7 -> 1 band
+        bw.write_bit(false); // quant_select = Fine
+        bw.write_bit(false); // sparse_select = false
+                             // ajoc_data: ajoc_b_nodt = true -> dp=0 is DF-only; 1 channel, 1 band.
+        bw.write_bit(true);
+        // A single F0 codeword for the sole (o=0, dp=0, ch=0) entry.
+        write_shortest_dry_fine_f0_codeword(&mut bw);
+
+        // ajoc_dmx_de_data(1, 1): b_dmx_de_cfg=0, b_keep_dmx_de_coeffs=1
+        // (skips the de_dlg_dmx_coeff loop entirely).
+        bw.write_bit(false);
+        bw.write_bit(true);
+
+        bw.write_bit(true); // b_umx_timing = 1
+        bw.write_bit(false); // oamd_timing_data: oa_sample_offset_type=0
+        bw.write_u32(1, 3); // num_obj_info_blocks = 1
+        bw.write_u32(0, 6); // block_offset_factor
+        bw.write_u32(0b01, 2); // ramp_duration_code
+
+        // oamd_dyndata_single for the umx side — identical shape.
+        bw.write_bit(false); // b_object_not_active
+        bw.write_bit(true); // b_default_basic_info_md
+        bw.write_u32(4, 6); // pos3D_X
+        bw.write_u32(5, 6); // pos3D_Y
+        bw.write_bit(true); // pos3D_Z_sign
+        bw.write_u32(6, 4); // pos3D_Z
+        bw.write_bit(true); // b_grouped_zone_defaults
+        bw.write_bit(true); // b_grouped_other_defaults
+        bw.write_bit(false); // b_add_table_data
+
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let out = parse_audio_data_ajoc(&mut br, &info, true, false, 1920).unwrap();
+        assert_eq!(out.ajoc.ctrl.num_bands[0], 1);
+        assert_eq!(out.dmx_dyndata.blocks.len(), 1);
+        let dmx_pos = out.dmx_dyndata.blocks[0][0]
+            .render_info
+            .as_ref()
+            .unwrap()
+            .position
+            .unwrap();
+        assert_eq!((dmx_pos.x, dmx_pos.y, dmx_pos.z_sign, dmx_pos.z), (1, 2, false, 3));
+        let umx_pos = out.umx_dyndata.blocks[0][0]
+            .render_info
+            .as_ref()
+            .unwrap()
+            .position
+            .unwrap();
+        assert_eq!((umx_pos.x, umx_pos.y, umx_pos.z_sign, umx_pos.z), (4, 5, true, 6));
+        assert!(out.dmx_de_data.keep_dmx_de_coeffs);
+    }
+
+    /// Writes the shortest codeword of `AJOC_HCB_DRY_FINE_F0` — used by
+    /// `audio_data_ajoc_minimal_one_signal_each_side` to supply the sole
+    /// `ajoc_huff_data(DRY, ...)` codeword its minimal frame needs.
+    fn write_shortest_dry_fine_f0_codeword(bw: &mut oxideav_core::bits::BitWriter) {
+        let (len, cw) = crate::ajoc::shortest_dry_fine_f0_for_test();
+        bw.write_u32(cw, len);
     }
 }

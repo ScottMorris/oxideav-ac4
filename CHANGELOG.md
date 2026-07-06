@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 394 — **`audio_data_ajoc()` end-to-end** (§6.2.3.4), the
+  top-level per-frame walk for an A-JOC object-coded substream — the
+  last piece tying together every module landed in rounds 390-393:
+  * New `ajoc::parse_ajoc`/`parse_ajoc_data` (§6.2.5.1/.3): decodes
+    every present object's per-data-point Huffman parameters via
+    `ajoc_huff_data`, recovers absolute quantised values with
+    `differential_decode_dry`/`_wet` (one running `_prev` row per
+    channel/decorrelator, carried across the object's data points), and
+    dequantizes with `dequantize_dry`/`_wet` — real, tested (2 new
+    tests: a single-object round-trip, and an absent-object stays
+    zeroed check).
+  * New `toc::parse_audio_data_ajoc`: `var_channel_element` for the
+    downmix signals, `oamd_timing_data` + `oamd_dyndata_single` for the
+    downmix side, the OAMD-extension skip (using `ajoc_bed_info`'s own
+    `bits_read` to compute the exact remainder, mirroring how
+    `oamd_common_data`'s skip already worked), `ajoc()` +
+    `ajoc_dmx_de_data()` (already existing), then `oamd_timing_data` +
+    `oamd_dyndata_single` again for the upmix side. Handles the
+    A-JOC-bed-can't-carry-an-LFE quirk (`ac4_substream_info_ajoc`'s own
+    `b_lfe` flag becomes an extra leading signal ahead of
+    `bed_dyn_obj_assignment`'s descriptors, on both the downmix and
+    upmix sides).
+  * One comprehensive integration test
+    (`audio_data_ajoc_minimal_one_signal_each_side`) drives the entire
+    chain — `var_channel_element` → `oamd_timing_data` →
+    `oamd_dyndata_single` (with real 3D position) → `ajoc` (with a real
+    Huffman codeword) → `ajoc_dmx_de_data` → `oamd_timing_data` →
+    `oamd_dyndata_single` again — through one hand-built bitstream and
+    checks results end to end. Getting this bit-exact required
+    empirically measuring `parse_mono_data`'s actual consumption (its
+    inner `sf_data` body is try-and-bail / data-dependent, so it can't
+    just be padded and skipped when something real needs to follow it
+    at a known offset — a throwaway diagnostic test pinned it at
+    exactly 8 bits for an all-zero long-frame body).
+  841 lib tests passing overall.
+
+  **Still not wired up:** nothing in `decoder.rs` calls
+  `parse_audio_data_ajoc` yet — `parse_substream_group_info()` still
+  returns `Error::unsupported` the moment it sees `b_channel_coded ==
+  false`. Two narrow gaps remain by design: the `b_static_dmx` path
+  (`audio_data_chan(5.0/5.1)`) and non-timed frames (`b_dmx_timing`/
+  `b_umx_timing == 0`, which need a sticky `num_obj_info_blocks` this
+  path doesn't thread yet) both return `Error::unsupported` rather than
+  guessing.
+
 - ac4 round 393 — **OAMD dynamic per-object metadata** (`oamd_dyndata_single`,
   §6.2.8.3, plus its `object_info_block`/`object_basic_info`/
   `object_render_info` tree, §6.2.8.5-.7), in a new `oamd.rs` module:

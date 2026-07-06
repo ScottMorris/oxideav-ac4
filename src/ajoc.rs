@@ -483,6 +483,15 @@ fn get_ajoc_hcb(
     }
 }
 
+/// `(len, codeword)` of `AJOC_HCB_DRY_FINE_F0`'s shortest entry — for
+/// other modules' tests that need one real, minimal `ajoc_huff_data`
+/// codeword without reaching into this module's private tables.
+pub(crate) fn shortest_dry_fine_f0_for_test() -> (u32, u32) {
+    let hcb = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::F0);
+    let (idx, &len) = hcb.len.iter().enumerate().min_by_key(|(_, &l)| l).unwrap();
+    (len as u32, hcb.cw[idx])
+}
+
 /// `ajoc_huff_data()` (§6.2.5.5 / §6.3.6.5): decode one data point's
 /// per-band Huffman codewords for one channel/decorrelator, returning
 /// `(diff_type, deltas)` ready to hand to [`differential_decode_dry`] /
@@ -1125,6 +1134,113 @@ pub fn parse_ajoc_ctrl_info(
         mix_mtx_dry_present,
         mix_mtx_wet_present,
     })
+}
+
+/// The full `ajoc(num_dmx_signals, num_umx_signals)` result (§6.2.5.1):
+/// `ajoc_ctrl_info` plus the dequantized dry/wet matrices from
+/// `ajoc_data()`, ready for [`ajoc_reconstruct`].
+#[derive(Debug, Clone)]
+pub struct AjocParsed {
+    pub num_decorr: u32,
+    pub ctrl: AjocCtrlInfo,
+    /// `mtx_dry_dq[o][dp][ch][pb]` — dequantized dry coefficients.
+    pub mtx_dry_dq: Vec<Vec<Vec<Vec<f64>>>>,
+    /// `mtx_wet_dq[o][dp][de][pb]` — dequantized wet coefficients.
+    pub mtx_wet_dq: Vec<Vec<Vec<Vec<f64>>>>,
+}
+
+/// `ajoc(num_dmx_signals, num_umx_signals)` (§6.2.5.1).
+pub fn parse_ajoc(
+    br: &mut BitReader<'_>,
+    num_dmx_signals: u32,
+    num_umx_signals: u32,
+) -> Result<AjocParsed> {
+    let num_decorr = br.read_u32(3)?;
+    let ctrl = parse_ajoc_ctrl_info(br, num_dmx_signals, num_decorr, num_umx_signals)?;
+    let (mtx_dry_dq, mtx_wet_dq) = parse_ajoc_data(br, num_dmx_signals, &ctrl)?;
+    Ok(AjocParsed {
+        num_decorr,
+        ctrl,
+        mtx_dry_dq,
+        mtx_wet_dq,
+    })
+}
+
+/// `ajoc_data(num_dmx_signals, num_umx_signals)` (§6.2.5.3): decodes
+/// every present object's per-data-point Huffman-coded dry/wet
+/// parameters via [`ajoc_huff_data`], recovers the absolute quantised
+/// values with [`differential_decode_dry`]/[`differential_decode_wet`]
+/// (one running `_prev` row per channel/decorrelator, carried across
+/// this object's data points), and dequantizes them with
+/// [`dequantize_dry`]/[`dequantize_wet`]. Absent objects, and absent
+/// sparse-path matrix elements, are left at the zero-centre dequantized
+/// value (matching `mix_mtx_dry[o][dp][ch] = 0` / the sparse
+/// "not present" default).
+fn parse_ajoc_data(
+    br: &mut BitReader<'_>,
+    num_dmx_signals: u32,
+    ctrl: &AjocCtrlInfo,
+) -> Result<(Vec<Vec<Vec<Vec<f64>>>>, Vec<Vec<Vec<Vec<f64>>>>)> {
+    let num_umx = ctrl.object_present.len();
+    let num_dmx = num_dmx_signals as usize;
+    let num_decorr = ctrl.decorr_enable.len();
+    let num_dpoints = ctrl.data_point_info.num_dpoints as usize;
+
+    let ajoc_b_nodt = br.read_bit()?;
+
+    let mut mtx_dry_dq = vec![vec![vec![Vec::new(); num_dmx]; num_dpoints]; num_umx];
+    let mut mtx_wet_dq = vec![vec![vec![Vec::new(); num_decorr]; num_dpoints]; num_umx];
+
+    for o in 0..num_umx {
+        // Spec: `mix_mtx_dry[o][dp][ch] = 0` / `mix_mtx_wet[o][dp][de] = 0`
+        // for every data point up front — a literal zero coefficient
+        // (contributes nothing in `ajoc_reconstruct`), not a per-band
+        // concept. Covers the "object absent" case outright; for a
+        // present object, the per-band Huffman-decoded values below
+        // overwrite whichever channels/decorrelators are actually coded.
+        if !ctrl.object_present[o] {
+            continue;
+        }
+        let nb = ctrl.num_bands[o] as usize;
+        for dp in 0..num_dpoints {
+            for ch in 0..num_dmx {
+                mtx_dry_dq[o][dp][ch] = vec![0.0; nb];
+            }
+            for de in 0..num_decorr {
+                mtx_wet_dq[o][dp][de] = vec![0.0; nb];
+            }
+        }
+
+        let qs = ctrl.quant_select[o];
+        let sparse = ctrl.sparse_select[o];
+        let mut dry_prev: Vec<Vec<i32>> = vec![vec![0i32; nb]; num_dmx];
+        let mut wet_prev: Vec<Vec<i32>> = vec![vec![0i32; nb]; num_decorr];
+
+        for dp in 0..num_dpoints {
+            let b_dfonly = dp == 0 && ajoc_b_nodt;
+
+            for ch in 0..num_dmx {
+                let present = !sparse || ctrl.mix_mtx_dry_present[o].get(ch).copied().unwrap_or(false);
+                if sparse && !present {
+                    continue;
+                }
+                let (diff_type, deltas) = ajoc_huff_data(br, AjocMatrixKind::Dry, qs, nb, b_dfonly)?;
+                let abs = differential_decode_dry(&deltas, diff_type, qs, true, &mut dry_prev[ch]);
+                mtx_dry_dq[o][dp][ch] = abs.iter().map(|&q| dequantize_dry(q as u32, qs)).collect();
+            }
+            for de in 0..num_decorr {
+                let present = !sparse || ctrl.mix_mtx_wet_present[o].get(de).copied().unwrap_or(false);
+                if sparse && !present {
+                    continue;
+                }
+                let (diff_type, deltas) = ajoc_huff_data(br, AjocMatrixKind::Wet, qs, nb, b_dfonly)?;
+                let abs = differential_decode_wet(&deltas, diff_type, qs, true, &mut wet_prev[de]);
+                mtx_wet_dq[o][dp][de] = abs.iter().map(|&q| dequantize_wet(q as u32, qs)).collect();
+            }
+        }
+    }
+
+    Ok((mtx_dry_dq, mtx_wet_dq))
 }
 
 /// Parsed `ajoc_bed_info()` (§6.2.3.6).
@@ -1850,5 +1966,81 @@ mod tests {
         assert_eq!(out[0], f0_idx as i32);
         let nquant = AjocQuantMode::Coarse.nquant(AjocMatrixKind::Dry) as i32;
         assert_eq!(out[1], (out[0] + deltas[1]).rem_euclid(nquant));
+    }
+
+    fn pack_bits_msb(bits: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &b) in bits.iter().enumerate() {
+            if b != 0 {
+                out[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn parse_ajoc_single_object_single_band_no_decorr() {
+        // num_dmx_signals = 1, num_umx_signals = 1, ajoc_num_decorr = 0:
+        // the simplest possible ajoc() — one dry channel, no wet side.
+        let mut bits = Vec::new();
+        bits.extend([0, 0, 0]); // ajoc_num_decorr = 0
+                                // ajoc_ctrl_info: decorr_enable has 0 entries.
+        bits.push(1); // object_present[0] = true
+                      // ajoc_data_point_info: num_dpoints = 1 (2 bits), then one
+                      // (start_pos: 5 bits, ramp_len_minus1: 6 bits).
+        bits.extend([0, 1]); // num_dpoints = 1
+        bits.extend([0, 0, 0, 0, 0]); // start_pos[0] = 0
+        bits.extend([0, 0, 0, 0, 0, 0]); // ramp_len_minus1[0] = 0
+                                          // num_dpoints != 0, object 0 present:
+        bits.extend([1, 1, 1]); // num_bands_code = 7 -> 1 band
+        bits.push(0); // quant_select = Fine
+        bits.push(0); // sparse_select = false (no per-element presence bits)
+
+        // ajoc_data: ajoc_b_nodt = true, so dp=0 is DF-only (no diff_type
+        // bit read); one channel, one band -> a single F0 codeword.
+        bits.push(1); // ajoc_b_nodt = true
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::F0);
+        let (f0_idx, &len) = hcb.len.iter().enumerate().min_by_key(|(_, &l)| l).unwrap();
+        let cw = hcb.cw[f0_idx];
+        bits.extend((0..len).map(|b| ((cw >> (len - 1 - b)) & 1) as u8));
+
+        let bytes = pack_bits_msb(&bits);
+        let mut br = BitReader::new(&bytes);
+        let parsed = parse_ajoc(&mut br, 1, 1).unwrap();
+
+        assert_eq!(parsed.num_decorr, 0);
+        assert!(parsed.ctrl.object_present[0]);
+        assert_eq!(parsed.ctrl.num_bands[0], 1);
+        assert_eq!(parsed.mtx_dry_dq.len(), 1); // num_umx
+        assert_eq!(parsed.mtx_dry_dq[0].len(), 1); // num_dpoints
+        assert_eq!(parsed.mtx_dry_dq[0][0].len(), 1); // num_dmx (channels)
+        assert_eq!(parsed.mtx_dry_dq[0][0][0].len(), 1); // num_bands
+
+        let expected = dequantize_dry(f0_idx as u32, AjocQuantMode::Fine);
+        assert!((parsed.mtx_dry_dq[0][0][0][0] - expected).abs() < 1e-12);
+        // No decorrelators -> the wet matrix has zero decorrelator rows.
+        assert_eq!(parsed.mtx_wet_dq[0][0].len(), 0);
+    }
+
+    #[test]
+    fn parse_ajoc_absent_object_stays_zeroed() {
+        // Same shape but object_present[0] = false: ajoc_data should
+        // read nothing further for object 0, leaving its dry/wet
+        // matrices as empty (zero-band) placeholders rather than
+        // consuming any Huffman codewords.
+        let mut bits = Vec::new();
+        bits.extend([0, 0, 0]); // ajoc_num_decorr = 0
+        bits.push(0); // object_present[0] = false
+        bits.extend([0, 1]); // num_dpoints = 1
+        bits.extend([0, 0, 0, 0, 0]); // start_pos[0]
+        bits.extend([0, 0, 0, 0, 0, 0]); // ramp_len_minus1[0]
+                                          // object 0 not present -> no num_bands_code/quant_select/sparse_select bits.
+        bits.push(1); // ajoc_b_nodt (still read unconditionally by ajoc_data)
+        let bytes = pack_bits_msb(&bits);
+        let mut br = BitReader::new(&bytes);
+        let parsed = parse_ajoc(&mut br, 1, 1).unwrap();
+        assert!(!parsed.ctrl.object_present[0]);
+        assert_eq!(parsed.mtx_dry_dq[0][0].len(), 1);
+        assert!(parsed.mtx_dry_dq[0][0][0].is_empty());
     }
 }
