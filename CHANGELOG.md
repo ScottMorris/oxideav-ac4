@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 393 — **OAMD dynamic per-object metadata** (`oamd_dyndata_single`,
+  §6.2.8.3, plus its `object_info_block`/`object_basic_info`/
+  `object_render_info` tree, §6.2.8.5-.7), in a new `oamd.rs` module:
+  * `parse_oamd_timing_data` (§6.2.8.2).
+  * `object_basic_info()` (gain/priority) and `object_render_info()`
+    (real 3D `pos3D_X/Y/Z` position, both absolute and
+    delta-against-previous-block forms, plus the zone/otherprops fields
+    consumed for bit-accuracy though not surfaced — they're renderer
+    tuning hints, not needed for a basic per-object position+gain
+    render).
+  * `object_info_block()`'s full active/reuse/partial-reuse dispatch,
+    threading the previous block's absolute position through for
+    delta-coded blocks.
+  * `oamd_dyndata_single()` itself, including the `b_alternative`
+    alternate-presentation branch (gain/position overrides per data
+    point).
+  9 new tests, 836 lib tests passing overall.
+
+  **Scope note** (documented at the top of `oamd.rs`): two rare, deeply
+  nested optional sub-elements return `Error::unsupported` rather than
+  being guessed at, since — unlike `oamd_common_data`'s
+  `bed_render_info()`/`headphone()`, which can be skipped as one opaque
+  declared-length block — the spec computes their skip length *from*
+  how many bits the (unimplemented) function itself would consume:
+  `add_per_object_md()` (`object_info_block`'s `b_add_table_data`
+  branch) and `ext_prec_alt_pos()` (`oamd_dyndata_single`'s
+  `b_alternative` additional-data branch).
+
+  Also flagged as a best-effort reading pending real-content
+  validation: `diff_pos3D_{X,Y,Z}`'s exact signed encoding isn't
+  spelled out in the syntax table bit-width column (just "3" bits);
+  treated as an offset-binary delta (range -4..=3) added to the
+  previous absolute position, matching this spec family's usual
+  small-delta convention elsewhere.
+
+
 - ac4 round 390 — **A-JOC Huffman decode + object-substream descriptor
   parsing**, closing two of the gaps flagged in "Not yet supported":
   1. **`AJOC_HCB_*` Huffman tables** (ETSI TS 103 190-2 Annex A.1.1,

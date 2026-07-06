@@ -166,23 +166,28 @@ an S16 `AudioFrame`:
 - **Object-coded (A-JOC) substream decode end-to-end** — the substream
   descriptor layer (`ac4_substream_info_ajoc`, `bed_dyn_obj_assignment`,
   `oamd_common_data`), the A-JOC Huffman/matrix decode (`ajoc_huff_data`,
-  `differential_decode_*`, `ajoc_reconstruct`), and the downmix signals'
+  `differential_decode_*`, `ajoc_reconstruct`), the downmix signals'
   spectral frontend (`parse_var_channel_element`, §6.2.4.4 — dispatches
   to the existing mono/two/three-channel ASF primitives by signal
   count/parity, the `aspx_config`/`companding_control` gates, **and**
   the A-SPX bandwidth-extension trailer itself via the crate's existing
   `asf::parse_aspx_data_2ch_body`/`_1ch_body` — real, tested, I-frame
-  decode, not a stub) are landed, but nothing wires them into an actual
-  per-frame walk yet: `audio_data_ajoc()` itself (§6.2.3.4, the function
-  that would call `var_channel_element` then `ajoc()`) isn't
-  implemented, and neither is `oamd_dyndata_single()` (§6.2.8.3 —
-  per-object gain/position metadata, including real 3D position
-  fields). `parse_substream_group_info()` still returns
-  `Error::unsupported` the moment it sees `b_channel_coded == false`.
+  decode, not a stub), and the OAMD dynamic per-object metadata
+  (`oamd.rs`: `parse_oamd_dyndata_single` + its `object_info_block`/
+  `object_basic_info`/`object_render_info` tree, including real 3D
+  `pos3D_X/Y/Z` position and gain, §6.2.8.3/.5-.7) are all landed, but
+  nothing wires them into an actual per-frame walk yet: `audio_data_ajoc()`
+  itself (§6.2.3.4, the function that would call `var_channel_element`
+  then `ajoc()` then `oamd_dyndata_single()` twice) isn't implemented.
+  `parse_substream_group_info()` still returns `Error::unsupported` the
+  moment it sees `b_channel_coded == false`.
   Non-I-frame `var_channel_element` calls also still return
   `Error::unsupported` — the sticky cross-frame `aspx_config` the
   channel-coded path threads through `StickyConfig` isn't threaded into
-  this A-JOC downmix path yet.
+  this A-JOC downmix path yet. Two rare, deeply-nested OAMD sub-elements
+  (`add_per_object_md()`, `ext_prec_alt_pos()`) do the same, since their
+  skip length is spec-defined *in terms of* their own (unimplemented)
+  bit consumption rather than a plain declared byte count.
   Note that `oamd_dyndata_single`'s position metadata implies object-coded
   content may need actual spatial *rendering* (objects + 3D positions →
   final output channels) on top of decoding — the object-audio renderer

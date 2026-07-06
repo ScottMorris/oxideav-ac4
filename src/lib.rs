@@ -510,6 +510,7 @@ pub mod huffman;
 pub mod mch;
 pub mod mdct;
 pub mod metadata;
+pub mod oamd;
 pub mod qmf;
 pub mod sfb_offset;
 pub mod ssf;
