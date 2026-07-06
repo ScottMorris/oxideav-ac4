@@ -7,7 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **IMDCT's inner complex transform now uses a real FFT (`rustfft`)
+  instead of a direct-form O(N²) sum.** `mdct::imdct`'s "Step 3" was a
+  literal double loop recomputing `sin`/`cos` from scratch on every
+  iteration — for a 2048-sample long-frame window that's roughly 1M
+  trig-heavy iterations *per channel, per frame*; across 8 channels and
+  a multi-thousand-frame track, tens of billions of transcendental
+  calls for a single full-track decode. The surrounding pre/post-
+  rotation steps were already correct and untouched; only the middle
+  "complex IFFT of length half_n" is now a real FFT, cached per-size in
+  a thread-local (`rustfft`'s own planning cost is nontrivial and this
+  function runs thousands of times per track at a handful of fixed
+  sizes). All 844 tests still pass — the swap is numerically
+  equivalent, not just faster. A full-track real-content decode that
+  previously hadn't finished after 46+ minutes now completes in
+  3-6 minutes.
+
+  This is flagged as a deliberate, temporary departure from every
+  other `oxideav-*` codec crate's zero-external-dependency convention
+  (checked directly: `oxideav-mp3`, `oxideav-speex`, `oxideav-h265`,
+  `oxideav-flac` all depend on nothing but sibling `oxideav-*` crates)
+  — a hand-rolled mixed-radix FFT would match that convention but is
+  real DSP work; `rustfft` (itself pure Rust, no unsafe/C deps) gets
+  real playback speed now, with the tradeoff left as an open question
+  for upstream. The encoder's forward `mdct_naive` (`encoder_mdct.rs`)
+  is a different, non-FFT-shaped direct cosine-basis sum and is out of
+  scope here — the encoder isn't on a hot path the way real-content
+  decode is.
+
 ### Fixed
+
+- **5_X SIMPLE/ASPX `Cfg0`/`Cfg1` dispatch used a combined guard
+  across two independent sub-structures, silently discarding a
+  perfectly good half whenever the other half didn't match `samples`.**
+  `Cfg1ThreeStereo`'s body is `three_channel_data + two_channel_data` —
+  two separate `sf_info(ASF, 0, 0)` elements, each with its own
+  independent transform info. Real content can legitimately pair a
+  grouped/short-frame half with a long-frame half (confirmed against
+  real content: frame 1 of the test file has `three_channel_data` at
+  a grouped `tl=128` while its trailing `two_channel_data` is
+  long-frame at `tl=2048`). `dispatch_5x_cfg1_simple_aspx` gated
+  `three` and `tcd` with a *single* combined check — if `three`'s
+  transform length didn't match `samples`, the function returned
+  before ever looking at `tcd`, discarding `tcd`'s independently
+  correct long-frame data too (and vice versa). Same bug, same fix,
+  in `dispatch_5x_cfg0_simple_aspx`'s `tcd_a`/`tcd_b` pair.
+
+  Fixed by gating each half independently — each renders its own
+  slots when its own transform length matches `samples`, regardless of
+  the other half's state. (`Cfg2FourMono`'s `four_channel_data` +
+  `cfg2_back_mono` pair was already correct — `back_mono`'s IMDCT
+  helper already gates independently via its own `Option`-returning
+  contract; `Cfg3Five` has no sub-structure split to have this bug.)
+
+  Verified against real content: slot-0 (L) nonzero-PCM rate rose from
+  60.2% to **69.5%**, and main-soundstage activity (any of slots 0..4)
+  rose to **92.9%** of all 1571 real frames tested.
 
 - **Grouped/short-frame `sf_data(ASF)` decode never handled multi-window
   groups, and never IMDCT'd the result** — the two biggest remaining

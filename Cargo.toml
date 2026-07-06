@@ -15,3 +15,12 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
+# Temporary speed shortcut for the IMDCT's inner complex transform,
+# replacing an O(N^2) direct-form sum (see src/mdct.rs). Every other
+# oxideav-* codec crate is dependency-free by design ("pure Rust, no C
+# deps"), so this is flagged as a decision to revisit with upstream
+# (OxideAV/oxideav-ac4) rather than a settled choice — a hand-rolled
+# mixed-radix FFT would match the project's convention but is real DSP
+# work; rustfft (itself pure Rust, no unsafe C deps) gets real playback
+# speed now.
+rustfft = "6.4"

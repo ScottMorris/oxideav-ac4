@@ -20,6 +20,32 @@
 //!   -  256 / 240 / 192   → alpha = 5
 
 use core::f32::consts::PI;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rustfft::num_complex::Complex64;
+use rustfft::{Fft, FftPlanner};
+
+thread_local! {
+    /// Per-thread cache of planned inverse FFTs, keyed by size. AC-4
+    /// only ever asks for a handful of distinct sizes (half of
+    /// 2048/1920/1536/1024/960/768/512/480/384/256/240/192/128/120/96),
+    /// so this cache stays tiny and avoids re-deriving the FFT's
+    /// twiddle factors on every single `imdct()` call — this function
+    /// runs once per channel per frame, thousands of times per track.
+    static IFFT_CACHE: RefCell<HashMap<usize, Arc<dyn Fft<f64>>>> = RefCell::new(HashMap::new());
+}
+
+fn cached_inverse_fft(len: usize) -> Arc<dyn Fft<f64>> {
+    IFFT_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .entry(len)
+            .or_insert_with(|| FftPlanner::new().plan_fft_inverse(len))
+            .clone()
+    })
+}
 
 /// KBD window alpha for transform length N (Table 186, 48 kHz family).
 pub fn kbd_alpha(n: u32) -> f32 {
@@ -116,22 +142,19 @@ pub fn imdct(x: &[f32]) -> Vec<f32> {
         zr[k] = a * xc - b * xs;
         zi[k] = b * xc + a * xs;
     }
-    // Step 3: complex IFFT of length half_n — direct form.
-    let mut yr_half = vec![0.0_f64; half_n];
-    let mut yi_half = vec![0.0_f64; half_n];
-    for n in 0..half_n {
-        let mut acc_r = 0.0_f64;
-        let mut acc_i = 0.0_f64;
-        for k in 0..half_n {
-            let theta = 4.0 * std::f64::consts::PI * k as f64 * n as f64 / fp_n;
-            let c = theta.cos();
-            let s = theta.sin();
-            acc_r += zr[k] * c - zi[k] * s;
-            acc_i += zr[k] * s + zi[k] * c;
-        }
-        yr_half[n] = acc_r;
-        yi_half[n] = acc_i;
-    }
+    // Step 3: complex IFFT of length half_n. Y[n] = sum_k Z[k] *
+    // exp(+i*2*pi*k*n/half_n) — an *unnormalized* inverse DFT (no
+    // 1/half_n scaling), which is exactly rustfft's own convention for
+    // `plan_fft_inverse` (its docs guarantee `ifft(fft(x)) == len * x`,
+    // i.e. neither direction is pre-scaled). This used to be a direct
+    // O(half_n^2) double loop recomputing sin/cos every iteration —
+    // billions of transcendental calls for a full track — now O(half_n
+    // log half_n) via a real (cached, so repeat calls at the same size
+    // skip re-planning) FFT.
+    let mut buf: Vec<Complex64> = (0..half_n).map(|k| Complex64::new(zr[k], zi[k])).collect();
+    cached_inverse_fft(half_n).process(&mut buf);
+    let yr_half: Vec<f64> = buf.iter().map(|c| c.re).collect();
+    let yi_half: Vec<f64> = buf.iter().map(|c| c.im).collect();
     // Step 4: post-IFFT multiply, divided by N.
     let mut yr = vec![0.0_f64; half_n];
     let mut yi = vec![0.0_f64; half_n];

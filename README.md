@@ -93,9 +93,29 @@ an S16 `AudioFrame`:
   wired a generic per-window IMDCT accumulator (mirrors
   `run_ssf_channel`'s block-by-block pattern) into all four
   `Cfg0`/`Cfg1`/`Cfg2`/`Cfg3` main-channel dispatchers. Slot-0 (L)
-  nonzero rate rose again, from 31.2% to **60.2%**, and main-soundstage
-  activity (any of slots 0..4) now reaches **88.5%** of all 1571 real
-  frames tested. See Changelog for the full trail.
+  nonzero rate rose again, from 31.2% to 60.2%, and main-soundstage
+  activity (any of slots 0..4) reached 88.5% of all 1571 real frames
+  tested.
+
+  A **fifth** bug then surfaced from real-content validation with an
+  actual audio reference (FLAC / E-AC-3 of the same songs): `Cfg0`'s
+  and `Cfg1`'s dispatch each combine two independent sub-structures
+  (`three_channel_data` + a trailing `two_channel_data` for `Cfg1`;
+  two `two_channel_data` halves for `Cfg0`) behind a *single* combined
+  transform-length guard — real content can legitimately pair a
+  grouped/short-frame half with a long-frame half (confirmed: frame 1
+  of the test file has `three_channel_data` grouped at `tl=128` while
+  its trailing `two_channel_data` is long-frame at `tl=2048`), and the
+  combined guard discarded *both* halves whenever either one didn't
+  match `samples` — even the half that was perfectly fine. Fixed by
+  gating each half independently. Slot-0 nonzero rate rose again, to
+  **69.5%**, and main-soundstage activity to **92.9%**. See Changelog
+  for the full trail.
+
+  Also swapped the IMDCT's inner O(N²) direct-form sum for a real,
+  cached FFT (`rustfft`) — full-track real-content decodes that
+  previously hadn't finished after 46+ minutes now complete in
+  3-6 minutes, with all 844 tests confirming numerical equivalence.
 
 - **`examples/ac4info.rs`** — a small mediainfo-style CLI, since stock
   `ffprobe`/`mediainfo` don't parse AC-4's TOC at all (they just report

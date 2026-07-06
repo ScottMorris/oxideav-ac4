@@ -1364,26 +1364,11 @@ impl Ac4Decoder {
         samples: usize,
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
     ) {
-        let Some(ti_a) = tcd_a.transform_info.as_ref() else {
-            return;
-        };
-        let n_a = ti_a.transform_length_0 as usize;
-        if n_a == 0 || n_a != samples {
-            return;
-        }
-        let Some(ti_b) = tcd_b.transform_info.as_ref() else {
-            return;
-        };
-        let n_b = ti_b.transform_length_0 as usize;
-        if n_b == 0 || n_b != samples {
-            return;
-        }
-        if tcd_a.scaled_spec_per_channel.len() < 2 || tcd_b.scaled_spec_per_channel.len() < 2 {
-            return;
-        }
-        // Slot map per Table 180 column 0:
-        //   2ch_mode == 0: [0,1] then [3,4] (L,R / Ls,Rs)
-        //   2ch_mode == 1: [0,3] then [1,4] (L,Ls / R,Rs)
+        // `tcd_a`/`tcd_b` are gated *independently* — real content can
+        // legitimately pair a grouped/short-frame half with a
+        // long-frame one (each is its own `sf_info(ASF, 0, 0)`), and a
+        // combined check would silently drop the matching half's
+        // perfectly good data whenever the other half didn't match.
         let slot_map_a: [usize; 2] = if b_2ch_mode { [0, 3] } else { [0, 1] };
         let slot_map_b: [usize; 2] = if b_2ch_mode { [1, 4] } else { [3, 4] };
         while pcm_per_channel.len() < 5 {
@@ -1398,27 +1383,45 @@ impl Ac4Decoder {
         //   slot 4 (Rs) -> aspx_ls_rs.secondary
         //   slot 2 (C)  -> aspx_centre.primary
         let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
-        for (ch_in, &slot) in slot_map_a.iter().enumerate() {
-            let Some(scaled) = tcd_a.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let n_a = tcd_a
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n| n != 0 && n == samples);
+        if let Some(n_a) = n_a {
+            if tcd_a.scaled_spec_per_channel.len() >= 2 {
+                for (ch_in, &slot) in slot_map_a.iter().enumerate() {
+                    let Some(scaled) = tcd_a.scaled_spec_per_channel[ch_in].as_ref() else {
+                        continue;
+                    };
+                    let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
+                    entries.push((
+                        slot,
+                        pcm_f,
+                        Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                    ));
+                }
+            }
         }
-        for (ch_in, &slot) in slot_map_b.iter().enumerate() {
-            let Some(scaled) = tcd_b.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let n_b = tcd_b
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n| n != 0 && n == samples);
+        if let Some(n_b) = n_b {
+            if tcd_b.scaled_spec_per_channel.len() >= 2 {
+                for (ch_in, &slot) in slot_map_b.iter().enumerate() {
+                    let Some(scaled) = tcd_b.scaled_spec_per_channel[ch_in].as_ref() else {
+                        continue;
+                    };
+                    let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
+                    entries.push((
+                        slot,
+                        pcm_f,
+                        Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                    ));
+                }
+            }
         }
         if let Some(mono) = centre_mono {
             if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
@@ -1521,8 +1524,14 @@ impl Ac4Decoder {
     ///     two_channel_data[0..2]   -> [3, 4]    (Ls, Rs)
     /// ```
     ///
-    /// No-op on transform-length / sample-count mismatch, or when a
-    /// per-channel scaled spectrum is absent.
+    /// No-op per half on transform-length / sample-count mismatch, or
+    /// when a per-channel scaled spectrum is absent. `three` and `tcd`
+    /// are gated *independently* — real content can legitimately pair a
+    /// grouped/short-frame `three_channel_data` with a long-frame
+    /// trailing `two_channel_data` (or vice versa), since each is its
+    /// own `sf_info(ASF, 0, 0)` with its own transform info. Gating both
+    /// halves on a single combined check would silently drop whichever
+    /// half *did* match `samples` whenever the other one didn't.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_5x_cfg1_simple_aspx(
         &mut self,
@@ -1537,50 +1546,53 @@ impl Ac4Decoder {
         samples: usize,
         pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
     ) {
-        let Some(ti3) = three.transform_info.as_ref() else {
-            return;
-        };
-        let n3 = ti3.transform_length_0 as usize;
-        if n3 == 0 || n3 != samples {
-            return;
-        }
-        let Some(ti2) = tcd.transform_info.as_ref() else {
-            return;
-        };
-        let n2 = ti2.transform_length_0 as usize;
-        if n2 == 0 || n2 != samples {
-            return;
-        }
-        if three.scaled_spec_per_channel.len() < 3 || tcd.scaled_spec_per_channel.len() < 2 {
-            return;
-        }
         while pcm_per_channel.len() < 5 {
             pcm_per_channel.push(None);
         }
-        const THREE_SLOTS: [usize; 3] = [0, 1, 2];
         let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
-        for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {
-            let Some(scaled) = three.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let three_ok = three
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n3| n3 != 0 && n3 == samples)
+            .is_some()
+            && three.scaled_spec_per_channel.len() >= 3;
+        if three_ok {
+            let n3 = samples;
+            const THREE_SLOTS: [usize; 3] = [0, 1, 2];
+            for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {
+                let Some(scaled) = three.scaled_spec_per_channel[ch_in].as_ref() else {
+                    continue;
+                };
+                let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
+                entries.push((
+                    slot,
+                    pcm_f,
+                    Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                ));
+            }
         }
-        const TWO_SLOTS: [usize; 2] = [3, 4];
-        for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
-            let Some(scaled) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let tcd_ok = tcd
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n2| n2 != 0 && n2 == samples)
+            .is_some()
+            && tcd.scaled_spec_per_channel.len() >= 2;
+        if tcd_ok {
+            let n2 = samples;
+            const TWO_SLOTS: [usize; 2] = [3, 4];
+            for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
+                let Some(scaled) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
+                    continue;
+                };
+                let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
+                entries.push((
+                    slot,
+                    pcm_f,
+                    Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                ));
+            }
         }
         self.extend_5x_entries(
             entries,
