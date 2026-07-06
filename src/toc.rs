@@ -958,15 +958,33 @@ fn parse_substream_group_info(
                 }
             }
         }
-        // ac4_substream_info_ajoc / ac4_substream_info_obj are not
-        // implemented for v2 audio body parsing yet; the loop returns
-        // Unsupported on the first iteration so callers surface an
-        // error rather than silently mis-aligning the bitstream.
-        if n_lf_substreams > 0 {
-            let _b_ajoc = br.read_bit()?;
-            return Err(Error::unsupported(
-                "ac4: ajoc / object substream parsing not implemented",
-            ));
+        for sus in 0..n_lf_substreams {
+            let b_ajoc = br.read_bit()?;
+            if b_ajoc {
+                let ajoc_info =
+                    parse_substream_info_ajoc(br, fs_index, frame_rate_index, b_substreams_present)?;
+                if sus == 0 {
+                    let upmix_channels =
+                        ajoc_info.n_fullband_upmix_signals + u32::from(ajoc_info.b_lfe);
+                    summary.first_channels = upmix_channels as u16;
+                    summary.first_sf_multiplier = ajoc_info.sf_multiplier;
+                }
+                if b_hsf_ext && b_substreams_present {
+                    let si = br.read_u32(2)?;
+                    if si == 3 {
+                        let _ = variable_bits(br, 2)?;
+                    }
+                }
+            } else {
+                // Direct-coded (non-A-JOC) object substreams
+                // (ac4_substream_info_obj) aren't implemented — Tidal's
+                // AC-4 IMS content uses the A-JOC path, per the earlier
+                // real-file investigation that motivated this whole
+                // object-decode effort.
+                return Err(Error::unsupported(
+                    "ac4: direct object-coded (non-A-JOC) substream parsing not implemented",
+                ));
+            }
         }
     }
     let b_content_type = br.read_bit()?;
@@ -1872,5 +1890,40 @@ mod tests {
     fn write_shortest_dry_fine_f0_codeword(bw: &mut oxideav_core::bits::BitWriter) {
         let (len, cw) = crate::ajoc::shortest_dry_fine_f0_for_test();
         bw.write_u32(cw, len);
+    }
+
+    #[test]
+    fn substream_group_info_ajoc_no_longer_errors() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_substreams_present
+        bw.write_bit(false); // b_hsf_ext
+        bw.write_bit(true); // b_single_substream -> n_lf_substreams = 1
+        bw.write_bit(false); // b_channel_coded = 0 (object-coded)
+        bw.write_bit(false); // b_oamd_substream = 0
+        bw.write_bit(true); // b_ajoc = 1 (this substream is A-JOC coded)
+
+        // ac4_substream_info_ajoc: b_lfe=0, b_static_dmx=1 (n_fullband_dmx=5,
+        // no bed_dyn_obj_assignment read), b_oamd_common_data_present=0,
+        // n_fullband_upmix_signals_minus1=1 -> 2, then dyn-only bed
+        // assignment for those 2 upmix signals, no sf_multiplier
+        // (fs_index=0), no bitrate info, one b_audio_ndot bit
+        // (frame_rate_factor is always 1 here), no substream_index
+        // (b_substreams_present=0).
+        bw.write_bit(false); // b_lfe
+        bw.write_bit(true); // b_static_dmx
+        bw.write_bit(false); // b_oamd_common_data_present
+        bw.write_u32(1, 4); // n_fullband_upmix_signals_minus1 = 1 -> 2
+        bw.write_bit(true); // upmix bed_dyn_obj_assignment: b_dyn_objects_only = 1
+        bw.write_bit(false); // b_bitrate_info
+        bw.write_bit(false); // b_audio_ndot
+
+        bw.write_bit(false); // b_content_type
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let summary = parse_substream_group_info(&mut br, 2, 0, 4).unwrap();
+        assert_eq!(summary.first_channels, 2);
     }
 }
