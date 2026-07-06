@@ -109,8 +109,17 @@ an S16 `AudioFrame`:
   combined guard discarded *both* halves whenever either one didn't
   match `samples` — even the half that was perfectly fine. Fixed by
   gating each half independently. Slot-0 nonzero rate rose again, to
-  **69.5%**, and main-soundstage activity to **92.9%**. See Changelog
-  for the full trail.
+  69.5%, and main-soundstage activity to 92.9%.
+
+  A **sixth** bug: `decode_asf_grouped_body_windows` rejected the
+  legitimate case of a short-frame body whose windows *all* collapse
+  into a single group (`num_windows > 1`, `num_window_groups == 1` —
+  real content packs up to 8 windows into one group this way) — its
+  entry guard checked group count instead of window count, bailing
+  before the widening/ungrouping logic (which handles this case fine)
+  ever ran. Fixed by gating on `psy.num_windows <= 1` instead. Slot-0
+  nonzero rate rose again, to **73.2%**, and main-soundstage activity
+  to **95.4%**. See Changelog for the full trail.
 
   Also swapped the IMDCT's inner O(N²) direct-form sum for a real,
   cached FFT (`rustfft`) — full-track real-content decodes that

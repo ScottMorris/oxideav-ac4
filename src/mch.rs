@@ -599,7 +599,14 @@ pub(crate) fn decode_asf_grouped_body_windows(
     psy: &AsfPsyInfo,
     max_sfb_in: u32,
 ) -> Option<Vec<WindowSpectrum>> {
-    if psy.num_window_groups <= 1 {
+    // Real short-frame content can legitimately collapse ALL of its
+    // physical windows into a *single* group (`num_window_groups == 1`
+    // with `num_windows > 1` — every `scale_factor_grouping` bit set to
+    // "continue"), which still needs the widened-decode + ungrouping
+    // machinery below (`num_win_in_group[0] == num_windows` in that
+    // case). The only genuine "nothing to ungroup" case is a single
+    // physical window altogether.
+    if psy.num_windows <= 1 {
         return None;
     }
     let (tl_idx_per_g, tl_per_g, max_sfb_per_g, num_win_in_group_per_g) =

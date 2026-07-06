@@ -39,6 +39,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`decode_asf_grouped_body_windows` rejected the legitimate case of a
+  short-frame body whose windows all collapse into a single group.**
+  Real content can have `num_windows > 1` (genuinely short-frame,
+  `b_long_frame == false`) with `num_window_groups == 1` — every
+  `scale_factor_grouping` bit set to "continue", so all windows share
+  one group's side info (`num_win_in_group[0] == num_windows`, up to
+  8 in observed real content). The function's entry guard was
+  `if psy.num_window_groups <= 1 { return None; }`, treating this as
+  "not actually grouped" and bailing before ever attempting the
+  widened decode — even though the widening/ungrouping machinery
+  underneath handles `num_window_groups == 1` correctly (it's not a
+  degenerate case for that code, only for the guard). Every consumer
+  of this channel's data then saw it as "no data at all" for the
+  whole frame, since neither the long-frame path (`b_long_frame` is
+  false) nor the grouped path (blocked by this guard) would run.
+
+  Fixed by gating on `psy.num_windows <= 1` instead — the actual
+  "nothing to ungroup" condition — rather than the group count.
+  Verified against real content: slot-0 (L) nonzero-PCM rate rose from
+  69.5% to **73.2%**, and main-soundstage activity (any of slots 0..4)
+  rose to **95.4%** of all 1571 real frames tested.
+
 - **5_X SIMPLE/ASPX `Cfg0`/`Cfg1` dispatch used a combined guard
   across two independent sub-structures, silently discarding a
   perfectly good half whenever the other half didn't match `samples`.**
