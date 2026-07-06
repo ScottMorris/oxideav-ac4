@@ -68,9 +68,34 @@ an S16 `AudioFrame`:
   data-dependently; fixed by constructing the LFE transform info
   implicitly (0 bits) per Table 35. Real content now parses substream
   bodies with **0 errors across all 1571 frames** of a real Tidal
-  file, and **1312 of 1571 frames (83.5%) decode to genuinely
-  non-silent PCM** — see Changelog for what's left (the remaining
-  silent frames aren't yet distinguished from real quiet passages).
+  file. Checking the whole-8-channel-interleaved-buffer nonzero rate
+  alone (83.5%) turned out to be misleading — the LFE channel decodes
+  independently of the main L/R/C/Ls/Rs core, so a frame with a
+  completely silent main soundstage still counted as "audible" if only
+  the sub-bass was present. Checking slot 0 (L) specifically instead: a
+  **third** bug, `receive_frame()`'s 7_X main-channel dispatch only
+  ever firing for `seven_x_coding_config == Cfg3Five`, meant the other
+  three real configs (`Cfg0`/`Cfg1`/`Cfg2` — parsed correctly, just
+  never converted to PCM) were **100% silent** on slot 0. Fixed by
+  routing all three through the existing `dispatch_5x_cfg0/1/2_simple_aspx`
+  helpers (already used by the real 5_X path); slot-0 nonzero rate rose
+  from 11.2% to 31.2% of all real frames. This surfaced a fourth,
+  larger, still-open gap: **every** main-channel dispatch function
+  only handles the single long-frame (`transform_length_0 == 2048`)
+  case — short-frame/grouped-window main-channel bodies (52% of real
+  frames) are silently dropped, 100% of the time, regardless of
+  coding_config. See Changelog for the full trail.
+
+- **`examples/ac4info.rs`** — a small mediainfo-style CLI, since stock
+  `ffprobe`/`mediainfo` don't parse AC-4's TOC at all (they just report
+  the container's `stsd` channel-count hint, which for AC-4 IMS content
+  can be entirely different from what the bitstream itself carries).
+  Accepts either a raw AC-4 elementary stream or an MP4/M4A file
+  directly (auto-detects and demuxes the `ac-4` track's samples itself
+  — no external extraction step), and reports bitstream version, real
+  sample rate/frame rate, per-substream-group layout (channel-coded vs
+  A-JOC, and which of the three same-channel-count 7.1 layouts), and
+  I/P-frame statistics. `cargo run --example ac4info -- <file> [--frames]`.
 
 - **ASF coefficient pipeline** — `asf_section_data()`,
   `asf_spectral_data()` (HCB 1..11 + the codebook-11 escape),

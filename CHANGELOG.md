@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **7_X SIMPLE/ASPX main-channel (slots 0..4) dispatch only wired
+  `Cfg3Five`** — `Cfg0Stereo2plusMono`/`Cfg1ThreeStereo`/`Cfg2FourMono`
+  were parsed correctly (real, non-silent spectral data landed in
+  `tools.two_channel_data`/`three_channel_data`/`four_channel_data`)
+  but never converted to PCM: `receive_frame()`'s round-91 dispatch
+  gate matched only `Cfg3Five`, so the other three configs' L/R/C/Ls/Rs
+  core came out as pure digital silence every time, with only the LFE
+  channel (decoded independently of this gate) making the frame look
+  "audible" at the whole-frame level. Confirmed against real content:
+  100% of `Cfg0`/`Cfg1`/`Cfg2` frames had a silent slot 0 before this
+  fix, for every real Tidal frame tested.
+
+  Fixed by routing all three configs through the existing
+  `dispatch_5x_cfg0/1/2_simple_aspx` helpers — the same functions
+  already used by the real 5_X path — passing `None` for the ASPX
+  trailer slots (the 7_X walker's own trailer plumbing is a separate,
+  not-yet-wired concern, matching the existing `Cfg3Five` branch's
+  simplification). Verified: slot-0 (L) nonzero-PCM rate on real
+  content rose from 11.2% to 31.2% of all frames.
+
+  This surfaced a second, deeper, and larger gap: **every** main-channel
+  dispatch function (`dispatch_5x_cfg0/1/2/3_simple_aspx`, all four
+  configs) guards on `transform_length_0 == samples` and silently
+  no-ops otherwise — none of them handle short-frame or grouped-window
+  transforms. Checked against real content: **100% of the 816 (of
+  1571) real frames whose main-channel body used a short/grouped
+  transform were silent**, and **0%** of the 490 successfully-decoded
+  frames were anything but a full 2048-sample long-frame transform.
+  This — not anything specific to Cfg0/1/2 — is now the single largest
+  remaining blocker to full real-content decode, affecting roughly half
+  of all real frames regardless of coding_config. Not yet fixed;
+  tracked as the next real-PCM blocker.
+
 - **`ac4_substream_info_chan()` / `ac4_substream_info_ajoc()` dropped
   `substream_index`** (§6.2.1.8/.9) — on `b_substreams_present` frames,
   each substream descriptor carries an explicit index into

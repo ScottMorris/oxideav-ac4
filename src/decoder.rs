@@ -2896,48 +2896,114 @@ impl Decoder for Ac4Decoder {
             }
         }
         // Round 91: 7_X SIMPLE/ASPX inner 5-channel core render (slots
-        // 0..4). The 7_X SIMPLE/Cfg3Five path inherits the inner
-        // `five_channel_data()` from the 5_X Table 29 layout (5 SCEs in
+        // 0..4). The 7_X SIMPLE/ASPX path inherits its inner channel
+        // bodies from the same 5_X Table 29 layouts (5/4/3+2/2+2 SCEs in
         // L/R/C/Ls/Rs order, identity SAP via 5x `chparam_info(sap_mode
         // = 0)`); the only difference from the 5_X dispatch is which
-        // walker populated `tools.five_channel_data` (7_X here, vs 5_X
-        // for the 5.0/5.1 paths). The 5_X dispatch fires the same
-        // IMDCT/KBD/overlap-add chain regardless of which walker
-        // populated the slot, so we route the 7_X-walker-produced
-        // five_channel_data through it. With identity SAP no joint-MDCT
-        // mixing happens at decode time so each output slot 0..4 reflects
-        // only its own input SCE. ASPX trailers for the 7_X path land in
-        // different `tools.*_aspx_*` slots (the 7_X walker has its own
-        // ASPX trailer plumbing — out of scope here); pass `None` for
-        // the trailer slots so the round-91 SIMPLE path reduces to
-        // low-band only. Cfg0/Cfg1/Cfg2 7_X variants need their own
-        // wiring (queued for follow-up rounds — they share the same
-        // 5_X core dispatchers, just with the 7_X-specific trailing
-        // `mono_data(0)` gate and ASPX trailer plumbing).
-        if seven_x_simple_aspx_active
-            && matches!(
-                self.last_substream
-                    .as_ref()
-                    .and_then(|sub| sub.tools.seven_x_coding_config),
-                Some(crate::mch::FiveXCodingConfig::Cfg3Five)
-            )
-        {
-            if let Some(five) = self
+        // walker populated `tools.five_channel_data`/`four_channel_data`/
+        // etc (7_X here, vs 5_X for the 5.0/5.1 paths). The 5_X
+        // dispatchers fire the same IMDCT/KBD/overlap-add chain
+        // regardless of which walker populated the slot, so we route the
+        // 7_X-walker-produced data through them directly — one dispatch
+        // call per `seven_x_coding_config` value, mirroring the 5_X
+        // match above. With identity SAP no joint-MDCT mixing happens at
+        // decode time so each output slot 0..4 reflects only its own
+        // input SCE. ASPX trailers for the 7_X path land in different
+        // `tools.*_aspx_*` slots (the 7_X walker has its own ASPX
+        // trailer plumbing — out of scope here); pass `None` for the
+        // trailer slots so every branch below reduces to low-band only.
+        //
+        // Round 398: Cfg0/Cfg1/Cfg2 were previously unwired here — only
+        // Cfg3Five fired — even though the walker had already parsed
+        // real, non-silent spectral data into `two_channel_data`/
+        // `three_channel_data`/`four_channel_data` for the other three
+        // configs. That data was silently discarded: the whole L/R/C/
+        // Ls/Rs core came out as digital silence for every frame whose
+        // `seven_x_coding_config` wasn't `Cfg3Five` (confirmed against
+        // real content: 100% of `Cfg0`/`Cfg1`/`Cfg2` frames had a silent
+        // slot 0, vs the LFE channel — decoded independently of this
+        // gate — masking it as "some nonzero audio" at the whole-frame
+        // level).
+        if seven_x_simple_aspx_active {
+            match self
                 .last_substream
                 .as_ref()
-                .and_then(|sub| sub.tools.five_channel_data.clone())
+                .and_then(|sub| sub.tools.seven_x_coding_config)
             {
-                self.dispatch_5x_cfg3_simple_aspx(
-                    &five,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    num_ts_in_ats,
-                    samples as usize,
-                    &mut pcm_per_channel,
-                );
+                Some(crate::mch::FiveXCodingConfig::Cfg0Stereo2plusMono) => {
+                    if cfg_two_channel_data.len() >= 2 {
+                        let b_2ch = cfg_b_2ch_mode.unwrap_or(false);
+                        self.dispatch_5x_cfg0_simple_aspx(
+                            &cfg_two_channel_data[0],
+                            &cfg_two_channel_data[1],
+                            b_2ch,
+                            cfg0_centre_mono.as_ref(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
+                    if let (Some(three), Some(tcd)) = (
+                        cfg_three_channel_data.as_ref(),
+                        cfg_two_channel_data.first(),
+                    ) {
+                        self.dispatch_5x_cfg1_simple_aspx(
+                            three,
+                            tcd,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
+                    if let Some(four) = cfg2_four_channel_data.as_ref() {
+                        self.dispatch_5x_cfg2_simple_aspx(
+                            four,
+                            cfg2_back_mono.as_ref(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
+                    if let Some(five) = self
+                        .last_substream
+                        .as_ref()
+                        .and_then(|sub| sub.tools.five_channel_data.clone())
+                    {
+                        self.dispatch_5x_cfg3_simple_aspx(
+                            &five,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                None | Some(crate::mch::FiveXCodingConfig::AcplLite2) => {}
             }
         }
         // Round 39 / 40: §5.3.4.4.1 / Table 182 + Table 183 — 7_X
