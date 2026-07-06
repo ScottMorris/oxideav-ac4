@@ -37,16 +37,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for I-frames that parse cleanly, versus 100% silent output for every
   frame before the fix.
 
-  A second, distinct bug surfaced once real substream bytes were
-  actually being decoded: roughly half of I-frames fail with
-  `asf_psy_info_lfe: transform_length not permitted for LFE` inside
-  `parse_7x_audio_data_outer`'s LFE `mono_data(1)` read, which
-  immediately follows the per-mode `aspx_config`/`acpl_config_1ch_*`
-  read when `b_iframe`. This is data-dependent (some I-frames decode
-  cleanly, most don't), which points at a bit-misalignment bug in the
-  preceding `aspx_config`/A-CPL config parse for at least one
-  `SevenXCodecMode` variant rather than a genuine short-frame LFE
-  encode — not yet root-caused. Tracked as the next real-PCM blocker.
+- **`mono_data(b_lfe=1)` read a phantom `asf_transform_info()`** — a
+  second, distinct bug that surfaced once real substream bytes were
+  actually being decoded, failing roughly half of all real I-frames
+  with `asf_psy_info_lfe: transform_length not permitted for LFE`.
+  `sf_info_lfe()` (§4.2.7.2 Table 35) sets `b_long_frame = 1`
+  *implicitly* — "transform length = frame_length" — and reads **no
+  bits** for it, unlike the regular `sf_info()` → `asf_transform_info()`
+  path used by every other channel. `parse_mono_data`'s LFE branch was
+  calling the full `asf_transform_info()` reader anyway (justified by a
+  comment claiming "the LFE channel is always coded with the ASF
+  frontend", which is true but irrelevant — it doesn't mean
+  `asf_transform_info()` the *bitstream element* is present), stealing
+  real bits belonging to `max_sfb[0]`/`sf_data()` that follow. The
+  resulting misalignment was data-dependent — whatever `b_long_frame`
+  bit happened to get stolen from the following field — which is
+  exactly why it failed on about half of real frames and not the
+  other half.
+
+  Fixed by constructing the LFE `AsfTransformInfo` synthetically
+  (`b_long_frame: true`, transform length resolved from
+  `frame_len_base` via the existing `resolve_transf_length` helper)
+  with zero bits consumed, matching Table 35 exactly. Updated the five
+  test fixtures that encoded the old (wrong) leading `b_long_frame` bit
+  for LFE `mono_data()`. Combined with the `substream_index` fix above,
+  real content now parses substream bodies with **0 errors across all
+  1571 frames** of a real Tidal file (previously ~50% failed), and
+  `decode_real_pcm` produces genuinely non-silent PCM for **1312 of
+  1571 frames (83.5%)** — the remaining silent frames are plausibly
+  real quiet/silent passages rather than decode failures, not yet
+  spot-checked against a reference decode.
+
+- **`huffman::ext_decode` panicked instead of erroring on a runaway
+  unary prefix** — codebook-11's extension-code unary length prefix
+  (Pseudocode 20) has no upper bound in the reader, so bit-misalignment
+  anywhere upstream in a substream walk (a separate, not yet
+  root-caused bug — hit on 1 of 1571 real frames after the two fixes
+  above) could turn into a long run of 1-bits and a `read_u32(n_ext+4)`
+  call with `n_ext+4 > 32`, which the underlying `BitReader` treats as
+  a hard panic rather than a `Result::Err`. A single malformed/
+  misaligned substream shouldn't be able to crash the whole decode
+  pipeline. Capped `n_ext` at 27 (real content never approaches this)
+  and return `Error::invalid` past that point, consistent with every
+  other try-and-bail parser in this codebase.
 
 - **`emdf_reserved()` bitstream bug** (§4.2.3.12, Table 80) — the
   long-standing implementation read a nonexistent `b_more_bits` flag

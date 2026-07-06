@@ -62,10 +62,15 @@ an S16 `AudioFrame`:
   `Ac4FrameInfo`, and `receive_frame()` skips forward by the correct
   number of bytes before handing the substream to the walker. Real
   7.1 (channel_mode 6, 3/4/0.1) I-frames now decode to genuinely
-  non-silent S16 PCM. A second, distinct, data-dependent
-  `asf_psy_info_lfe` bug (likely a bit-misalignment in the preceding
-  `aspx_config`/A-CPL config read for at least one `SevenXCodecMode`)
-  still fails roughly half of real I-frames — see Changelog.
+  non-silent S16 PCM. A second, distinct bug — `mono_data(b_lfe=1)`
+  reading a phantom `asf_transform_info()` that `sf_info_lfe()` doesn't
+  actually carry — was misaligning roughly half of all real I-frames
+  data-dependently; fixed by constructing the LFE transform info
+  implicitly (0 bits) per Table 35. Real content now parses substream
+  bodies with **0 errors across all 1571 frames** of a real Tidal
+  file, and **1312 of 1571 frames (83.5%) decode to genuinely
+  non-silent PCM** — see Changelog for what's left (the remaining
+  silent frames aren't yet distinguished from real quiet passages).
 
 - **ASF coefficient pipeline** — `asf_section_data()`,
   `asf_spectral_data()` (HCB 1..11 + the codebook-11 escape),
