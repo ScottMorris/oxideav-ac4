@@ -1030,6 +1030,242 @@ struct SubstreamGroupSummary {
     first_sf_multiplier: u32,
 }
 
+// ---------------------------------------------------------------------
+// ETSI TS 103 190-2 §6.2.1.9 / §6.2.1.10 / §6.2.1.11 — object-coded
+// (A-JOC) substream descriptors.
+// ---------------------------------------------------------------------
+
+/// The three object kinds `bed_dyn_obj_assignment()` / `ac4_substream_info_obj()`
+/// can assign to a signal (§6.2.1.10/.11, §6.3.2.10.3/.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjType {
+    /// A fixed, speaker-anchored bed channel.
+    Bed,
+    /// A dynamic object with its own position metadata.
+    Dyn,
+    /// An Intermediate Spatial Format object (Table 61 layouts).
+    Isf,
+}
+
+/// One signal's object descriptor, as produced by `bed_dyn_obj_assignment()`.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjDescriptor {
+    pub obj_type: ObjType,
+    pub b_lfe: bool,
+    pub b_ajoc_coded: bool,
+}
+
+/// `bed_dyn_obj_assignment(n_signals)` (§6.2.1.10): assigns each of
+/// `n_signals` signals a bed/ISF descriptor from the bitstream, then pads
+/// any remainder up to `n_signals` as dynamic objects — covering the
+/// `b_dyn_objects_only` case, where no bed/ISF bits are read at all and
+/// every signal is dynamic (§6.3.2.10.3).
+pub fn parse_bed_dyn_obj_assignment(
+    br: &mut BitReader<'_>,
+    n_signals: u32,
+) -> Result<Vec<ObjDescriptor>> {
+    let mut objs = Vec::new();
+    let bed = ObjDescriptor {
+        obj_type: ObjType::Bed,
+        b_lfe: false,
+        b_ajoc_coded: true,
+    };
+
+    let b_dyn_objects_only = br.read_bit()?;
+    if !b_dyn_objects_only {
+        let b_isf = br.read_bit()?;
+        if b_isf {
+            let isf_config = br.read_u32(3)?;
+            let n_isf = match isf_config {
+                0 => 4,
+                1 => 8,
+                2 => 10,
+                3 => 14,
+                4 => 15,
+                5 => 30,
+                _ => {
+                    return Err(Error::invalid("ac4: reserved isf_config value"));
+                }
+            };
+            for _ in 0..n_isf {
+                objs.push(ObjDescriptor {
+                    obj_type: ObjType::Isf,
+                    b_lfe: false,
+                    b_ajoc_coded: true,
+                });
+            }
+        } else {
+            let b_ch_assign_code = br.read_bit()?;
+            if b_ch_assign_code {
+                const COUNTS: [u32; 8] = [2, 3, 5, 7, 9, 7, 9, 11];
+                let bed_chan_assign_code = br.read_u32(3)?;
+                for _ in 0..COUNTS[bed_chan_assign_code as usize] {
+                    objs.push(bed);
+                }
+            } else {
+                let b_channel_assignment_flags_present = br.read_bit()?;
+                if b_channel_assignment_flags_present {
+                    let b_nonstd = br.read_bit()?;
+                    if b_nonstd {
+                        let mut flags = [false; 17];
+                        for f in flags.iter_mut() {
+                            *f = br.read_bit()?;
+                        }
+                        for i in 0..17usize {
+                            if flags[16 - i] && i != 3 && i != 16 {
+                                objs.push(bed);
+                            }
+                        }
+                    } else {
+                        const COUNTS2: [u32; 10] = [2, 1, 1, 2, 2, 2, 2, 2, 2, 1];
+                        let mut flags = [false; 10];
+                        for f in flags.iter_mut() {
+                            *f = br.read_bit()?;
+                        }
+                        for i in 0..10usize {
+                            if flags[9 - i] {
+                                for _ in 0..COUNTS2[i] {
+                                    objs.push(bed);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let n_bed_signals = if n_signals > 1 {
+                        // ceil(log2(n_signals)) bits to represent 0..n_signals-1.
+                        let bed_ch_bits = 32 - (n_signals - 1).leading_zeros();
+                        br.read_u32(bed_ch_bits)? + 1
+                    } else {
+                        1
+                    };
+                    for _ in 0..n_bed_signals {
+                        let nonstd_bed_channel_assignment = br.read_u32(4)?;
+                        if nonstd_bed_channel_assignment != 3 {
+                            objs.push(bed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Any signals not accounted for above are dynamic objects — the only
+    // case reached when b_dyn_objects_only was set, since objs is empty.
+    while (objs.len() as u32) < n_signals {
+        objs.push(ObjDescriptor {
+            obj_type: ObjType::Dyn,
+            b_lfe: false,
+            b_ajoc_coded: false,
+        });
+    }
+    Ok(objs)
+}
+
+/// `oamd_common_data()` (§6.2.8.1). The `bed_render_info()` / `headphone()`
+/// sub-fields inside `b_additional_data` describe screen-relative and
+/// headphone-specific rendering hints we don't need for decode or a basic
+/// render; `add_data_bytes` declares their exact combined length, so the
+/// whole block is skipped as opaque bits rather than parsed field-by-field
+/// — safe, since it doesn't change how anything downstream aligns.
+pub fn parse_oamd_common_data(br: &mut BitReader<'_>) -> Result<()> {
+    let b_default_screen_size_ratio = br.read_bit()?;
+    if !b_default_screen_size_ratio {
+        let _master_screen_size_ratio_code = br.read_u32(5)?;
+    }
+    let _b_bed_object_chan_distribute = br.read_bit()?;
+    let b_additional_data = br.read_bit()?;
+    if b_additional_data {
+        let add_data_bytes_minus1 = br.read_u32(1)?;
+        let mut add_data_bytes = add_data_bytes_minus1 + 1;
+        if add_data_bytes == 2 {
+            add_data_bytes += variable_bits(br, 2)?;
+        }
+        br.skip(add_data_bytes * 8)?;
+    }
+    Ok(())
+}
+
+/// `ac4_substream_info_ajoc(b_substreams_present)` (§6.2.1.9): the
+/// substream descriptor for A-JOC coded object substreams — signal
+/// counts, bed/ISF assignment for the downmix and upmix signal sets, and
+/// the same bitrate/sf-multiplier/substream-index tail as
+/// `ac4_substream_info_chan`.
+#[derive(Debug, Clone)]
+pub struct SubstreamInfoAjoc {
+    pub b_lfe: bool,
+    pub b_static_dmx: bool,
+    pub n_fullband_dmx_signals: u32,
+    /// Empty when `b_static_dmx` — the downmix is a plain 5.0/5.1 bed
+    /// decoded via `audio_data_chan`, not individually assigned objects.
+    pub dmx_objs: Vec<ObjDescriptor>,
+    pub n_fullband_upmix_signals: u32,
+    pub umx_objs: Vec<ObjDescriptor>,
+    pub sf_multiplier: u32,
+}
+
+pub fn parse_substream_info_ajoc(
+    br: &mut BitReader<'_>,
+    fs_index: u32,
+    frame_rate_index: u32,
+    b_substreams_present: bool,
+) -> Result<SubstreamInfoAjoc> {
+    let b_lfe = br.read_bit()?;
+    let b_static_dmx = br.read_bit()?;
+    let (n_fullband_dmx_signals, dmx_objs) = if b_static_dmx {
+        (5, Vec::new())
+    } else {
+        let n_fullband_dmx_signals = br.read_u32(4)? + 1;
+        let objs = parse_bed_dyn_obj_assignment(br, n_fullband_dmx_signals)?;
+        (n_fullband_dmx_signals, objs)
+    };
+
+    let b_oamd_common_data_present = br.read_bit()?;
+    if b_oamd_common_data_present {
+        parse_oamd_common_data(br)?;
+    }
+
+    let mut n_fullband_upmix_signals = br.read_u32(4)? + 1;
+    if n_fullband_upmix_signals == 16 {
+        n_fullband_upmix_signals += variable_bits(br, 3)?;
+    }
+    let umx_objs = parse_bed_dyn_obj_assignment(br, n_fullband_upmix_signals)?;
+
+    let mut sf_multiplier = 0;
+    if fs_index == 1 {
+        let b_sf_multiplier = br.read_bit()?;
+        if b_sf_multiplier {
+            sf_multiplier = br.read_u32(1)? + 1;
+        }
+    }
+    let b_bitrate_info = br.read_bit()?;
+    if b_bitrate_info {
+        let short = br.read_u32(3)?;
+        if short == 0b111 {
+            let _ = br.read_u32(2)?;
+        }
+    }
+    let factor = frame_rate_factor(frame_rate_index, false, 0);
+    for _ in 0..factor.max(1) {
+        let _b_audio_ndot = br.read_bit()?;
+    }
+    if b_substreams_present {
+        let si = br.read_u32(2)?;
+        if si == 3 {
+            let _ = variable_bits(br, 2)?;
+        }
+    }
+
+    Ok(SubstreamInfoAjoc {
+        b_lfe,
+        b_static_dmx,
+        n_fullband_dmx_signals,
+        dmx_objs,
+        n_fullband_upmix_signals,
+        umx_objs,
+        sf_multiplier,
+    })
+}
+
 /// `frame_rate_fractions_info()` per ETSI TS 103 190-2 §6.2.1.4 — gated
 /// on `frame_rate_index`. Consumes 0, 1, or 2 bits depending on the
 /// frame-rate slot.
@@ -1194,5 +1430,157 @@ mod tests {
         let bytes = [0b1110_0000];
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_channel_mode(&mut br).unwrap(), (6, 4));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_dyn_only_pads_all_signals() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only = 1: no further bits read; every one of the
+        // 3 signals comes back as a padded Dyn descriptor.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 3).unwrap();
+        assert_eq!(objs.len(), 3);
+        assert!(objs.iter().all(|o| o.obj_type == ObjType::Dyn && !o.b_ajoc_coded));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_isf_config_0_gives_4_objects() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only=0, b_isf=1, isf_config=0 (0b000) -> 4 ISF objects.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(0, 3);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 4).unwrap();
+        assert_eq!(objs.len(), 4);
+        assert!(objs.iter().all(|o| o.obj_type == ObjType::Isf && o.b_ajoc_coded));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_isf_config_reserved_errors() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(6, 3); // reserved isf_config
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert!(parse_bed_dyn_obj_assignment(&mut br, 4).is_err());
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_ch_assign_code_then_dyn_padding() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only=0, b_isf=0, b_ch_assign_code=1,
+        // bed_chan_assign_code=0 (-> 2 bed objects). n_signals=5, so the
+        // remaining 3 signals pad out as Dyn.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(0, 3);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 5).unwrap();
+        assert_eq!(objs.len(), 5);
+        assert_eq!(objs[0].obj_type, ObjType::Bed);
+        assert_eq!(objs[1].obj_type, ObjType::Bed);
+        assert!(objs[2..].iter().all(|o| o.obj_type == ObjType::Dyn));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_nonstd_per_signal_skips_value_3() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only=0, b_isf=0, b_ch_assign_code=0,
+        // b_channel_assignment_flags_present=0, n_signals=2 (1 bit for
+        // n_bed_signals_minus1): n_bed_signals_minus1=1 -> n_bed_signals=2,
+        // then two nonstd_bed_channel_assignment codes: 0 (kept), 3 (skipped).
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_u32(1, 1); // n_bed_signals_minus1 = 1 -> n_bed_signals = 2
+        bw.write_u32(0, 4); // first: kept
+        bw.write_u32(3, 4); // second: skipped (== 3)
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 2).unwrap();
+        // 1 bed object kept, 1 signal unaccounted for -> padded as Dyn.
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[0].obj_type, ObjType::Bed);
+        assert_eq!(objs[1].obj_type, ObjType::Dyn);
+    }
+
+    #[test]
+    fn oamd_common_data_no_additional_data() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_default_screen_size_ratio
+        bw.write_bit(false); // b_bed_object_chan_distribute
+        bw.write_bit(false); // b_additional_data
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert!(parse_oamd_common_data(&mut br).is_ok());
+    }
+
+    #[test]
+    fn oamd_common_data_skips_additional_data_block() {
+        use oxideav_core::bits::BitWriter;
+        // add_data_bytes_minus1 = 0 -> add_data_bytes = 1 -> skip 8 bits,
+        // then one more real bit after it that must still be reachable.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_default_screen_size_ratio
+        bw.write_bit(false); // b_bed_object_chan_distribute
+        bw.write_bit(true); // b_additional_data
+        bw.write_u32(0, 1); // add_data_bytes_minus1 = 0 -> 1 byte
+        bw.write_u32(0xAB, 8); // the skipped byte
+        bw.write_bit(true); // sentinel after the block
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_oamd_common_data(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel bit after the skipped block should still be reachable");
+    }
+
+    #[test]
+    fn substream_info_ajoc_static_dmx_skips_dmx_objs() {
+        use oxideav_core::bits::BitWriter;
+        // b_lfe=1, b_static_dmx=1 (n_fullband_dmx_signals=5, no bed_dyn read),
+        // b_oamd_common_data_present=0,
+        // n_fullband_upmix_signals_minus1=1 (-> 2), then dyn-only bed
+        // assignment for those 2 upmix signals, then no sf_multiplier
+        // (fs_index=0), b_bitrate_info=0, frame_rate_index chosen so
+        // factor=1, b_substreams_present=false.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_lfe
+        bw.write_bit(true); // b_static_dmx
+        bw.write_bit(false); // b_oamd_common_data_present
+        bw.write_u32(1, 4); // n_fullband_upmix_signals_minus1 = 1 -> 2
+        bw.write_bit(true); // upmix bed_dyn_obj_assignment: b_dyn_objects_only=1
+        bw.write_bit(false); // b_bitrate_info
+        bw.write_bit(false); // b_audio_ndot (frame_rate_index maps to factor 1)
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let info = parse_substream_info_ajoc(&mut br, 0, 4, false).unwrap();
+        assert!(info.b_lfe);
+        assert!(info.b_static_dmx);
+        assert_eq!(info.n_fullband_dmx_signals, 5);
+        assert!(info.dmx_objs.is_empty());
+        assert_eq!(info.n_fullband_upmix_signals, 2);
+        assert_eq!(info.umx_objs.len(), 2);
+        assert!(info.umx_objs.iter().all(|o| o.obj_type == ObjType::Dyn));
     }
 }

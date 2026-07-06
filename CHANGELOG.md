@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- ac4 round 390 — **A-JOC Huffman decode + object-substream descriptor
+  parsing**, closing two of the gaps flagged in "Not yet supported":
+  1. **`AJOC_HCB_*` Huffman tables** (ETSI TS 103 190-2 Annex A.1.1,
+     Tables A.1-A.12) — transcribed verbatim from the Part 2
+     accompaniment ZIP's `ts_103190_tables_part2.c` (`ts_10319002v010301p0.zip`,
+     published alongside the spec PDF) into
+     `src/ajoc_huffman_tables.rs`. All 12 tables verified prefix-free
+     and round-tripped through `huff_decode` in
+     `all_ajoc_tables_decode_shortest_entry`.
+  2. **`ajoc_huff_data()`** (§6.2.5.5 / §6.3.6.5) — `get_ajoc_hcb()`
+     resolves the right one of the 12 tables from
+     `(data_type, quant_mode, hcb_type)`, with `cb_off` derived from the
+     crate's existing `AjocQuantMode::nquant`/`zero_index` rather than
+     hand-copied constants (`F0` tables are absolute, `cb_off = 0`; `DF`
+     tables share `F0`'s width, `cb_off = zero_index`; `DT` tables are
+     `2*nquant-1` wide, `cb_off = nquant-1`). Feeds directly into the
+     already-existing `differential_decode_dry`/`differential_decode_wet`
+     — verified end-to-end in
+     `ajoc_huff_data_feeds_differential_decode_end_to_end`.
+  3. **Object-coded substream descriptors** (§6.2.1.9/.10/.11) —
+     `parse_substream_info_ajoc()` (`ac4_substream_info_ajoc`) and
+     `parse_bed_dyn_obj_assignment()` (`bed_dyn_obj_assignment`, covering
+     the ISF / `bed_chan_assign_code` / non-standard-flags / per-signal
+     forms, plus the `b_dyn_objects_only` all-dynamic case) added to
+     `toc.rs`, alongside `parse_oamd_common_data()` (§6.2.8.1) — its
+     optional `bed_render_info()`/`headphone()` extension is skipped as
+     one opaque `add_data_bytes`-long block rather than field-parsed,
+     since we don't need those rendering hints and the block's length is
+     self-declared.
+
+  Still open: `audio_data_ajoc()` / `var_channel_element()` (the actual
+  per-frame object audio-data walk) and `oamd_dyndata_single()` (object
+  position/gain metadata) aren't wired up yet, so a real object-coded
+  frame still won't decode end-to-end — `parse_substream_group_info()`
+  still returns `Error::unsupported` for `b_channel_coded == false`.
+
 - ac4 round 389 — **inter-frame (P-frame, `b_iframe = 0`) support
   end-to-end** (ETSI TS 103 190-1 §4.2.6.x Tables 25/33, §4.2.12.3/4
   Tables 51/52, §5.7.6.3.4 Pseudocodes 80/81, §4.2.13.7 Table 65 /

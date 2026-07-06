@@ -81,9 +81,18 @@ an S16 `AudioFrame`:
   §6.2.5 config-layer parsers (`ajoc_ctrl_info`, `ajoc_data_point_info`,
   `ajoc_bed_info`, `ajoc_dmx_de_data` with the Table 106
   `de_dlg_dmx_coeff` prefix code) walk the side-information. The
-  per-codeword `ajoc_huff_data()` decode that feeds the dequantized
-  matrices into `ajoc_reconstruct` is blocked on the missing
-  `AJOC_HCB_*` codebook arrays (see "Not yet supported").
+  per-codeword **`ajoc_huff_data()` decode is now landed** (§6.2.5.5 /
+  §6.3.6.5): the twelve `AJOC_HCB_*` Huffman `_LEN`/`_CW` arrays
+  (Annex A.1.1 Tables A.1-A.12), missing from the PDF text itself, are
+  transcribed from the Part 2 accompaniment ZIP's
+  `ts_103190_tables_part2.c` into `src/ajoc_huffman_tables.rs`;
+  `get_ajoc_hcb()` resolves the right table from
+  `(data_type, quant_mode, hcb_type)` and feeds straight into
+  `differential_decode_dry`/`differential_decode_wet` above. The
+  object-coded substream descriptors (`ac4_substream_info_ajoc`,
+  `bed_dyn_obj_assignment`, `oamd_common_data`) are landed in `toc.rs`
+  too — see "Not yet supported" for what's still missing before a real
+  object-coded frame decodes end-to-end.
 - **P-frames (`b_iframe = 0`)** — full inter-frame decode per §4.2.6.x:
   a per-substream sticky-config state (`asf::StickyConfig`) carries the
   I-frame-gated `aspx_config()` / `acpl_config_*()` elements and the
@@ -154,17 +163,23 @@ an S16 `AudioFrame`:
 
 ## Not yet supported
 
-- **A-JOC per-codeword Huffman decode** (`ajoc_huff_data()`, §6.2.5.5) —
-  blocked on a docs gap: the twelve `AJOC_HCB_*` Huffman `_LEN` / `_CW`
-  arrays (Annex A.1.1 Tables A.1-A.12) are named in the spec with their
-  `codebook_length` / `cb_off` metadata, but the actual codeword and
-  length values are not listed in the TS 103 190-2 PDF and are not in
-  the part-1 accompaniment table file (which carries only the part-1
-  ASF / DRC / DE codebooks). The `ajoc` module's differential decoder
-  consumes those deltas directly the moment the arrays are supplied; the
-  full end-to-end A-JOC object decode also needs the surrounding
-  immersive / OAMD substream machinery (`audio_data_ajoc()`,
-  `oamd_dyndata_single()`, `var_channel_element()`).
+- **Object-coded (A-JOC) substream decode end-to-end** — the substream
+  descriptor layer (`ac4_substream_info_ajoc`, `bed_dyn_obj_assignment`,
+  `oamd_common_data`) and the A-JOC Huffman/matrix decode (`ajoc_huff_data`,
+  `differential_decode_*`, `ajoc_reconstruct`) are landed, but nothing
+  wires them to an actual per-frame walk yet: `audio_data_ajoc()` /
+  `var_channel_element()` (§6.2.3.4 / §6.2.4.4 — the downmix signals'
+  spectral-frontend decode) and `oamd_dyndata_single()` (§6.2.8.3 —
+  per-object gain/position metadata, including real 3D position fields)
+  aren't implemented, so `parse_substream_group_info()` still returns
+  `Error::unsupported` the moment it sees `b_channel_coded == false`.
+  Note that `oamd_dyndata_single`'s position metadata implies object-coded
+  content may need actual spatial *rendering* (objects + 3D positions →
+  final output channels) on top of decoding — the object-audio renderer
+  itself isn't normatively specified in the public TS 103 190-2 text, so
+  even a complete decoder here would produce decoded objects + positions,
+  not automatically final PCM, without a separate (non-normative)
+  rendering step.
 - TS 103 190-2 multi-stream / immersive / object-based (IFM) extensions.
 - P-frame refinements: the sticky state carries **one** xover offset per
   substream, so P-frames assume the I-frame used a single

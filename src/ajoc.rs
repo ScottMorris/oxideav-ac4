@@ -84,6 +84,10 @@
 use oxideav_core::bits::BitReader;
 use oxideav_core::{Error, Result};
 
+use crate::huffman::huff_decode;
+
+include!("ajoc_huffman_tables.rs");
+
 /// `DRY` / `WET` selector for the two reconstruction submatrices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AjocMatrixKind {
@@ -399,6 +403,135 @@ fn differential_decode(
     // mtx_*_q_prev[o][.] = mtx_*_q[o][dp][.]
     prev.copy_from_slice(&out);
     out
+}
+
+// ---------------------------------------------------------------------
+// §6.2.5.5 / §6.3.6.5 — ajoc_huff_data() Huffman decode
+// ---------------------------------------------------------------------
+
+/// Which of the three per-data-point Huffman tables to use, matching
+/// `hcb_type` in `get_ajoc_hcb()` (Pseudocode 27, §6.3.6.5.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AjocHcbType {
+    /// Absolute value for band 0 of a DIFF_FREQ-coded data point.
+    F0,
+    /// Frequency-differential delta for bands 1.. of a DIFF_FREQ point.
+    Df,
+    /// Time-differential delta for every band of a DIFF_TIME point.
+    Dt,
+}
+
+/// One A-JOC Huffman codebook: the codeword-length / codeword arrays
+/// (transcribed verbatim from the ETSI Part 2 accompaniment file, see
+/// `ajoc_huffman_tables.rs`) plus the offset that recentres a decoded
+/// table index into a signed delta.
+///
+/// `F0` tables are used directly as the absolute quantised value
+/// (`cb_off = 0`); `DF`/`DT` tables carry a delta recentred on the
+/// table's own zero-index, per the sizes actually published: `DF`
+/// tables are `nquant` entries wide (same range as `F0`, `cb_off =
+/// zero_index`), while `DT` tables are `2*nquant - 1` entries wide (a
+/// full `-[nquant-1] ..= [nquant-1]` delta range between two arbitrary
+/// quantised values, `cb_off = nquant - 1`).
+struct AjocHcb {
+    len: &'static [u8],
+    cw: &'static [u32],
+    cb_off: i32,
+}
+
+/// Resolve the codebook for `(data_type, quant_mode, hcb_type)`
+/// (Pseudocode 27, §6.3.6.5.2) — one of the twelve `AJOC_HCB_*` tables.
+fn get_ajoc_hcb(
+    data_type: AjocMatrixKind,
+    quant_mode: AjocQuantMode,
+    hcb_type: AjocHcbType,
+) -> AjocHcb {
+    let nquant = quant_mode.nquant(data_type) as i32;
+    let zero = quant_mode.zero_index(data_type) as i32;
+
+    macro_rules! hcb {
+        ($len:expr, $cw:expr, $off:expr) => {
+            AjocHcb {
+                len: $len,
+                cw: $cw,
+                cb_off: $off,
+            }
+        };
+    }
+
+    use AjocHcbType::{Df, Dt, F0};
+    use AjocMatrixKind::{Dry, Wet};
+    use AjocQuantMode::{Coarse, Fine};
+
+    match (data_type, quant_mode, hcb_type) {
+        (Dry, Fine, F0) => hcb!(AJOC_HCB_DRY_FINE_F0_LEN, AJOC_HCB_DRY_FINE_F0_CW, 0),
+        (Dry, Fine, Df) => hcb!(AJOC_HCB_DRY_FINE_DF_LEN, AJOC_HCB_DRY_FINE_DF_CW, zero),
+        (Dry, Fine, Dt) => hcb!(AJOC_HCB_DRY_FINE_DT_LEN, AJOC_HCB_DRY_FINE_DT_CW, nquant - 1),
+        (Dry, Coarse, F0) => hcb!(AJOC_HCB_DRY_COARSE_F0_LEN, AJOC_HCB_DRY_COARSE_F0_CW, 0),
+        (Dry, Coarse, Df) => hcb!(AJOC_HCB_DRY_COARSE_DF_LEN, AJOC_HCB_DRY_COARSE_DF_CW, zero),
+        (Dry, Coarse, Dt) => {
+            hcb!(AJOC_HCB_DRY_COARSE_DT_LEN, AJOC_HCB_DRY_COARSE_DT_CW, nquant - 1)
+        }
+        (Wet, Fine, F0) => hcb!(AJOC_HCB_WET_FINE_F0_LEN, AJOC_HCB_WET_FINE_F0_CW, 0),
+        (Wet, Fine, Df) => hcb!(AJOC_HCB_WET_FINE_DF_LEN, AJOC_HCB_WET_FINE_DF_CW, zero),
+        (Wet, Fine, Dt) => hcb!(AJOC_HCB_WET_FINE_DT_LEN, AJOC_HCB_WET_FINE_DT_CW, nquant - 1),
+        (Wet, Coarse, F0) => hcb!(AJOC_HCB_WET_COARSE_F0_LEN, AJOC_HCB_WET_COARSE_F0_CW, 0),
+        (Wet, Coarse, Df) => hcb!(AJOC_HCB_WET_COARSE_DF_LEN, AJOC_HCB_WET_COARSE_DF_CW, zero),
+        (Wet, Coarse, Dt) => {
+            hcb!(AJOC_HCB_WET_COARSE_DT_LEN, AJOC_HCB_WET_COARSE_DT_CW, nquant - 1)
+        }
+    }
+}
+
+/// `ajoc_huff_data()` (§6.2.5.5 / §6.3.6.5): decode one data point's
+/// per-band Huffman codewords for one channel/decorrelator, returning
+/// `(diff_type, deltas)` ready to hand to [`differential_decode_dry`] /
+/// [`differential_decode_wet`] — `deltas[0]` is already the absolute
+/// F0 value in the `Freq` case (its codebook has `cb_off = 0`), so the
+/// differential decoder can treat `deltas` uniformly regardless of
+/// which codebook produced each entry.
+///
+/// `b_dfonly` forces `diff_type = Freq` without reading a bit, for a
+/// frame whose `ajoc_b_nodt` flag disallows time-differential coding
+/// on this data point.
+pub fn ajoc_huff_data(
+    br: &mut BitReader<'_>,
+    data_type: AjocMatrixKind,
+    quant_mode: AjocQuantMode,
+    data_bands: usize,
+    b_dfonly: bool,
+) -> Result<(AjocDiffType, Vec<i32>)> {
+    let diff_type = if b_dfonly {
+        AjocDiffType::Freq
+    } else {
+        AjocDiffType::from_bit(br.read_bit()?)
+    };
+
+    let mut deltas = Vec::with_capacity(data_bands);
+    match diff_type {
+        AjocDiffType::Freq => {
+            if data_bands > 0 {
+                let hcb = get_ajoc_hcb(data_type, quant_mode, AjocHcbType::F0);
+                let idx = huff_decode(br, hcb.len, hcb.cw)?;
+                deltas.push(idx as i32 - hcb.cb_off);
+
+                let hcb = get_ajoc_hcb(data_type, quant_mode, AjocHcbType::Df);
+                for _ in 1..data_bands {
+                    let idx = huff_decode(br, hcb.len, hcb.cw)?;
+                    deltas.push(idx as i32 - hcb.cb_off);
+                }
+            }
+        }
+        AjocDiffType::Time => {
+            let hcb = get_ajoc_hcb(data_type, quant_mode, AjocHcbType::Dt);
+            for _ in 0..data_bands {
+                let idx = huff_decode(br, hcb.len, hcb.cw)?;
+                deltas.push(idx as i32 - hcb.cb_off);
+            }
+        }
+    }
+
+    Ok((diff_type, deltas))
 }
 
 // ---------------------------------------------------------------------
@@ -1572,5 +1705,150 @@ mod tests {
         assert_eq!(ci.num_bands[0], 1);
         assert_eq!(ci.quant_select[0], AjocQuantMode::Fine);
         assert!(!ci.sparse_select[0]);
+    }
+
+    #[test]
+    fn get_ajoc_hcb_table_sizes_and_offsets() {
+        // F0 tables are `nquant`-wide with cb_off = 0 (used as absolute).
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::F0);
+        assert_eq!(hcb.len.len(), 101);
+        assert_eq!(hcb.cb_off, 0);
+
+        // DF tables are the same `nquant` width, recentred on zero_index.
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::Df);
+        assert_eq!(hcb.len.len(), 101);
+        assert_eq!(hcb.cb_off, 50);
+
+        // DT tables are `2*nquant - 1` wide, recentred on nquant - 1.
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::Dt);
+        assert_eq!(hcb.len.len(), 201);
+        assert_eq!(hcb.cb_off, 100);
+
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Coarse, AjocHcbType::Dt);
+        assert_eq!(hcb.len.len(), 101);
+        assert_eq!(hcb.cb_off, 50);
+
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Wet, AjocQuantMode::Fine, AjocHcbType::Dt);
+        assert_eq!(hcb.len.len(), 81);
+        assert_eq!(hcb.cb_off, 40);
+
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Wet, AjocQuantMode::Coarse, AjocHcbType::Dt);
+        assert_eq!(hcb.len.len(), 41);
+        assert_eq!(hcb.cb_off, 20);
+    }
+
+    /// Round-trip the shortest codeword of every one of the 12 AJOC
+    /// Huffman tables through `huff_decode`, confirming the transcribed
+    /// tables actually decode (mirrors `huffman.rs`'s ASF table sweep).
+    #[test]
+    fn all_ajoc_tables_decode_shortest_entry() {
+        let combos = [
+            (AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::F0),
+            (AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::Df),
+            (AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::Dt),
+            (AjocMatrixKind::Dry, AjocQuantMode::Coarse, AjocHcbType::F0),
+            (AjocMatrixKind::Dry, AjocQuantMode::Coarse, AjocHcbType::Df),
+            (AjocMatrixKind::Dry, AjocQuantMode::Coarse, AjocHcbType::Dt),
+            (AjocMatrixKind::Wet, AjocQuantMode::Fine, AjocHcbType::F0),
+            (AjocMatrixKind::Wet, AjocQuantMode::Fine, AjocHcbType::Df),
+            (AjocMatrixKind::Wet, AjocQuantMode::Fine, AjocHcbType::Dt),
+            (AjocMatrixKind::Wet, AjocQuantMode::Coarse, AjocHcbType::F0),
+            (AjocMatrixKind::Wet, AjocQuantMode::Coarse, AjocHcbType::Df),
+            (AjocMatrixKind::Wet, AjocQuantMode::Coarse, AjocHcbType::Dt),
+        ];
+        for (dt, qm, ht) in combos {
+            let hcb = get_ajoc_hcb(dt, qm, ht);
+            let (sym_idx, &min_len) = hcb
+                .len
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, &l)| l)
+                .expect("non-empty codebook");
+            let cw = hcb.cw[sym_idx];
+
+            let bits: Vec<u8> = (0..min_len).map(|b| ((cw >> (min_len - 1 - b)) & 1) as u8).collect();
+            let bytes = pack_bits(&bits);
+            let mut br = BitReader::new(&bytes);
+            let got = huff_decode(&mut br, hcb.len, hcb.cw)
+                .unwrap_or_else(|e| panic!("{dt:?}/{qm:?}/{ht:?}: decode failed: {e:?}"));
+            assert_eq!(got as usize, sym_idx, "{dt:?}/{qm:?}/{ht:?}");
+        }
+    }
+
+    #[test]
+    fn ajoc_huff_data_dfonly_single_band_is_absolute() {
+        // b_dfonly forces Freq without reading a diff_type bit; with
+        // data_bands = 1 only the F0 codeword is read, and its value
+        // (cb_off = 0) becomes the absolute deltas[0] directly.
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Fine, AjocHcbType::F0);
+        let (sym_idx, &len) = hcb.len.iter().enumerate().min_by_key(|(_, &l)| l).unwrap();
+        let cw = hcb.cw[sym_idx];
+        let bits: Vec<u8> = (0..len).map(|b| ((cw >> (len - 1 - b)) & 1) as u8).collect();
+        let bytes = pack_bits(&bits);
+        let mut br = BitReader::new(&bytes);
+
+        let (diff_type, deltas) =
+            ajoc_huff_data(&mut br, AjocMatrixKind::Dry, AjocQuantMode::Fine, 1, true).unwrap();
+        assert_eq!(diff_type, AjocDiffType::Freq);
+        assert_eq!(deltas, vec![sym_idx as i32]);
+    }
+
+    #[test]
+    fn ajoc_huff_data_time_reads_diff_type_bit_and_dt_table() {
+        // diff_type = 1 (Time): one bit, then one DT codeword per band.
+        let hcb = get_ajoc_hcb(AjocMatrixKind::Wet, AjocQuantMode::Coarse, AjocHcbType::Dt);
+        let (sym_idx, &len) = hcb.len.iter().enumerate().min_by_key(|(_, &l)| l).unwrap();
+        let cw = hcb.cw[sym_idx];
+        let mut bits = vec![1u8]; // diff_type = 1
+        bits.extend((0..len).map(|b| ((cw >> (len - 1 - b)) & 1) as u8));
+        let bytes = pack_bits(&bits);
+        let mut br = BitReader::new(&bytes);
+
+        let (diff_type, deltas) =
+            ajoc_huff_data(&mut br, AjocMatrixKind::Wet, AjocQuantMode::Coarse, 1, false).unwrap();
+        assert_eq!(diff_type, AjocDiffType::Time);
+        assert_eq!(deltas, vec![sym_idx as i32 - hcb.cb_off]);
+    }
+
+    #[test]
+    fn ajoc_huff_data_feeds_differential_decode_end_to_end() {
+        // A tiny integration check: decode a 2-band Freq data point
+        // (F0 absolute + one DF delta) and confirm
+        // `differential_decode_dry` reconstructs the expected absolute
+        // quantised values from it.
+        let f0 = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Coarse, AjocHcbType::F0);
+        let df = get_ajoc_hcb(AjocMatrixKind::Dry, AjocQuantMode::Coarse, AjocHcbType::Df);
+        // Pick the F0 table's centre index (25, the "no bitstream data
+        // needed for a stationary mix" case is unrelated here — just a
+        // valid, unambiguous entry) and the DF table's shortest entry.
+        let f0_idx = 25u32;
+        let f0_len = f0.len[f0_idx as usize];
+        let f0_cw = f0.cw[f0_idx as usize];
+        let (df_idx, &df_len) = df.len.iter().enumerate().min_by_key(|(_, &l)| l).unwrap();
+        let df_cw = df.cw[df_idx];
+
+        let mut bits = vec![0u8]; // diff_type = 0 (Freq)
+        bits.extend((0..f0_len).map(|b| ((f0_cw >> (f0_len - 1 - b)) & 1) as u8));
+        bits.extend((0..df_len).map(|b| ((df_cw >> (df_len - 1 - b)) & 1) as u8));
+        let bytes = pack_bits(&bits);
+        let mut br = BitReader::new(&bytes);
+
+        let (diff_type, deltas) =
+            ajoc_huff_data(&mut br, AjocMatrixKind::Dry, AjocQuantMode::Coarse, 2, false).unwrap();
+        assert_eq!(diff_type, AjocDiffType::Freq);
+        assert_eq!(deltas[0], f0_idx as i32);
+        assert_eq!(deltas[1], df_idx as i32 - df.cb_off);
+
+        let mut prev = vec![0i32; 2];
+        let out = differential_decode_dry(
+            &deltas,
+            AjocDiffType::Freq,
+            AjocQuantMode::Coarse,
+            true,
+            &mut prev,
+        );
+        assert_eq!(out[0], f0_idx as i32);
+        let nquant = AjocQuantMode::Coarse.nquant(AjocMatrixKind::Dry) as i32;
+        assert_eq!(out[1], (out[0] + deltas[1]).rem_euclid(nquant));
     }
 }
