@@ -3121,11 +3121,13 @@ mod tests {
         // b_multiplier bit, 0.
         bw.write_u32(0, 1);
         // emdf_info(): emdf_version=0 (2b), key_id=0 (3b),
-        // b_emdf_payloads_substream_info=0, emdf_reserved(): b_more=0.
+        // b_emdf_payloads_substream_info=0, emdf_reserved(): two 2-bit
+        // skip-byte-length codes, both 0 (no reserved bytes).
         bw.write_u32(0, 2);
         bw.write_u32(0, 3);
         bw.write_u32(0, 1);
-        bw.write_u32(0, 1);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
         // ac4_substream_info():
         //   channel_mode prefix '10' = stereo, fs_index==1 so
         //   b_sf_multiplier=0, b_bitrate_info=0, b_content_type=0,
@@ -3196,11 +3198,14 @@ mod tests {
         bw.write_u32(0, 3); // md_compat
         bw.write_u32(0, 1); // b_belongs_to_presentation_id
         bw.write_u32(0, 1); // frame_rate_multiply_info
-                            // emdf_info:
+                            // emdf_info: emdf_version=0, key_id=0,
+                            // b_emdf_payloads_substream_info=0,
+                            // emdf_reserved(): two 2-bit skip-byte-length codes, both 0.
         bw.write_u32(0, 2);
         bw.write_u32(0, 3);
         bw.write_u32(0, 1);
-        bw.write_u32(0, 1);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
         // ac4_substream_info:
         bw.write_u32(0b0, 1); // channel_mode = 0 (mono) — prefix '0'
         bw.write_u32(0, 1); // b_sf_multiplier

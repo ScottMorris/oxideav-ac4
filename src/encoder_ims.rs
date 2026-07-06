@@ -318,7 +318,9 @@ impl Ac4ImsEncoder {
         bw.write_u32(0, 2); // emdf_version
         bw.write_u32(0, 3); // key_id
         bw.write_u32(0, 1); // b_emdf_payloads_substream_info
-        bw.write_u32(0, 1); // emdf_reserved.b_more
+                            // emdf_reserved(): two 2-bit skip-byte-length codes, both 0.
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
                             // ac4_substream_info():
         bw.write_u32(
             self.channel_mode_value as u32,
@@ -360,11 +362,13 @@ impl Ac4ImsEncoder {
         // frame_rate_fractions_info(): nothing for frame_rate_index < 5
         // or > 12.
         // emdf_info(): emdf_version=0 (2b), key_id=0 (3b),
-        //   b_emdf_payloads_substream_info=0, emdf_reserved.b_more=0.
+        //   b_emdf_payloads_substream_info=0,
+        //   emdf_reserved(): two 2-bit skip-byte-length codes, both 0.
         bw.write_u32(0, 2);
         bw.write_u32(0, 3);
         bw.write_u32(0, 1);
-        bw.write_u32(0, 1);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
         // b_presentation_filter = 0.
         bw.write_u32(0, 1);
         // ac4_sgi_specifier(): group_index = 0 (3 b, no variable_bits

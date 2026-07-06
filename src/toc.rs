@@ -507,22 +507,30 @@ fn parse_emdf_payloads_substream_info(br: &mut BitReader<'_>) -> Result<()> {
     Ok(())
 }
 
+/// `emdf_reserved()` (§4.2.3.12, Table 80 — the table's syntax box is
+/// itself headed `emdf_protection()`, apparently a naming artifact in
+/// the spec, but this is the only definition given for what
+/// `emdf_info()` calls `emdf_reserved()`).
+///
+/// Two 2-bit skip-byte-length codes (primary/secondary); each, when
+/// nonzero, contributes `1 << (2*(code-1))` bytes of opaque reserved
+/// data (so 0, 1, 4, or 16 bytes per code — max 32 bytes combined).
+/// The previous implementation here read a `b_more_bits` flag plus a
+/// `variable_bits(5)`-encoded skip count, which doesn't match this
+/// syntax at all and misaligned every real-world stream tested against
+/// it (misreading downstream fields until something claimed an
+/// absurd/impossible bit count).
 fn parse_emdf_reserved(br: &mut BitReader<'_>) -> Result<()> {
-    // §4.2.3.12 — emdf_reserved(): b_more_bits and optional
-    // variable_bits(32) chunk list. Consumes a minimum of 1 bit.
-    let b_more_bits = br.read_bit()?;
-    if b_more_bits {
-        // Spec phrasing: emdf_reserved() carries a payload of
-        // variable_bits(5) skip bytes, each treated as opaque reserved.
-        let n_bits = variable_bits(br, 5)?;
-        // Clamp — the spec says the reserved field must fit within the
-        // remaining frame, so we trust it but cap at a sane upper bound
-        // to avoid runaway reads on malformed streams.
-        if n_bits > 1 << 20 {
-            return Err(Error::invalid("ac4: emdf_reserved claims too many bits"));
-        }
-        br.skip(n_bits)?;
+    let primary = br.read_u32(2)?;
+    let secondary = br.read_u32(2)?;
+    let mut n_skip_bytes: u32 = 0;
+    if primary > 0 {
+        n_skip_bytes += 1 << (2 * (primary - 1));
     }
+    if secondary > 0 {
+        n_skip_bytes += 1 << (2 * (secondary - 1));
+    }
+    br.skip(n_skip_bytes * 8)?;
     Ok(())
 }
 
@@ -1925,5 +1933,63 @@ mod tests {
 
         let summary = parse_substream_group_info(&mut br, 2, 0, 4).unwrap();
         assert_eq!(summary.first_channels, 2);
+    }
+
+    // Regression coverage for the emdf_reserved() bitstream bug found by
+    // testing against real Tidal AC-4 files: the previous implementation
+    // read a nonexistent `b_more_bits` flag plus a `variable_bits(5)`
+    // skip count, which doesn't match the spec (Table 80 — two 2-bit
+    // skip-byte-length codes) and misaligned every real-world stream
+    // tested against it.
+
+    #[test]
+    fn emdf_reserved_all_zero_consumes_exactly_four_bits() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // primary = 0
+        bw.write_u32(0, 2); // secondary = 0
+        bw.write_bit(true); // sentinel — must still be reachable right after
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_emdf_reserved(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel bit should be reachable after exactly 4 bits");
+    }
+
+    #[test]
+    fn emdf_reserved_skips_primary_and_secondary_bytes() {
+        use oxideav_core::bits::BitWriter;
+        // primary = 2 -> 1 << (2*(2-1)) = 4 bytes; secondary = 1 -> 1 byte.
+        // Total 5 reserved bytes (40 bits) to skip before the sentinel.
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 2);
+        bw.write_u32(1, 2);
+        for _ in 0..40 {
+            bw.write_bit(false);
+        }
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_emdf_reserved(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel should be reachable after skipping 5 bytes");
+    }
+
+    #[test]
+    fn emdf_reserved_max_codes_skip_32_bytes() {
+        use oxideav_core::bits::BitWriter;
+        // primary = 3 -> 16 bytes; secondary = 3 -> 16 bytes; 32 total.
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 2);
+        bw.write_u32(3, 2);
+        for _ in 0..(32 * 8) {
+            bw.write_bit(false);
+        }
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_emdf_reserved(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel should be reachable after skipping 32 bytes");
     }
 }

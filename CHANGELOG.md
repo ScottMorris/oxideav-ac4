@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`emdf_reserved()` bitstream bug** (§4.2.3.12, Table 80) — the
+  long-standing implementation read a nonexistent `b_more_bits` flag
+  followed by a `variable_bits(5)`-encoded skip count. The real syntax
+  (the table is headed `emdf_protection()`, apparently a naming
+  artifact, but it's the only definition given for what `emdf_info()`
+  calls `emdf_reserved()`) is two 2-bit skip-byte-length codes
+  (primary/secondary), each contributing `1 << (2*(code-1))` bytes of
+  reserved data when nonzero (max 32 bytes combined) — nothing like the
+  old reading. This was hit on **every real AC-4 frame** tested against
+  this session's real Tidal downloads and silently corrupted alignment
+  for everything parsed afterward, producing wrong/inconsistent
+  channel counts, sample rates, and substream sizes frame-to-frame (or
+  outright parse failures) despite passing the crate's own synthetic
+  test suite — the test fixtures and the real encoder path
+  (`encoder_ims.rs`) both wrote the same wrong 1-bit form, so reader
+  and writer agreed with each other while disagreeing with the actual
+  spec and with every real encoder's output.
+
+  Fixed in `toc::parse_emdf_reserved`, with matching fixes to the two
+  test-fixture builders (`decoder::build_minimal_toc`,
+  `decoder::build_mono_toc`) and the two real encoder call sites
+  (`encoder_ims::write_presentation_v0`, `write_presentation_v1_info`)
+  that all encoded the old wrong form. 3 new regression tests pin the
+  correct 4-bit-minimum consumption and both non-trivial skip-byte
+  codes. Verified against two complete real Tidal AC-4 files end to
+  end: 1571/1571 and 1806/1806 frames now parse successfully with
+  fully consistent `sample_rate`/`channels` across every frame, versus
+  scattered failures and frame-to-frame nonsense before the fix.
+
 ### Other
 
 - ac4 round 394 — **`audio_data_ajoc()` end-to-end** (§6.2.3.4), the

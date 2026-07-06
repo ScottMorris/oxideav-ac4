@@ -36,6 +36,17 @@ covers the channel-based layouts.
 `raw_ac4_frame` payload, parses the TOC, and decodes the substreams to
 an S16 `AudioFrame`:
 
+- **TOC parsing is now validated against real files, not just the
+  crate's own synthetic fixtures.** A long-standing bug in
+  `emdf_reserved()` (see Changelog) meant `parse_ac4_toc` misaligned on
+  *every* real AC-4 frame tested, despite the full test suite passing —
+  the fixture builders and the real encoder path had both been writing
+  the same wrong bit pattern the buggy reader expected, so nothing
+  caught it until real Tidal downloads were fed through it. Fixed and
+  confirmed end-to-end: two complete real files (1571 and 1806 frames)
+  now parse with 100% success and fully consistent `sample_rate`/
+  `channels` across every frame.
+
 - **ASF coefficient pipeline** — `asf_section_data()`,
   `asf_spectral_data()` (HCB 1..11 + the codebook-11 escape),
   `asf_scalefac_data()`, and `asf_snf_data()` for mono, stereo (split +
