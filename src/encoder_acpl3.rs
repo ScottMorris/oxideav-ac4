@@ -3205,6 +3205,9 @@ fn write_two_channel_data(
         .expect("encoder: unsupported transform_length");
     let (n_msfb_bits, _, _) =
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
+    // Table 26: b_enable_mdct_stereo_proc = 1 — this writer emits the
+    // shared-sf_info + chparam_info branch.
+    bw.write_bit(true);
     // Shared sf_info(ASF, 0, 0).
     bw.write_bit(true); // asf_transform_info: b_long_frame = 1
     bw.write_u32(max_sfb, n_msfb_bits); // asf_psy_info: max_sfb[0]

@@ -2041,6 +2041,16 @@ pub(crate) fn parse_aspx_data_2ch_body(
     // then four aspx_ec_data() calls (ch0/ch1 SIGNAL, ch0/ch1
     // NOISE) per Table 52.
     if let Ok(tables) = aspx::derive_aspx_frequency_tables(cfg, xover as u32) {
+        let _t = std::env::var_os("AC4_T").is_some();
+        if _t {
+            eprintln!(
+                "A2 xover={xover} bal={} ne0={} ic0={:?} hires={} lores={} noise={} sbx={} sba={} sbz={} @{}",
+                balance as u8, framing_ch0.num_env, framing_ch0.int_class,
+                tables.counts.num_sbg_sig_highres, tables.counts.num_sbg_sig_lowres,
+                tables.counts.num_sbg_noise, tables.sbx, tables.sba, tables.sbz,
+                br.bit_position()
+            );
+        }
         let hfgen = aspx::parse_aspx_hfgen_iwc_2ch(
             br,
             balance,
@@ -2048,6 +2058,7 @@ pub(crate) fn parse_aspx_data_2ch_body(
             tables.counts.num_sbg_sig_highres,
             nats,
         )?;
+        if _t { eprintln!("A2 hfgen done @{}", br.bit_position()); }
         tools.aspx_hfgen_iwc_2ch = Some(hfgen);
         let qmode_ch1_effective = tools.aspx_qmode_env_secondary.unwrap_or(qmode_ch0);
         // ch0 SIGNAL: stereo_mode = LEVEL (Table 52).
@@ -2062,6 +2073,7 @@ pub(crate) fn parse_aspx_data_2ch_body(
             tables.counts,
         )?;
         tools.aspx_data_sig_primary = Some(sig0);
+        if _t { eprintln!("A2 sig0 done @{}", br.bit_position()); }
         // ch1 SIGNAL: BALANCE when aspx_balance == 1 else LEVEL
         // (Table 52).
         let sm_ch1 = if balance {
@@ -3550,6 +3562,20 @@ pub fn walk_ac4_substream_sticky(
     // byte_align to enter audio_data().
     br.align_to_byte();
     let audio_data_offset = br.byte_position() as u32;
+    // Bound the walk at the end of audio_data: `audio_size` counts from
+    // its own 2-byte size field, so audio_data spans exactly
+    // `audio_size - 2` bytes from here. Without this clamp a runaway
+    // Huffman loop reads on into fill/metadata (and, for substream
+    // slices that extend to the frame end, arbitrarily far) and a
+    // misparse can masquerade as a completed walk. With it, every
+    // runaway hits a hard EOF at the correct wall, which both keeps
+    // garbage out of downstream state and makes the AC4_PARSE_STATS
+    // delta a truthful bail-vs-complete meter.
+    let audio_end = (audio_data_offset as usize)
+        .saturating_add((audio_size as usize).saturating_sub(2))
+        .min(substream_bytes.len());
+    let bounded = &substream_bytes[..audio_end];
+    let mut br = BitReader::with_position(bounded, audio_data_offset as usize);
 
     // Parse the outer layers of audio_data(channel_mode, b_iframe).
     let mut tools = SubstreamTools {
@@ -3632,6 +3658,18 @@ pub fn walk_ac4_substream_sticky(
         // spectral data. For the baseline we record the channel count
         // and bail.
         _ => {}
+    }
+
+    // AC4_PARSE_STATS=1: per-substream parse-consumption diagnostic.
+    // `audio_size` counts from its own 2-byte size field, so a fully
+    // correct walk (which starts after that field) reports delta == -2.
+    // Positive deltas = the walk bailed early; negative beyond -2 = it
+    // over-consumed. This is the ground-truth meter used by the
+    // round-403+ conformance work; see riptide's
+    // docs/ac4-decoder-accuracy-plan.md §7c/§7f.
+    if std::env::var_os("AC4_PARSE_STATS").is_some() {
+        let consumed = br.bit_position() as i64 / 8 - audio_data_offset as i64;
+        eprintln!("AC4_PARSE_STATS delta={}", audio_size as i64 - consumed);
     }
 
     // Every I-frame refreshes the sticky configs for the P-frames that
@@ -4534,9 +4572,11 @@ mod tests {
         // 3 qmf_band_minus1). The walker now also consumes
         // companding_control(1) and tries the MDCT body, but ACPL_1's
         // joint-MDCT residual layer isn't wired so the body bails;
-        // config + companding still surface.
+        // config + companding still surface. audio_size must cover the
+        // whole region the walk may touch — the walker is bounded at
+        // audio_size and errors past it rather than reading padding.
         let mut bw = BitWriter::new();
-        bw.write_u32(5, 15);
+        bw.write_u32(12, 15);
         bw.write_bit(false);
         bw.align_to_byte();
         bw.write_u32(0b10, 2); // ASPX_ACPL_1

@@ -4844,6 +4844,9 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let tcd_a = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -4851,6 +4854,9 @@ mod tests {
             scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd_b = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -4906,6 +4912,9 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let tcd_a = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -4913,6 +4922,9 @@ mod tests {
             scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd_b = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -4964,6 +4976,9 @@ mod tests {
             scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -5039,6 +5054,9 @@ mod tests {
         };
         // cfg0
         let tcd = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti_short),
             psy_info: None,
             chparam: None,
@@ -5161,6 +5179,9 @@ mod tests {
 
         // ===== cfg0 =====
         let tcd_a = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -5168,6 +5189,9 @@ mod tests {
             scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd_b = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -5240,6 +5264,9 @@ mod tests {
             scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -5512,6 +5539,9 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let add = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -5548,6 +5578,9 @@ mod tests {
             transform_length_1: 1_024,
         };
         let add = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
@@ -5585,6 +5618,9 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let add = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,

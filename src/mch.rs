@@ -197,8 +197,19 @@ pub struct FiveChannelInfo {
 /// (short frame, grouped, or Huffman error).
 #[derive(Debug, Clone, Default)]
 pub struct TwoChannelData {
+    /// `b_enable_mdct_stereo_proc` (Table 26, first bit). When set the
+    /// two channels share one `sf_info` + a `chparam_info`; when clear
+    /// each channel carries its *own* `sf_info` and there is no
+    /// chparam. (Round 404: this selector bit was previously never
+    /// read — the parser hardcoded the shared-sf_info branch, desyncing
+    /// every `two_channel_data` in every frame by at least one bit.)
+    pub b_enable_mdct_stereo_proc: bool,
     pub transform_info: Option<AsfTransformInfo>,
     pub psy_info: Option<AsfPsyInfo>,
+    /// Channel 1's own `sf_info` for the `b_enable_mdct_stereo_proc == 0`
+    /// branch (`None` when the shared branch is taken).
+    pub transform_info_1: Option<AsfTransformInfo>,
+    pub psy_info_1: Option<AsfPsyInfo>,
     pub chparam: Option<ChparamInfo>,
     /// Per-channel scaled MDCT spectra. Length = 2 once the body has
     /// been walked. Each entry's `Vec<f32>` is `sfb_offset[max_sfb]`
@@ -372,18 +383,48 @@ pub fn parse_two_channel_data(
     br: &mut BitReader<'_>,
     frame_len_base: u32,
 ) -> Result<TwoChannelData> {
-    let ti = parse_asf_transform_info(br, frame_len_base)?;
-    let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let chparam = parse_chparam_info(br, &[max_sfb_g])?;
-    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
-    Ok(TwoChannelData {
-        transform_info: Some(ti),
-        psy_info: Some(psy),
-        chparam: Some(chparam),
-        scaled_spec_per_channel: scaled,
-        scaled_spec_windows_per_channel: scaled_windows,
-    })
+    // Table 26: `b_enable_mdct_stereo_proc` selects between a shared
+    // sf_info + chparam_info (joint MDCT stereo processing) and two
+    // fully independent per-channel sf_infos.
+    let b_msp = br.read_bit()?;
+    if b_msp {
+        let ti = parse_asf_transform_info(br, frame_len_base)?;
+        let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
+        let max_sfb_g = psy.max_sfb_0;
+        let chparam = parse_chparam_info(br, &[max_sfb_g])?;
+        let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+        Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: true,
+            transform_info: Some(ti),
+            psy_info: Some(psy),
+            transform_info_1: None,
+            psy_info_1: None,
+            chparam: Some(chparam),
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        })
+    } else {
+        // Independent channels: each has its own sf_info, and each
+        // sf_data body is decoded against its own transform/psy pair.
+        let ti0 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy0 = parse_asf_psy_info(br, &ti0, frame_len_base, false, false)?;
+        let ti1 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy1 = parse_asf_psy_info(br, &ti1, frame_len_base, false, false)?;
+        let (mut scaled, mut scaled_windows) = decode_mch_sf_data_channels(br, &ti0, &psy0, 1);
+        let (s1, w1) = decode_mch_sf_data_channels(br, &ti1, &psy1, 1);
+        scaled.extend(s1);
+        scaled_windows.extend(w1);
+        Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: false,
+            transform_info: Some(ti0),
+            psy_info: Some(psy0),
+            transform_info_1: Some(ti1),
+            psy_info_1: Some(psy1),
+            chparam: None,
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        })
+    }
 }
 
 /// `three_channel_info()` per Table 30.
@@ -2157,6 +2198,7 @@ mod tests {
         // Long-frame @1920, max_sfb=20, chparam_info sap_mode=0,
         // r23: + 2 sf_data(ASF) all-zero bodies.
         let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(20, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
@@ -2187,12 +2229,14 @@ mod tests {
         bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
         bw.write_bit(true); // b_2ch_mode
                             // two_channel_data #1: long-frame, max_sfb=10, chparam=0.
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
         write_zero_sf_data_body(&mut bw, 10, 1920); // sf_data #1
         write_zero_sf_data_body(&mut bw, 10, 1920); // sf_data #2
                                                  // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
@@ -2253,6 +2297,7 @@ mod tests {
             write_zero_sf_data_body(&mut bw, 14, 1920);
         }
         // two_channel_data: long-frame, max_sfb=18, chparam=0.
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(18, 6);
         bw.write_u32(0, 2);
@@ -2539,6 +2584,7 @@ mod tests {
     #[test]
     fn parse_two_channel_data_per_channel_lengths_match_sfb_offset() {
         let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(15, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam_info sap_mode = 0
@@ -2711,6 +2757,7 @@ mod tests {
     #[test]
     fn parse_two_channel_data_grouped_short_frame_walks_per_group() {
         let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(false); // b_long_frame = 0
         bw.write_u32(2, 2); // transf_length[0] = 2 (tl=480)
         bw.write_u32(2, 2); // transf_length[1] = 2 (tl=480)
@@ -2894,6 +2941,7 @@ mod tests {
         write_companding_3_all_on(&mut bw);
         bw.write_bit(false); // coding_config = 0 -> two_channel_data + mono(0)
                              // two_channel_data() outer + 2x sf_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
@@ -3043,6 +3091,7 @@ mod tests {
         write_companding_3_all_on(&mut bw);
         bw.write_bit(false); // coding_config = 0 -> two_channel_data
                              // two_channel_data outer (Table 26):
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(12, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
@@ -3202,6 +3251,7 @@ mod tests {
         // SIMPLE additional-channel block: b_use_sap_add_ch = 0.
         bw.write_bit(false);
         // additional two_channel_data (no SAP):
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
@@ -3252,6 +3302,7 @@ mod tests {
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
@@ -3282,12 +3333,14 @@ mod tests {
         // 2ch_mode (1 bit).
         bw.write_bit(false);
         // two_channel_data #0:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
         write_zero_sf_data_body(&mut bw, 12, 1920);
         write_zero_sf_data_body(&mut bw, 12, 1920);
         // two_channel_data #1:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
@@ -3296,6 +3349,7 @@ mod tests {
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
                              // additional two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
@@ -3340,6 +3394,7 @@ mod tests {
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(9, 6);
         bw.write_u32(0, 2);
@@ -3382,6 +3437,7 @@ mod tests {
             write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
@@ -3389,6 +3445,7 @@ mod tests {
         write_zero_sf_data_body(&mut bw, 10, 1920);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
@@ -3433,6 +3490,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0 sap_mode = 0
         bw.write_u32(0, 2); // chparam_info #1 sap_mode = 0
                             // additional two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
@@ -3473,6 +3531,7 @@ mod tests {
             write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
@@ -3513,12 +3572,14 @@ mod tests {
         bw.write_u32(0, 2); // coding_config = 0 -> 2ch_mode + 2x two_channel_data
         bw.write_bit(false); // 2ch_mode
                              // two_channel_data #0:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
         write_zero_sf_data_body(&mut bw, 12, 1920);
         write_zero_sf_data_body(&mut bw, 12, 1920);
         // two_channel_data #1:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
@@ -3579,6 +3640,7 @@ mod tests {
             write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
