@@ -2131,8 +2131,22 @@ pub(crate) fn parse_aspx_data_2ch_body(
     let f_ch1 = framing_ch1_ref.unwrap_or(&framing_ch0);
     let dd1 = aspx::parse_aspx_delta_dir(br, f_ch1)?;
     // Round 407f: derived per-envelope freq res (see the 1ch site).
-    let fres0 = aspx::derive_freq_res_vec(&framing_ch0, cfg, nats, b_iframe, nats as i32);
-    let fres1 = aspx::derive_freq_res_vec(f_ch1, cfg, nats, b_iframe, nats as i32);
+    let mut fres0 = aspx::derive_freq_res_vec(&framing_ch0, cfg, nats, b_iframe, nats as i32);
+    let mut fres1 = aspx::derive_freq_res_vec(f_ch1, cfg, nats, b_iframe, nats as i32);
+    // Scan-only override: AC4_FRES_MASK0/1 force the per-envelope
+    // resolution bits (LSB = env 0) for the fres backchain experiments.
+    if let Ok(m) = std::env::var("AC4_FRES_MASK0") {
+        let m: u32 = m.parse().unwrap_or(0);
+        for (i, b) in fres0.iter_mut().enumerate() {
+            *b = (m >> i) & 1 == 1;
+        }
+    }
+    if let Ok(m) = std::env::var("AC4_FRES_MASK1") {
+        let m: u32 = m.parse().unwrap_or(0);
+        for (i, b) in fres1.iter_mut().enumerate() {
+            *b = (m >> i) & 1 == 1;
+        }
+    }
     // §5.7.6.3.1 derivation feeds aspx_hfgen_iwc_2ch() (Table 56)
     // then four aspx_ec_data() calls (ch0/ch1 SIGNAL, ch0/ch1
     // NOISE) per Table 52.
@@ -4386,6 +4400,72 @@ mod tests {
             }
         }
         eprintln!("I2POS done");
+    }
+
+    /// Round-407f: free per-envelope fres brute for I-frame trailer
+    /// #1 (from AC4_SCAN_TSTART) chained with #2 landing exactly at
+    /// AC4_SCAN_TARGET (the proven 1ch start). Prints every fres
+    /// mask combination that closes the chain with '000' xover bits
+    /// at the #2 boundary.
+    #[test]
+    #[ignore]
+    fn debug_scan_fres_brute() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let tstart: u64 = std::env::var("AC4_SCAN_TSTART").expect("AC4_SCAN_TSTART").parse().unwrap();
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let data = std::fs::read(&path).expect("read");
+        let mut hr = BitReader::new(&data);
+        let _short = hr.read_u32(15).unwrap();
+        assert!(!hr.read_bit().unwrap());
+        hr.align_to_byte();
+        let off = hr.byte_position();
+        let mut cbr = BitReader::with_position(&data, off);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        for m0a in 0u32..16 {
+            for m1a in 0u32..16 {
+                std::env::set_var("AC4_FRES_MASK0", m0a.to_string());
+                std::env::set_var("AC4_FRES_MASK1", m1a.to_string());
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(tstart as u32).unwrap();
+                let mut tools = SubstreamTools::default();
+                if parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, true, 2048).is_err() {
+                    continue;
+                }
+                let x1 = br.bit_position() as usize;
+                if x1 + 3 >= target as usize
+                    || bit(x1) != 0
+                    || bit(x1 + 1) != 0
+                    || bit(x1 + 2) != 0
+                {
+                    continue;
+                }
+                for m0b in 0u32..16 {
+                    for m1b in 0u32..16 {
+                        std::env::set_var("AC4_FRES_MASK0", m0b.to_string());
+                        std::env::set_var("AC4_FRES_MASK1", m1b.to_string());
+                        let mut b2 = BitReader::with_position(&data, 0);
+                        b2.skip(x1 as u32).unwrap();
+                        let mut t2 = SubstreamTools::default();
+                        if parse_aspx_data_2ch_body(&mut b2, &mut t2, &cfg, true, 2048)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        if b2.bit_position() == target {
+                            eprintln!(
+                                "FRES hit: t1 masks=({m0a:04b},{m1a:04b}) end@{x1}; t2 masks=({m0b:04b},{m1b:04b}) -> {target}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        std::env::remove_var("AC4_FRES_MASK0");
+        std::env::remove_var("AC4_FRES_MASK1");
+        eprintln!("FRES done");
     }
 
     /// Round-406c P-frame full-chain pipeline: like
