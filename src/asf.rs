@@ -4159,6 +4159,151 @@ mod tests {
         }
         eprintln!("PTRL done");
     }
+
+    /// Round-406c P-frame full-chain pipeline: like
+    /// `debug_scan_iframe_pipeline` but with b_iframe=false trailers
+    /// (per-slot sticky xovers from AC4_SCAN_XOVERS, aspx_config from
+    /// AC4_SCAN_CFG_FILE) and a tight stage-3 filter using the PROVEN
+    /// ms rule (ms_count == AC4_SCAN_MS, default 50) + msfb == m1.
+    #[test]
+    #[ignore]
+    fn debug_scan_pframe_pipeline() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        std::env::set_var("AC4_SECT_NO_TRUNC", "1");
+        let cfg_path = std::env::var("AC4_SCAN_CFG_FILE").expect("AC4_SCAN_CFG_FILE");
+        let ms_expect: usize = std::env::var("AC4_SCAN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let xovers: Vec<u8> = std::env::var("AC4_SCAN_XOVERS")
+            .expect("AC4_SCAN_XOVERS")
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let data = std::fs::read(&path).expect("read scan file");
+        let cdata = std::fs::read(&cfg_path).expect("read cfg file");
+        let mut hr = BitReader::new(&data);
+        let short = hr.read_u32(15).unwrap();
+        assert!(!hr.read_bit().unwrap());
+        hr.align_to_byte();
+        let wall = (hr.byte_position() as u64 + short as u64) * 8;
+        let mut hr2 = BitReader::new(&cdata);
+        let _ = hr2.read_u32(15).unwrap();
+        let _ = hr2.read_bit().unwrap();
+        hr2.align_to_byte();
+        let coff = hr2.byte_position();
+        let mut cbr = BitReader::with_position(&cdata, coff);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        eprintln!("PPIPE file={path} wall={wall} xovers={xovers:?} ms_expect={ms_expect}");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let tl = 2048u32;
+        let sfbo = sfb_offset::sfb_offset_48(tl).unwrap();
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        let v = |lo: usize, n: usize| {
+            let mut x = 0u32;
+            for i in 0..n {
+                x = (x << 1) | bit(lo + i) as u32;
+            }
+            x
+        };
+        let lo = wall.saturating_sub(6000) as usize;
+        let hi = wall.saturating_sub(400) as usize;
+        for start_bit in lo..hi {
+            for m1 in 1..=63u32 {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(start_bit as u32).unwrap();
+                let Some(body) = decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m1) else {
+                    continue;
+                };
+                if body.iter().filter(|q| **q != 0.0).count() < 50 {
+                    continue;
+                }
+                let body_end = br.bit_position();
+                if body_end >= wall {
+                    continue;
+                }
+                let mut tools = SubstreamTools::default();
+                for (i, &x) in xovers.iter().enumerate() {
+                    tools.aspx_xover_slots[i] = Some(x);
+                }
+                let mut ok = true;
+                for ch in [2u8, 2, 1, 2] {
+                    let r = if ch == 1 {
+                        parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                    } else {
+                        parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                    };
+                    if r.is_err() || br.bit_position() > wall {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let slack = wall as i64 - br.bit_position() as i64;
+                if !(0..=8).contains(&slack) {
+                    continue;
+                }
+                // stage 2: body0 ending exactly at start_bit
+                let t = start_bit as u64;
+                for s0 in start_bit.saturating_sub(4200)..start_bit.saturating_sub(30) {
+                    for m0 in 1..=63u32 {
+                        let mut b2 = BitReader::with_position(&data, 0);
+                        b2.skip(s0 as u32).unwrap();
+                        let Ok(sections) = asf_data::parse_asf_section_data(&mut b2, 0, tl, m0)
+                        else {
+                            continue;
+                        };
+                        if sections.sect_cb.iter().any(|&cb| cb > 11) {
+                            continue;
+                        }
+                        let Ok((_q, mqi)) =
+                            asf_data::parse_asf_spectral_data(&mut b2, &sections, sfbo, m0)
+                        else {
+                            continue;
+                        };
+                        if asf_data::parse_asf_scalefac_data(&mut b2, &sections, &mqi, m0, tl)
+                            .is_err()
+                        {
+                            continue;
+                        }
+                        if asf_data::parse_asf_snf_data(&mut b2, &sections, &mqi, m0, tl).is_err()
+                        {
+                            continue;
+                        }
+                        if b2.bit_position() != t {
+                            continue;
+                        }
+                        // stage 3: head with the PROVEN shape
+                        let e = match s0.checked_sub(10 + ms_expect) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        if bit(e) != 1 || bit(e + 1) != 1 {
+                            continue;
+                        }
+                        let msfb = v(e + 2, 6);
+                        let sap = v(e + 8, 2);
+                        if sap != 1 || msfb != m1 {
+                            continue;
+                        }
+                        eprintln!(
+                            "PPIPE sol: head@{e} msfb={msfb} body0=({s0},m={m0}) body1=({start_bit},m={m1}) trailer_slack={slack}"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("PPIPE done");
+    }
     use super::*;
     use oxideav_core::bits::BitWriter;
 

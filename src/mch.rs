@@ -474,6 +474,64 @@ pub(crate) fn aspx_core_band_count(cfg: &crate::aspx::AspxConfig, tl: u32) -> Op
     Some(n)
 }
 
+/// Trial-parse helper for [`parse_two_channel_data_additional`]: given
+/// a reader positioned at body0's first section bit, find body0's
+/// scalefac/SNF band bound by validating each candidate tail length
+/// against a full parse of body1. Returns the winning bound
+/// (`k + 1` bands for `k` scalefac codewords read).
+fn discover_add_pair_body0_bound(
+    br0: BitReader<'_>,
+    ti: &AsfTransformInfo,
+    max_sfb_1: u32,
+) -> Option<u32> {
+    use crate::asf_data;
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    let num_sfb = crate::tables::num_sfb_48(tl)?;
+    for m0 in 1..=num_sfb {
+        // Full deterministic body0 parse under the candidate bound.
+        let mut tr = br0;
+        let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut tr, tl_idx, tl, m0, true)
+        else {
+            continue;
+        };
+        if sections.sect_cb.iter().any(|&cb| cb > 11) {
+            continue;
+        }
+        let Ok((_q, mqi)) = asf_data::parse_asf_spectral_data(&mut tr, &sections, sfbo, m0)
+        else {
+            continue;
+        };
+        if asf_data::parse_asf_scalefac_data(&mut tr, &sections, &mqi, m0, tl).is_err() {
+            continue;
+        }
+        if asf_data::parse_asf_snf_data(&mut tr, &sections, &mqi, m0, tl).is_err() {
+            continue;
+        }
+        // Oracle: body1 must parse cleanly from here with legal
+        // codebooks and sections closing exactly at max_sfb_1 — a few
+        // hundred chained Huffman codewords make a false accept
+        // essentially impossible.
+        let mut vr = tr;
+        let Ok(s1) = asf_data::parse_asf_section_data_ext(&mut vr, tl_idx, tl, max_sfb_1, true)
+        else {
+            continue;
+        };
+        if s1.sect_cb.iter().any(|&cb| cb > 11) {
+            continue;
+        }
+        if s1.sect_end.last().map(|&e| e as u32) != Some(max_sfb_1) {
+            continue;
+        }
+        if asf_data::parse_asf_spectral_data(&mut vr, &s1, sfbo, max_sfb_1).is_err() {
+            continue;
+        }
+        return Some(m0);
+    }
+    None
+}
+
 /// The additional-channel pair's FIRST body gates scalefac/SNF over
 /// this many bands, independent of the transmitted max_sfb (round 406,
 /// empirical — constant 2 across tracks; its single section and the
@@ -549,12 +607,17 @@ pub fn parse_two_channel_data_additional(
     }
     let ms_bands = aspx_core_band_count(cfg, ti.transform_length_0).unwrap_or(psy.max_sfb_0);
     let chparam = parse_chparam_info(br, &[ms_bands])?;
-    let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(
-        br,
-        &ti,
-        ADD_PAIR_BODY0_SF_BOUND,
-        true,
-    );
+    // Round 406d: body0's scalefac band count is NOT derivable from any
+    // known header field (observed 2 / 2 / 14 across three tracks with
+    // identical aspx configs). Discover it per frame: parse body0's
+    // section+spectral (deterministic), then try k = 0.. scalefac
+    // codewords; the first k whose implied body1 start yields a fully
+    // valid body1 parse (legal codebooks, sections closing exactly at
+    // max_sfb) wins — a few hundred chained Huffman codewords make a
+    // false accept essentially impossible.
+    let m0 = discover_add_pair_body0_bound(*br, &ti, psy.max_sfb_0)
+        .unwrap_or(ADD_PAIR_BODY0_SF_BOUND);
+    let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, m0, true);
     let b1 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, psy.max_sfb_0, true);
     if _trace {
         eprintln!(
