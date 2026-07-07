@@ -447,6 +447,142 @@ pub fn parse_two_channel_data(
     }
 }
 
+/// Number of scale factor bands lying strictly below the A-SPX start
+/// subband (`sba`) for the given transform length — i.e. the count of
+/// sfbs whose END line is < `sba * (tl / 64)`.
+///
+/// Round 406: on real 7_X ASPX content the additional-channel
+/// `two_channel_data`'s `chparam_info` ms_used loop runs over THIS
+/// count, not `get_max_sfb` as Table 47 reads — proven by exact-end
+/// backchaining on two independent tracks (ms bits = 50 with
+/// max_sfb = 54 on one and max_sfb = 44 on the other; both
+/// aspx start_freq=7/HighRes ⇒ sba=40 ⇒ line 1280 ⇒ 50 bands).
+pub(crate) fn aspx_core_band_count(cfg: &crate::aspx::AspxConfig, tl: u32) -> Option<u32> {
+    let (_master, _n, sba, _sbz) = crate::aspx::derive_master_sbg_table(cfg);
+    let sb_width = tl / 64;
+    let line = sba * sb_width;
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    let num_sfb = crate::tables::num_sfb_48(tl)?;
+    let mut n = 0u32;
+    for sfb in 0..num_sfb as usize {
+        if (sfbo[sfb + 1] as u32) < line {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    Some(n)
+}
+
+/// The additional-channel pair's FIRST body gates scalefac/SNF over
+/// this many bands, independent of the transmitted max_sfb (round 406,
+/// empirical — constant 2 across tracks; its single section and the
+/// spectral data span far wider, hence the untruncated section
+/// grammar). Semantics of the two bands' gains are still TBD; parsing
+/// length is exact.
+pub(crate) const ADD_PAIR_BODY0_SF_BOUND: u32 = 2;
+
+/// Table 26 `two_channel_data()` for the 7_X ADDITIONAL channel pair.
+///
+/// Identical to [`parse_two_channel_data`] except in the
+/// `b_enable_mdct_stereo_proc == 1` long-frame path, where the
+/// additional pair deviates from the plain Table 26/47 reading in two
+/// proven ways (riptide docs/ac4-decoder-accuracy-plan.md §7i):
+///   1. `chparam_info`'s ms_used loop runs over
+///      [`aspx_core_band_count`] bands (not `max_sfb`);
+///   2. body0 uses the untruncated section grammar with a scalefac/SNF
+///      bound of [`ADD_PAIR_BODY0_SF_BOUND`]; body1 uses `max_sfb`.
+/// Falls back to the plain parse when no aspx config is available
+/// (SIMPLE codec mode) or the frame is short/grouped.
+pub fn parse_two_channel_data_additional(
+    br: &mut BitReader<'_>,
+    frame_len_base: u32,
+    aspx_cfg: Option<&crate::aspx::AspxConfig>,
+) -> Result<TwoChannelData> {
+    let Some(cfg) = aspx_cfg else {
+        return parse_two_channel_data(br, frame_len_base);
+    };
+    let b_msp = br.read_bit()?;
+    let _trace = std::env::var_os("AC4_TRACE_BODIES").is_some();
+    if _trace {
+        eprintln!("2CH-ADD b_msp={} in@{}", b_msp as u8, br.bit_position() - 1);
+    }
+    if !b_msp {
+        // Independent-channel branch is byte-identical to the plain
+        // element; reuse its body handling.
+        let ti0 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy0 = parse_asf_psy_info(br, &ti0, frame_len_base, false, false)?;
+        let ti1 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy1 = parse_asf_psy_info(br, &ti1, frame_len_base, false, false)?;
+        let (mut scaled, mut scaled_windows) = decode_mch_sf_data_channels(br, &ti0, &psy0, 1);
+        let (s1, w1) = decode_mch_sf_data_channels(br, &ti1, &psy1, 1);
+        scaled.extend(s1);
+        scaled_windows.extend(w1);
+        return Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: false,
+            transform_info: Some(ti0),
+            psy_info: Some(psy0),
+            transform_info_1: Some(ti1),
+            psy_info_1: Some(psy1),
+            chparam: None,
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        });
+    }
+    let ti = parse_asf_transform_info(br, frame_len_base)?;
+    let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
+    if !(ti.b_long_frame && psy.num_window_groups == 1) {
+        // Short/grouped additional pair: rule unverified — use the
+        // plain Table 47 count and grouped body walker.
+        let chparam = parse_chparam_info(br, &[psy.max_sfb_0])?;
+        let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+        return Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: true,
+            transform_info: Some(ti),
+            psy_info: Some(psy),
+            transform_info_1: None,
+            psy_info_1: None,
+            chparam: Some(chparam),
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        });
+    }
+    let ms_bands = aspx_core_band_count(cfg, ti.transform_length_0).unwrap_or(psy.max_sfb_0);
+    let chparam = parse_chparam_info(br, &[ms_bands])?;
+    let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(
+        br,
+        &ti,
+        ADD_PAIR_BODY0_SF_BOUND,
+        true,
+    );
+    let b1 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, psy.max_sfb_0, true);
+    if _trace {
+        eprintln!(
+            "2CH-ADD shared m={} ms_bands={} b0={} b1={} out@{}",
+            psy.max_sfb_0,
+            ms_bands,
+            b0.is_some(),
+            b1.is_some(),
+            br.bit_position()
+        );
+    }
+    if b0.is_none() || b1.is_none() {
+        return Err(oxideav_core::error::Error::invalid(
+            "ac4: additional two_channel_data body parse failed",
+        ));
+    }
+    Ok(TwoChannelData {
+        b_enable_mdct_stereo_proc: true,
+        transform_info: Some(ti),
+        psy_info: Some(psy),
+        transform_info_1: None,
+        psy_info_1: None,
+        chparam: Some(chparam),
+        scaled_spec_per_channel: vec![b0, b1],
+        scaled_spec_windows_per_channel: vec![None, None],
+    })
+}
+
 /// `three_channel_info()` per Table 30.
 pub fn parse_three_channel_info(
     br: &mut BitReader<'_>,
@@ -1496,7 +1632,17 @@ pub fn parse_7x_audio_data_outer(
             // pass the largest channel-data max_sfb seen so far (the
             // chparam SAP DPCM walker is bounded by its own
             // `max_sfb_per_group` argument).
-            let max_sfb_g = largest_tl.and_then(crate::tables::num_sfb_48).unwrap_or(63);
+            // Round 406: when the aspx config is known, these SAP
+            // chparams cover the aspx-core band range (same count as
+            // the additional pair's own ms_used loop), not
+            // num_sfb_48(tl).
+            let max_sfb_g = tools
+                .aspx_config
+                .as_ref()
+                .zip(largest_tl)
+                .and_then(|(cfg, tl)| aspx_core_band_count(cfg, tl))
+                .or_else(|| largest_tl.and_then(crate::tables::num_sfb_48))
+                .unwrap_or(63);
             let cp0 = match parse_chparam_info(br, &[max_sfb_g]) {
                 Ok(c) => c,
                 Err(_) => return Ok(()),
@@ -1508,7 +1654,8 @@ pub fn parse_7x_audio_data_outer(
             tools.seven_x_add_chparam_info = Some([cp0, cp1]);
         }
         // Additional `two_channel_data()` for the extra 2 channels.
-        match parse_two_channel_data(br, frame_len_base) {
+        let add_cfg = tools.aspx_config.clone();
+        match parse_two_channel_data_additional(br, frame_len_base, add_cfg.as_ref()) {
             Ok(d) => {
                 if let Some(ti) = d.transform_info.as_ref() {
                     update_largest(ti.transform_length_0, &mut largest_tl);

@@ -79,9 +79,27 @@ pub fn sect_len_bits(transform_length: u32) -> (u32, u32) {
 
 pub fn parse_asf_section_data(
     br: &mut BitReader<'_>,
+    transf_length_idx: u32,
+    transform_length: u32,
+    max_sfb: u32,
+) -> Result<AsfSections> {
+    parse_asf_section_data_ext(br, transf_length_idx, transform_length, max_sfb, false)
+}
+
+/// Like [`parse_asf_section_data`] but with an explicit `no_trunc`
+/// switch: when set, a section's stored `sect_end` is NOT saturated at
+/// `max_sfb`. The 7_X additional-channel `two_channel_data` bodies
+/// follow this untruncated grammar (round 406: proven by exact-end
+/// backchaining on real content — body0 carries a single section
+/// spanning well past its scalefac bound, and spectral data follows
+/// the section, not max_sfb), while LFE and the core channel elements
+/// need the saturating behavior.
+pub fn parse_asf_section_data_ext(
+    br: &mut BitReader<'_>,
     _transf_length_idx: u32,
     transform_length: u32,
     max_sfb: u32,
+    no_trunc: bool,
 ) -> Result<AsfSections> {
     let (n_sect_bits, sect_esc_val) = sect_len_bits(transform_length);
     let num_sfb = num_sfb_48(transform_length)
@@ -137,7 +155,7 @@ pub fn parse_asf_section_data(
         // AC4_SECT_NO_TRUNC=1 lifts this for the offline debug_scan_*
         // harnesses, which probe the alternate grammar some elements
         // (the additional-2ch bodies) appear to use.
-        if sect_end > max_sfb && std::env::var_os("AC4_SECT_NO_TRUNC").is_none() {
+        if sect_end > max_sfb && !no_trunc && std::env::var_os("AC4_SECT_NO_TRUNC").is_none() {
             sect_end = max_sfb;
         }
         out.sect_cb.push(sect_cb);

@@ -3017,6 +3017,18 @@ pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
     ti: &AsfTransformInfo,
     max_sfb_in: u32,
 ) -> Option<Vec<f32>> {
+    decode_asf_long_mono_body_with_max_sfb_ext(br, ti, max_sfb_in, false)
+}
+
+/// [`decode_asf_long_mono_body_with_max_sfb`] with the round-406
+/// untruncated-section switch (see `parse_asf_section_data_ext`) used
+/// by the 7_X additional-channel pair bodies.
+pub(crate) fn decode_asf_long_mono_body_with_max_sfb_ext(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    max_sfb_in: u32,
+    sect_no_trunc: bool,
+) -> Option<Vec<f32>> {
     let tl = ti.transform_length_0;
     let tl_idx = ti.transf_length[0];
     let max_sfb_cap = tables::num_sfb_48(tl)?;
@@ -3028,7 +3040,8 @@ pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
     // AC4_TRACE_BODIES=1: sub-element sizes for the conformance work.
     let _trace = std::env::var_os("AC4_TRACE_BODIES").is_some();
     let _p0 = br.bit_position();
-    let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
+    let sections =
+        asf_data::parse_asf_section_data_ext(br, tl_idx, tl, max_sfb, sect_no_trunc).ok()?;
     let _p1 = br.bit_position();
     let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
     let _p2 = br.bit_position();
