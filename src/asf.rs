@@ -2002,6 +2002,11 @@ pub(crate) fn parse_aspx_data_1ch_body(
     };
     tools.aspx_qmode_env_primary = Some(qmode);
     let dd = aspx::parse_aspx_delta_dir(br, &framing)?;
+    // Round 407f: per-envelope frequency resolution is DERIVED for
+    // freq_res_mode != 0 (Pseudocode 77) — the previous always-high
+    // default over-read ~3 codewords per short envelope and drifted
+    // every I-frame trailer boundary.
+    let fres = aspx::derive_freq_res_vec(&framing, cfg, nats, b_iframe, nats as i32);
     if let Ok(tables) = aspx::derive_aspx_frequency_tables(cfg, xover as u32) {
         // Table 55 Note 1: num_sbg_noise is the *derived* count from
         // §5.7.6.3.1 (frequency-table derivation), NOT the config's
@@ -2017,7 +2022,7 @@ pub(crate) fn parse_aspx_data_1ch_body(
             br,
             aspx::AspxDataType::Signal,
             framing.num_env,
-            &framing.freq_res,
+            &fres,
             qmode,
             aspx::AspxStereoMode::Level,
             &dd.sig_delta_dir,
@@ -2125,6 +2130,9 @@ pub(crate) fn parse_aspx_data_2ch_body(
     let dd0 = aspx::parse_aspx_delta_dir(br, &framing_ch0)?;
     let f_ch1 = framing_ch1_ref.unwrap_or(&framing_ch0);
     let dd1 = aspx::parse_aspx_delta_dir(br, f_ch1)?;
+    // Round 407f: derived per-envelope freq res (see the 1ch site).
+    let fres0 = aspx::derive_freq_res_vec(&framing_ch0, cfg, nats, b_iframe, nats as i32);
+    let fres1 = aspx::derive_freq_res_vec(f_ch1, cfg, nats, b_iframe, nats as i32);
     // §5.7.6.3.1 derivation feeds aspx_hfgen_iwc_2ch() (Table 56)
     // then four aspx_ec_data() calls (ch0/ch1 SIGNAL, ch0/ch1
     // NOISE) per Table 52.
@@ -2156,7 +2164,7 @@ pub(crate) fn parse_aspx_data_2ch_body(
             br,
             aspx::AspxDataType::Signal,
             framing_ch0.num_env,
-            &framing_ch0.freq_res,
+            &fres0,
             qmode_ch0,
             aspx::AspxStereoMode::Level,
             &dd0.sig_delta_dir,
@@ -2175,7 +2183,7 @@ pub(crate) fn parse_aspx_data_2ch_body(
             br,
             aspx::AspxDataType::Signal,
             f_ch1.num_env,
-            &f_ch1.freq_res,
+            &fres1,
             qmode_ch1_effective,
             sm_ch1,
             &dd1.sig_delta_dir,
@@ -4289,6 +4297,95 @@ mod tests {
             }
         }
         eprintln!("TSLOT done");
+    }
+
+    /// Round-407f: pin the TRUE 1ch-trailer start inside an I-frame's
+    /// trailer block. Scans X2: bits[X2..X2+3) must be '000' (the
+    /// proven slot-2 xover), the 1ch iframe parse from X2 ends at Y,
+    /// bits[Y..Y+3) must be '100' (proven slot-3 xover = 4), and the
+    /// final 2ch iframe parse from Y must land within 8 bits of the
+    /// wall.
+    #[test]
+    #[ignore]
+    fn debug_scan_iframe_1ch_pos() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let lo: usize = std::env::var("AC4_SCAN_LO").expect("AC4_SCAN_LO").parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_HI").expect("AC4_SCAN_HI").parse().unwrap();
+        let data = std::fs::read(&path).expect("read");
+        let mut hr = BitReader::new(&data);
+        let short = hr.read_u32(15).unwrap();
+        assert!(!hr.read_bit().unwrap());
+        hr.align_to_byte();
+        let off = hr.byte_position();
+        let wall = (off as u64 + short as u64) * 8;
+        let mut cbr = BitReader::with_position(&data, off);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        eprintln!("IPOS wall={wall}");
+        for x2 in lo..hi {
+            if bit(x2) != 0 || bit(x2 + 1) != 0 || bit(x2 + 2) != 0 {
+                continue;
+            }
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(x2 as u32).unwrap();
+            let mut tools = SubstreamTools::default();
+            if parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, true, 2048).is_err() {
+                continue;
+            }
+            let y = br.bit_position() as usize;
+            if bit(y) != 1 || bit(y + 1) != 0 || bit(y + 2) != 0 {
+                continue;
+            }
+            if parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, true, 2048).is_err() {
+                continue;
+            }
+            let z = br.bit_position();
+            let slack = wall as i64 - z as i64;
+            if (0..=8).contains(&slack) {
+                eprintln!("IPOS hit: 1ch@{x2}..{y}, final2ch..{z} slack={slack}");
+            }
+        }
+        eprintln!("IPOS done");
+    }
+
+    /// Round-407f: pin trailer #2's true start — scan X1 with '000'
+    /// xover bits whose 2ch iframe parse ends exactly at
+    /// AC4_SCAN_TARGET (the proven 1ch start).
+    #[test]
+    #[ignore]
+    fn debug_scan_iframe_2ch_pos() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let lo: usize = std::env::var("AC4_SCAN_LO").expect("AC4_SCAN_LO").parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_HI").expect("AC4_SCAN_HI").parse().unwrap();
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let data = std::fs::read(&path).expect("read");
+        let mut hr = BitReader::new(&data);
+        let _short = hr.read_u32(15).unwrap();
+        assert!(!hr.read_bit().unwrap());
+        hr.align_to_byte();
+        let off = hr.byte_position();
+        let mut cbr = BitReader::with_position(&data, off);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        for x1 in lo..hi {
+            if bit(x1) != 0 || bit(x1 + 1) != 0 || bit(x1 + 2) != 0 {
+                continue;
+            }
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(x1 as u32).unwrap();
+            let mut tools = SubstreamTools::default();
+            if parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, true, 2048).is_err() {
+                continue;
+            }
+            if br.bit_position() == target {
+                eprintln!("I2POS hit: 2ch@{x1}..{target}");
+            }
+        }
+        eprintln!("I2POS done");
     }
 
     /// Round-406c P-frame full-chain pipeline: like
