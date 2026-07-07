@@ -536,6 +536,165 @@ pub(crate) fn discover_add_pair_body0_bound(
     None
 }
 
+/// Round-407d resync-by-signature: starting from `floor_br`, scan bit
+/// positions for the PROVEN additional-pair head signature
+/// ([bmsp=1][blong=1][msfb!=0][sap!=3], with sap=1 implying the
+/// aspx-core ms run), validate the FULL remaining chain on a copy
+/// (body0 via bound discovery, body1 at msfb, then the four ASPX
+/// trailers ending within 8 bits of the wall), and return a reader
+/// positioned at the winning head. This realigns the walk after front
+/// elements whose per-body grammar is still ambiguous, so the
+/// additional pair + trailers + sticky configs parse on every frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resync_7x_addpair<'a>(
+    floor_br: BitReader<'a>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Option<BitReader<'a>> {
+    let wall = tools.wall_bits?;
+    let ti = AsfTransformInfo {
+        b_long_frame: true,
+        transf_length: [0, 0],
+        transform_length_0: frame_len_base,
+        transform_length_1: frame_len_base,
+    };
+    let ms = aspx_core_band_count(cfg, frame_len_base).unwrap_or(50);
+    let floor = floor_br.bit_position();
+    let hi = wall.saturating_sub(400);
+    let mut e = floor;
+    while e < hi {
+        // Position a copy at e.
+        let mut hr = floor_br;
+        if hr.skip((e - floor) as u32).is_err() {
+            return None;
+        }
+        let head = hr;
+        // Cheap pattern gate.
+        let Ok(bmsp) = hr.read_bit() else { return None };
+        if !bmsp {
+            e += 1;
+            continue;
+        }
+        let Ok(blong) = hr.read_bit() else { return None };
+        if !blong {
+            e += 1;
+            continue;
+        }
+        let Ok(msfb) = hr.read_u32(6) else { return None };
+        if msfb == 0 {
+            e += 1;
+            continue;
+        }
+        let Ok(sap) = hr.read_u32(2) else { return None };
+        if sap == 3 {
+            e += 1;
+            continue;
+        }
+        if sap == 1 && hr.skip(ms).is_err() {
+            e += 1;
+            continue;
+        }
+        let dbg = std::env::var("AC4_RESYNC_DEBUG")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|want| want == e)
+            .unwrap_or(false);
+        // body0 legality prefix, then full discovery + body1.
+        if !legal_body_prefix(hr, &ti) {
+            if dbg {
+                eprintln!("RSDBG e={e}: legal_body_prefix REJECT");
+            }
+            e += 1;
+            continue;
+        }
+        let Some(m0) = discover_add_pair_body0_bound(hr, &ti, msfb) else {
+            if dbg {
+                eprintln!("RSDBG e={e}: discovery REJECT (msfb={msfb} sap={sap})");
+            }
+            e += 1;
+            continue;
+        };
+        let mut vr = hr;
+        if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, m0, true)
+            .is_none()
+        {
+            e += 1;
+            continue;
+        }
+        if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, msfb, true)
+            .is_none()
+        {
+            e += 1;
+            continue;
+        }
+        // Trailers on a scratch tools copy (slot cursor starts at 0).
+        let mut tt = tools.clone();
+        tt.aspx_trailer_slot = 0;
+        let mut ok = true;
+        for chs in [2u8, 2, 1, 2] {
+            let r = if chs == 1 {
+                crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
+            } else {
+                crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
+            };
+            if r.is_err() || vr.bit_position() > wall {
+                ok = false;
+                break;
+            }
+        }
+        if dbg {
+            eprintln!(
+                "RSDBG e={e}: m0={m0} trailers ok={ok} end={} wall={wall} slots={:?} iframe={b_iframe}",
+                vr.bit_position(),
+                tools.aspx_xover_slots
+            );
+        }
+        if ok {
+            let slack = wall as i64 - vr.bit_position() as i64;
+            if (0..=8).contains(&slack) {
+                if std::env::var_os("AC4_T").is_some() {
+                    eprintln!(
+                        "RESYNC 7x add-pair @{} (floor {floor}, msfb={msfb}, m0={m0}, slack={slack})",
+                        head.bit_position()
+                    );
+                }
+                return Some(head);
+            }
+        }
+        e += 1;
+    }
+    None
+}
+
+/// Validate the 7_X ASPX trailer block (2ch,2ch,1ch,2ch) on a COPY of
+/// the reader: must parse and end within 8 bits of the wall.
+pub(crate) fn validate_7x_trailers(
+    mut vr: BitReader<'_>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> bool {
+    let Some(wall) = tools.wall_bits else {
+        return true; // no wall info — accept
+    };
+    let mut tt = tools.clone();
+    tt.aspx_trailer_slot = 0;
+    for chs in [2u8, 2, 1, 2] {
+        let r = if chs == 1 {
+            crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
+        } else {
+            crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
+        };
+        if r.is_err() || vr.bit_position() > wall {
+            return false;
+        }
+    }
+    (0..=8).contains(&(wall as i64 - vr.bit_position() as i64))
+}
+
 /// Generalized round-407c body-bound discovery: parse ONE long-frame
 /// sf_data body under the untruncated-section grammar, discovering its
 /// scalefac/SNF band bound by trying candidates ascending and
@@ -1733,6 +1892,9 @@ pub fn parse_7x_audio_data_outer(
         _ => FiveXCodingConfig::Cfg3Five,
     };
     tools.seven_x_coding_config = Some(coding_cfg);
+    // Round 407d: remember where the channel-data switch starts — the
+    // resync scan floor when the front walk desyncs.
+    let switch_floor = *br;
 
     // Track the largest signalled transform length across the channel
     // data bodies — used downstream to derive `n_side_bits` per the
@@ -1833,55 +1995,107 @@ pub fn parse_7x_audio_data_outer(
     }
     if !body_ok {
         if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL switch-body @{}", br.bit_position()); }
-        return Ok(());
+        // Round 407d: don't give up — the resync fallback below can
+        // still recover the additional pair + trailers + sticky
+        // configs past the desynced front. Only bail here for modes
+        // without the trailer oracle.
+        if !matches!(mode, SevenXCodecMode::Aspx) {
+            return Ok(());
+        }
     }
 
     // SIMPLE / ASPX additional-channel block: optional `chparam_info()×2`
     // gated on `b_use_sap_add_ch`, then a `two_channel_data()` carrying
     // the extra 2 channels (the front-extension or surround-back pair).
     if matches!(mode, SevenXCodecMode::Simple | SevenXCodecMode::Aspx) {
-        let b_use_sap_add_ch = match br.read_bit() {
-            Ok(b) => b,
-            Err(_) => { if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL sap-gate"); } return Ok(()); }
-        };
-        tools.seven_x_b_use_sap_add_ch = Some(b_use_sap_add_ch);
-        if b_use_sap_add_ch {
-            // Two chparam_info() calls. Use the additional-channel
-            // two_channel_data's max_sfb when we read it below; for now
-            // pass the largest channel-data max_sfb seen so far (the
-            // chparam SAP DPCM walker is bounded by its own
-            // `max_sfb_per_group` argument).
-            // Round 406: when the aspx config is known, these SAP
-            // chparams cover the aspx-core band range (same count as
-            // the additional pair's own ms_used loop), not
-            // num_sfb_48(tl).
-            let max_sfb_g = tools
-                .aspx_config
-                .as_ref()
-                .zip(largest_tl)
-                .and_then(|(cfg, tl)| aspx_core_band_count(cfg, tl))
-                .or_else(|| largest_tl.and_then(crate::tables::num_sfb_48))
-                .unwrap_or(63);
-            let cp0 = match parse_chparam_info(br, &[max_sfb_g]) {
-                Ok(c) => c,
-                Err(_) => return Ok(()),
-            };
-            let cp1 = match parse_chparam_info(br, &[max_sfb_g]) {
-                Ok(c) => c,
-                Err(_) => return Ok(()),
-            };
-            tools.seven_x_add_chparam_info = Some([cp0, cp1]);
-        }
-        // Additional `two_channel_data()` for the extra 2 channels.
         let add_cfg = tools.aspx_config.clone();
-        match parse_two_channel_data_additional(br, frame_len_base, add_cfg.as_ref()) {
-            Ok(d) => {
-                if let Some(ti) = d.transform_info.as_ref() {
-                    update_largest(ti.transform_length_0, &mut largest_tl);
-                }
-                tools.seven_x_additional_channel_data = Some(d);
+        let mut add_done = false;
+        // ---- normal attempt (only from a healthy front walk) ----
+        let normal_save = *br;
+        'normal: {
+            if !body_ok {
+                break 'normal;
             }
-            Err(_) => { if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL add-2ch @{}", br.bit_position()); } return Ok(()); }
+            let Ok(b_use_sap_add_ch) = br.read_bit() else {
+                if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL sap-gate"); }
+                break 'normal;
+            };
+            tools.seven_x_b_use_sap_add_ch = Some(b_use_sap_add_ch);
+            if b_use_sap_add_ch {
+                // Round 406: when the aspx config is known, these SAP
+                // chparams cover the aspx-core band range (same count
+                // as the additional pair's own ms_used loop), not
+                // num_sfb_48(tl).
+                let max_sfb_g = tools
+                    .aspx_config
+                    .as_ref()
+                    .zip(largest_tl)
+                    .and_then(|(cfg, tl)| aspx_core_band_count(cfg, tl))
+                    .or_else(|| largest_tl.and_then(crate::tables::num_sfb_48))
+                    .unwrap_or(63);
+                let Ok(cp0) = parse_chparam_info(br, &[max_sfb_g]) else { break 'normal };
+                let Ok(cp1) = parse_chparam_info(br, &[max_sfb_g]) else { break 'normal };
+                tools.seven_x_add_chparam_info = Some([cp0, cp1]);
+            }
+            // Additional `two_channel_data()` for the extra 2 channels.
+            match parse_two_channel_data_additional(br, frame_len_base, add_cfg.as_ref()) {
+                Ok(d) => {
+                    // Round 407d: in ASPX mode, only accept when the
+                    // trailer block validates to the wall from here —
+                    // a fake add-pair parsed from a desynced front
+                    // otherwise poisons the trailers and the sticky
+                    // configs.
+                    let trailers_ok = if matches!(mode, SevenXCodecMode::Aspx) {
+                        add_cfg
+                            .as_ref()
+                            .map(|c| validate_7x_trailers(*br, tools, c, b_iframe, frame_len_base))
+                            .unwrap_or(true)
+                    } else {
+                        true
+                    };
+                    if trailers_ok {
+                        if let Some(ti) = d.transform_info.as_ref() {
+                            update_largest(ti.transform_length_0, &mut largest_tl);
+                        }
+                        tools.seven_x_additional_channel_data = Some(d);
+                        add_done = true;
+                    } else if std::env::var_os("AC4_T").is_some() {
+                        eprintln!("BAIL add-2ch trailer-validate @{}", br.bit_position());
+                    }
+                }
+                Err(_) => {
+                    if std::env::var_os("AC4_T").is_some() {
+                        eprintln!("BAIL add-2ch @{}", br.bit_position());
+                    }
+                }
+            }
+        }
+        // ---- resync fallback (ASPX only — needs the trailer oracle) ----
+        if !add_done && matches!(mode, SevenXCodecMode::Aspx) {
+            if let Some(cfg) = add_cfg.as_ref() {
+                if let Some(head) =
+                    resync_7x_addpair(switch_floor, tools, cfg, b_iframe, frame_len_base)
+                {
+                    *br = head;
+                    // The gate/chparams preceding the recovered head
+                    // were not parsed — clear the stale slots.
+                    tools.seven_x_b_use_sap_add_ch = None;
+                    tools.seven_x_add_chparam_info = None;
+                    if let Ok(d) =
+                        parse_two_channel_data_additional(br, frame_len_base, add_cfg.as_ref())
+                    {
+                        if let Some(ti) = d.transform_info.as_ref() {
+                            update_largest(ti.transform_length_0, &mut largest_tl);
+                        }
+                        tools.seven_x_additional_channel_data = Some(d);
+                        add_done = true;
+                    }
+                }
+            }
+        }
+        if !add_done {
+            *br = normal_save;
+            return Ok(());
         }
     }
 

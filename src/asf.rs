@@ -1463,6 +1463,10 @@ pub struct SubstreamTools {
     pub aspx_xover_slots: [Option<u8>; 8],
     /// Cursor into `aspx_xover_slots`, reset per frame by seed()/default.
     pub aspx_trailer_slot: usize,
+    /// End of the bounded audio_data payload in bits (the "wall") —
+    /// set by the substream walker so element walkers can validate
+    /// resync candidates against it (round 407d).
+    pub wall_bits: Option<u64>,
     /// `aspx_xover_subband_offset` — 3-bit I-frame-sticky field that
     /// leads `aspx_data_1ch` / `aspx_data_2ch` (Tables 51 / 52). Only
     /// populated for I-frames; carries the crossover-subband offset
@@ -3709,10 +3713,12 @@ pub fn walk_ac4_substream_sticky(
         .min(substream_bytes.len());
     let bounded = &substream_bytes[..audio_end];
     let mut br = BitReader::with_position(bounded, audio_data_offset as usize);
+    let wall_bits = (audio_end as u64) * 8;
 
     // Parse the outer layers of audio_data(channel_mode, b_iframe).
     let mut tools = SubstreamTools {
         channel_mode_channels: channels,
+        wall_bits: Some(wall_bits),
         ..Default::default()
     };
     // Non-I-frames reuse the I-frame-sticky configs (aspx_config /
