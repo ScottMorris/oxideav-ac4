@@ -136,6 +136,35 @@ pub struct AsfPsyInfo {
     pub num_windows: u32,
     /// Derived: `num_window_groups`.
     pub num_window_groups: u32,
+    /// Derived: `window_to_group[w]` (Pseudocode 3). Empty for long
+    /// frames.
+    pub window_to_group: Vec<u32>,
+    /// Derived: for `b_different_framing`, the group index of the
+    /// first window of the second framing half
+    /// (`window_to_group[num_windows_0]`, Pseudocode 5). 0 otherwise.
+    pub diff_framing_boundary_group: u32,
+}
+
+impl AsfPsyInfo {
+    /// Per-group `get_max_sfb(g)` (Pseudocode 5): groups at or past
+    /// the different-framing boundary use `max_sfb[1]`.
+    ///
+    /// Round 406e: chparam_info / sap_data loop PER WINDOW GROUP
+    /// (Table 47/48). Callers previously passed a single-group slice,
+    /// under-reading `ms_used` by (ng-1)*max_sfb bits on every grouped
+    /// element with sap_mode == 1.
+    pub fn max_sfb_per_group(&self) -> Vec<u32> {
+        let ng = self.num_window_groups.max(1);
+        (0..ng)
+            .map(|g| {
+                if self.b_different_framing && g >= self.diff_framing_boundary_group {
+                    self.max_sfb_1
+                } else {
+                    self.max_sfb_0
+                }
+            })
+            .collect()
+    }
 }
 
 /// Table 109 row lookup — `n_grp_bits` for `frame_len_base ≥ 1536` and
@@ -249,27 +278,36 @@ pub fn parse_asf_psy_info(
     }
     info.scale_factor_grouping = grouping;
 
-    // Derive num_windows / num_window_groups per Pseudocode 3 —
-    // simplified: for long frames it's 1/1; for non-long with equal
-    // transform lengths, num_windows = n_grp_bits + 1.
+    // Derive num_windows / num_window_groups / window_to_group.
+    //
+    // Round 406e note: spec Pseudocode 3 (§4.3.6.2.6) INSERTS an extra
+    // window + forced group boundary at the half-frame mark for
+    // b_different_framing — but applying that broke the
+    // trailer-validated Kraftwerk frame-0 walk, while this simplified
+    // derivation (num_windows = n_grp_bits + 1, groups from the raw
+    // bits, no insert) chains bit-exactly on real content. Another
+    // observed encoder deviation from the spec text; revisit only with
+    // a proven counter-anchor.
     if transform_info.b_long_frame {
         info.num_windows = 1;
         info.num_window_groups = 1;
     } else {
-        info.num_windows = n_grp_bits + 1;
+        info.num_windows = (n_grp_bits + 1).max(1);
         info.num_window_groups = 1;
-        // For the equal-transform-length case each grouping==0 bit
-        // starts a new group. For b_different_framing the pseudocode
-        // inserts an unconditional boundary at the half-frame mark.
-        for &b in &info.scale_factor_grouping {
-            if b == 0 {
+        let mut w2g = Vec::with_capacity(info.num_windows as usize);
+        w2g.push(0u32);
+        for i in 0..(info.num_windows as usize - 1) {
+            if info.scale_factor_grouping.get(i).copied().unwrap_or(0) == 0 {
                 info.num_window_groups += 1;
             }
+            w2g.push(info.num_window_groups - 1);
         }
-        // Safety cap — malformed streams shouldn't explode.
-        if info.num_windows == 0 {
-            info.num_windows = 1;
+        if info.b_different_framing {
+            let num_windows_0 = 1usize << (3 - (transform_info.transf_length[0] & 3));
+            info.diff_framing_boundary_group =
+                w2g.get(num_windows_0).copied().unwrap_or(0);
         }
+        info.window_to_group = w2g;
     }
 
     Ok(info)

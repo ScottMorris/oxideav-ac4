@@ -397,8 +397,12 @@ pub fn parse_two_channel_data(
     if b_msp {
         let ti = parse_asf_transform_info(br, frame_len_base)?;
         let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-        let max_sfb_g = psy.max_sfb_0;
-        let chparam = parse_chparam_info(br, &[max_sfb_g])?;
+        // Round 406e: Table 47 says the ms_used loop runs per window
+        // group, but the trailer-validated Kraftwerk walk proves this
+        // encoder reads exactly ONE group's worth (m=6 with ng=2 →
+        // 6 ms bits). Keep the single-group read; psy.max_sfb_per_group()
+        // exists for when counter-evidence shows up.
+        let chparam = parse_chparam_info(br, &[psy.max_sfb_0])?;
         let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
         if _trace {
             eprintln!(
@@ -590,8 +594,8 @@ pub fn parse_two_channel_data_additional(
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     if !(ti.b_long_frame && psy.num_window_groups == 1) {
-        // Short/grouped additional pair: rule unverified — use the
-        // plain Table 47 count and grouped body walker.
+        // Short/grouped additional pair: rule unverified — single-group
+        // count (see round-406e note above) and grouped body walker.
         let chparam = parse_chparam_info(br, &[psy.max_sfb_0])?;
         let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
         return Ok(TwoChannelData {
@@ -703,8 +707,7 @@ pub fn parse_three_channel_data(
 ) -> Result<ThreeChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_three_channel_info(br, &[max_sfb_g])?;
+    let info = parse_three_channel_info(br, &[psy.max_sfb_0])?;
     let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 3);
     Ok(ThreeChannelData {
         transform_info: Some(ti),
@@ -722,8 +725,7 @@ pub fn parse_four_channel_data(
 ) -> Result<FourChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_four_channel_info(br, &[max_sfb_g])?;
+    let info = parse_four_channel_info(br, &[psy.max_sfb_0])?;
     let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 4);
     Ok(FourChannelData {
         transform_info: Some(ti),
@@ -741,8 +743,7 @@ pub fn parse_five_channel_data(
 ) -> Result<FiveChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_five_channel_info(br, &[max_sfb_g])?;
+    let info = parse_five_channel_info(br, &[psy.max_sfb_0])?;
     let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 5);
     Ok(FiveChannelData {
         transform_info: Some(ti),
