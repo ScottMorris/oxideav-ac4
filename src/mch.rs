@@ -552,7 +552,7 @@ pub(crate) fn resync_7x_addpair<'a>(
     cfg: &crate::aspx::AspxConfig,
     b_iframe: bool,
     frame_len_base: u32,
-) -> Option<BitReader<'a>> {
+) -> Option<(BitReader<'a>, [Option<u8>; 8])> {
     let wall = tools.wall_bits?;
     let ti = AsfTransformInfo {
         b_long_frame: true,
@@ -564,6 +564,7 @@ pub(crate) fn resync_7x_addpair<'a>(
     let floor = floor_br.bit_position();
     let hi = wall.saturating_sub(400);
     let mut e = floor;
+    let mut brute_budget: u32 = 16;
     while e < hi {
         // Position a copy at e.
         let mut hr = floor_br;
@@ -629,39 +630,42 @@ pub(crate) fn resync_7x_addpair<'a>(
             e += 1;
             continue;
         }
-        // Trailers on a scratch tools copy (slot cursor starts at 0).
-        let mut tt = tools.clone();
-        tt.aspx_trailer_slot = 0;
-        let mut ok = true;
-        for chs in [2u8, 2, 1, 2] {
-            let r = if chs == 1 {
-                crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
-            } else {
-                crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
-            };
-            if r.is_err() || vr.bit_position() > wall {
-                ok = false;
-                break;
-            }
+        // The four trailers span ~250-400 bits on real content; a
+        // candidate whose bodies end far from the wall cannot be the
+        // additional pair. This gate kills nearly every false
+        // candidate before the expensive trailer validation.
+        if wall.saturating_sub(vr.bit_position()) > 1200 {
+            e += 1;
+            continue;
+        }
+        // Trailers with slot self-discovery (round 407e). The 4096
+        // brute is budgeted to the first candidate that gets here.
+        let ok = validate_7x_trailers_slots_budgeted(
+            vr,
+            tools,
+            cfg,
+            b_iframe,
+            frame_len_base,
+            brute_budget > 0,
+        );
+        if ok.is_none() {
+            brute_budget = brute_budget.saturating_sub(1);
         }
         if dbg {
             eprintln!(
-                "RSDBG e={e}: m0={m0} trailers ok={ok} end={} wall={wall} slots={:?} iframe={b_iframe}",
-                vr.bit_position(),
-                tools.aspx_xover_slots
+                "RSDBG e={e}: m0={m0} trailers {:?} (harvested slots={:?}) iframe={b_iframe}",
+                ok.as_ref().map(|s| &s[..4]),
+                &tools.aspx_xover_slots[..4]
             );
         }
-        if ok {
-            let slack = wall as i64 - vr.bit_position() as i64;
-            if (0..=8).contains(&slack) {
-                if std::env::var_os("AC4_T").is_some() {
-                    eprintln!(
-                        "RESYNC 7x add-pair @{} (floor {floor}, msfb={msfb}, m0={m0}, slack={slack})",
-                        head.bit_position()
-                    );
-                }
-                return Some(head);
+        if let Some(slots) = ok {
+            if std::env::var_os("AC4_T").is_some() {
+                eprintln!(
+                    "RESYNC 7x add-pair @{} (floor {floor}, msfb={msfb}, m0={m0})",
+                    head.bit_position()
+                );
             }
+            return Some((head, slots));
         }
         e += 1;
     }
@@ -671,28 +675,89 @@ pub(crate) fn resync_7x_addpair<'a>(
 /// Validate the 7_X ASPX trailer block (2ch,2ch,1ch,2ch) on a COPY of
 /// the reader: must parse and end within 8 bits of the wall.
 pub(crate) fn validate_7x_trailers(
-    mut vr: BitReader<'_>,
+    vr: BitReader<'_>,
     tools: &SubstreamTools,
     cfg: &crate::aspx::AspxConfig,
     b_iframe: bool,
     frame_len_base: u32,
 ) -> bool {
+    validate_7x_trailers_slots(vr, tools, cfg, b_iframe, frame_len_base).is_some()
+}
+
+/// Like [`validate_7x_trailers`] but returns the slot vector that made
+/// the walk land on the wall. Tries the harvested sticky slots first;
+/// on failure (P-frames only) brute-forces the 8^4 vectors — round
+/// 407e proved the harvested I-frame slots can be internally wrong
+/// ([0,0,4,4] harvested where the cross-frame-proven vector is
+/// [0,0,0,4]; the I-frame trailer internals still need their own
+/// backchain) while the wall oracle over a whole trailer block is
+/// selective enough to recover the working vector per frame.
+pub(crate) fn validate_7x_trailers_slots(
+    vr: BitReader<'_>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Option<[Option<u8>; 8]> {
+    validate_7x_trailers_slots_budgeted(vr, tools, cfg, b_iframe, frame_len_base, true)
+}
+
+/// Budgeted variant: `allow_brute` gates the 8^4 vector search (4096
+/// trailer walks — too expensive to run per rejected resync
+/// candidate; the resync loop grants it to the first candidate that
+/// reaches trailer validation and uses cheap checks after).
+pub(crate) fn validate_7x_trailers_slots_budgeted(
+    vr: BitReader<'_>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+    allow_brute: bool,
+) -> Option<[Option<u8>; 8]> {
     let Some(wall) = tools.wall_bits else {
-        return true; // no wall info — accept
+        return Some(tools.aspx_xover_slots); // no wall info — accept
     };
-    let mut tt = tools.clone();
-    tt.aspx_trailer_slot = 0;
-    for chs in [2u8, 2, 1, 2] {
-        let r = if chs == 1 {
-            crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
-        } else {
-            crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut tt, cfg, b_iframe, frame_len_base)
-        };
-        if r.is_err() || vr.bit_position() > wall {
-            return false;
+    let attempt = |slots: [Option<u8>; 8]| -> bool {
+        let mut r2 = vr;
+        let mut tt = tools.clone();
+        tt.aspx_xover_slots = slots;
+        tt.aspx_trailer_slot = 0;
+        for chs in [2u8, 2, 1, 2] {
+            let r = if chs == 1 {
+                crate::asf::parse_aspx_data_1ch_body(&mut r2, &mut tt, cfg, b_iframe, frame_len_base)
+            } else {
+                crate::asf::parse_aspx_data_2ch_body(&mut r2, &mut tt, cfg, b_iframe, frame_len_base)
+            };
+            if r.is_err() || r2.bit_position() > wall {
+                return false;
+            }
+        }
+        (0..=8).contains(&(wall as i64 - r2.bit_position() as i64))
+    };
+    if attempt(tools.aspx_xover_slots) {
+        return Some(tools.aspx_xover_slots);
+    }
+    if b_iframe {
+        // I-frames read their xovers from the bits — slots don't gate.
+        return None;
+    }
+    // Last-known-good vector (persisted across frames) — cheap second try.
+    if let Some(good) = tools.aspx_xover_slots_good {
+        if good != tools.aspx_xover_slots && attempt(good) {
+            return Some(good);
         }
     }
-    (0..=8).contains(&(wall as i64 - vr.bit_position() as i64))
+    // Round 407e postmortem: a free 8^4 vector search here OVERFITS —
+    // with 4096 slot choices, huffman soup at wrong positions
+    // validates against the wall and resync locks onto fake add-pairs
+    // (observed: frame 1 "resyncing" to 5551 with slots [5,3,0,0]
+    // when the proven head is 9409 with [0,0,0,4]). The vector must
+    // come from a TRUSTED source: the harvested I-frame slots (buggy
+    // today — see the I-frame trailer-internals open problem) or the
+    // cross-frame-proven cache. `_allow_brute` is kept for a future
+    // constrained search.
+    let _ = allow_brute;
+    None
 }
 
 /// Generalized round-407c body-bound discovery: parse ONE long-frame
@@ -2046,10 +2111,17 @@ pub fn parse_7x_audio_data_outer(
                     // otherwise poisons the trailers and the sticky
                     // configs.
                     let trailers_ok = if matches!(mode, SevenXCodecMode::Aspx) {
-                        add_cfg
-                            .as_ref()
-                            .map(|c| validate_7x_trailers(*br, tools, c, b_iframe, frame_len_base))
-                            .unwrap_or(true)
+                        match add_cfg.as_ref().map(|c| {
+                            validate_7x_trailers_slots(*br, tools, c, b_iframe, frame_len_base)
+                        }) {
+                            Some(Some(slots)) => {
+                                tools.aspx_xover_slots = slots;
+                                tools.aspx_xover_slots_good = Some(slots);
+                                true
+                            }
+                            Some(None) => false,
+                            None => true,
+                        }
                     } else {
                         true
                     };
@@ -2073,10 +2145,12 @@ pub fn parse_7x_audio_data_outer(
         // ---- resync fallback (ASPX only — needs the trailer oracle) ----
         if !add_done && matches!(mode, SevenXCodecMode::Aspx) {
             if let Some(cfg) = add_cfg.as_ref() {
-                if let Some(head) =
+                if let Some((head, slots)) =
                     resync_7x_addpair(switch_floor, tools, cfg, b_iframe, frame_len_base)
                 {
                     *br = head;
+                    tools.aspx_xover_slots = slots;
+                    tools.aspx_xover_slots_good = Some(slots);
                     // The gate/chparams preceding the recovered head
                     // were not parsed — clear the stale slots.
                     tools.seven_x_b_use_sap_add_ch = None;
@@ -2183,7 +2257,9 @@ pub fn parse_7x_audio_data_outer(
     // `if (7_X_codec_mode != SIMPLE) { aspx_data_2ch + aspx_data_2ch
     // + aspx_data_1ch }` — covers the L/R + Ls/Rs front pair and the
     // additional-channel pair plus the centre mono.
+    let _ttr = std::env::var_os("AC4_TRACE_BODIES").is_some();
     if !matches!(mode, SevenXCodecMode::Simple) {
+        let _t0 = br.bit_position();
         if let Err(e) =
             crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
         {
@@ -2192,17 +2268,28 @@ pub fn parse_7x_audio_data_outer(
             }
             return Ok(());
         }
+        if _ttr {
+            eprintln!("TRL#1 2ch [{_t0}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
+        }
+        let _t1 = br.bit_position();
         if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-2ch#2 @{}", br.bit_position()); }
             return Ok(());
         }
+        if _ttr {
+            eprintln!("TRL#2 2ch [{_t1}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
+        }
+        let _t2 = br.bit_position();
         if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-1ch @{}", br.bit_position()); }
             return Ok(());
+        }
+        if _ttr {
+            eprintln!("TRL#3 1ch [{_t2}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
     }
     // `if (7_X_codec_mode == ASPX) { aspx_data_2ch }` — extra 2ch

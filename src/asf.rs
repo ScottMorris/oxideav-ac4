@@ -1344,6 +1344,9 @@ pub struct StickyConfig {
     /// last I-frame — LAST value seen (kept for the single-trailer
     /// stereo/mono paths).
     pub aspx_xover: Option<u8>,
+    /// Round 407e: last wall-validated slot vector (see
+    /// SubstreamTools::aspx_xover_slots_good).
+    pub aspx_xover_slots_good: Option<[Option<u8>; 8]>,
     /// Round 406c: per-trailer-slot xover offsets. Multi-trailer
     /// elements (7_X: 2ch,2ch,1ch,2ch) carry a DIFFERENT xover per
     /// channel pair on the I-frame (observed 0,0,·,4 on real content);
@@ -1366,6 +1369,7 @@ impl StickyConfig {
         tools.aspx_config = self.aspx_config;
         tools.aspx_xover_subband_offset = self.aspx_xover;
         tools.aspx_xover_slots = self.aspx_xover_slots;
+        tools.aspx_xover_slots_good = self.aspx_xover_slots_good;
         tools.aspx_trailer_slot = 0;
         tools.acpl_config_1ch_partial = self.acpl_config_1ch_partial;
         tools.acpl_config_1ch_full = self.acpl_config_1ch_full;
@@ -1377,6 +1381,9 @@ impl StickyConfig {
         self.aspx_config = tools.aspx_config;
         self.aspx_xover = tools.aspx_xover_subband_offset;
         self.aspx_xover_slots = tools.aspx_xover_slots;
+        if tools.aspx_xover_slots_good.is_some() {
+            self.aspx_xover_slots_good = tools.aspx_xover_slots_good;
+        }
         self.acpl_config_1ch_partial = tools.acpl_config_1ch_partial;
         self.acpl_config_1ch_full = tools.acpl_config_1ch_full;
         self.acpl_config_2ch = tools.acpl_config_2ch;
@@ -1467,6 +1474,11 @@ pub struct SubstreamTools {
     /// set by the substream walker so element walkers can validate
     /// resync candidates against it (round 407d).
     pub wall_bits: Option<u64>,
+    /// Last slot vector that validated a trailer block against the
+    /// wall (round 407e slot self-discovery) — persisted across frames
+    /// via the sticky config so the 4096-vector brute runs ~once per
+    /// track.
+    pub aspx_xover_slots_good: Option<[Option<u8>; 8]>,
     /// `aspx_xover_subband_offset` — 3-bit I-frame-sticky field that
     /// leads `aspx_data_1ch` / `aspx_data_2ch` (Tables 51 / 52). Only
     /// populated for I-frames; carries the crossover-subband offset
@@ -3809,17 +3821,22 @@ pub fn walk_ac4_substream_sticky(
     if std::env::var_os("AC4_PARSE_STATS").is_some() {
         let consumed = br.bit_position() as i64 / 8 - audio_data_offset as i64;
         eprintln!(
-            "AC4_PARSE_STATS delta={} complete={}",
+            "AC4_PARSE_STATS delta={} complete={} slots={:?}",
             audio_size as i64 - consumed,
-            tools.walk_complete as u8
+            tools.walk_complete as u8,
+            &tools.aspx_xover_slots[..4]
         );
     }
 
     // Every I-frame refreshes the sticky configs for the P-frames that
     // follow it (§4.2.6.x: configs are only transmitted on I-frames).
-    if b_iframe {
-        if let Some(st) = sticky {
+    // The wall-validated slot vector (round 407e) is learned on ANY
+    // frame and persists regardless.
+    if let Some(st) = sticky {
+        if b_iframe {
             st.harvest(&tools);
+        } else if tools.aspx_xover_slots_good.is_some() {
+            st.aspx_xover_slots_good = tools.aspx_xover_slots_good;
         }
     }
 
@@ -4210,6 +4227,68 @@ mod tests {
             }
         }
         eprintln!("PTRL done");
+    }
+
+    /// Round-407e: brute the sticky xover slot vector. For a P-frame
+    /// trailer region starting at AC4_SCAN_TSTART (a PROVEN add-pair
+    /// end), try all 8^4 slot vectors and print those whose
+    /// [2ch,2ch,1ch,2ch] walk ends within 8 bits of the wall.
+    #[test]
+    #[ignore]
+    fn debug_scan_trailer_slots() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let cfg_path = std::env::var("AC4_SCAN_CFG_FILE").expect("AC4_SCAN_CFG_FILE");
+        let tstart: u64 = std::env::var("AC4_SCAN_TSTART").expect("AC4_SCAN_TSTART").parse().unwrap();
+        let data = std::fs::read(&path).expect("read");
+        let cdata = std::fs::read(&cfg_path).expect("read cfg");
+        let mut hr = BitReader::new(&data);
+        let short = hr.read_u32(15).unwrap();
+        assert!(!hr.read_bit().unwrap());
+        hr.align_to_byte();
+        let wall = (hr.byte_position() as u64 + short as u64) * 8;
+        let mut hr2 = BitReader::new(&cdata);
+        let _ = hr2.read_u32(15).unwrap();
+        let _ = hr2.read_bit().unwrap();
+        hr2.align_to_byte();
+        let coff = hr2.byte_position();
+        let mut cbr = BitReader::with_position(&cdata, coff);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        eprintln!("TSLOT file={path} tstart={tstart} wall={wall}");
+        for combo in 0u32..4096 {
+            let slots = [
+                (combo & 7) as u8,
+                ((combo >> 3) & 7) as u8,
+                ((combo >> 6) & 7) as u8,
+                ((combo >> 9) & 7) as u8,
+            ];
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(tstart as u32).unwrap();
+            let mut tools = SubstreamTools::default();
+            for (i, &x) in slots.iter().enumerate() {
+                tools.aspx_xover_slots[i] = Some(x);
+            }
+            let mut ok = true;
+            for chs in [2u8, 2, 1, 2] {
+                let r = if chs == 1 {
+                    parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                } else {
+                    parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                };
+                if r.is_err() || br.bit_position() > wall {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let slack = wall as i64 - br.bit_position() as i64;
+                if (0..=8).contains(&slack) {
+                    eprintln!("TSLOT hit: slots={slots:?} slack={slack}");
+                }
+            }
+        }
+        eprintln!("TSLOT done");
     }
 
     /// Round-406c P-frame full-chain pipeline: like
