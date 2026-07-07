@@ -131,7 +131,13 @@ pub fn parse_asf_section_data(
             k += sect_len;
             continue;
         }
-        if sect_end > max_sfb {
+        // Production behavior: a section's stored end saturates at
+        // max_sfb (encoders emit saturated length codes; validated by
+        // exact element chaining on real content — LFE + 3ch bodies).
+        // AC4_SECT_NO_TRUNC=1 lifts this for the offline debug_scan_*
+        // harnesses, which probe the alternate grammar some elements
+        // (the additional-2ch bodies) appear to use.
+        if sect_end > max_sfb && std::env::var_os("AC4_SECT_NO_TRUNC").is_none() {
             sect_end = max_sfb;
         }
         out.sect_cb.push(sect_cb);
@@ -163,9 +169,25 @@ pub fn parse_asf_spectral_data(
     sfb_offset: &[u16],
     max_sfb: u32,
 ) -> Result<(Vec<i32>, Vec<u32>)> {
-    let end_bin = sfb_offset[max_sfb as usize] as usize;
+    // Sections may legitimately extend past max_sfb (the last section's
+    // sect_len is written as-is and, per Table 39's straddle handling,
+    // can run to num_sfb). Spectral data, max_quant_idx, scalefactors
+    // and SNF all follow the SECTIONS' extent, not max_sfb — sizing by
+    // max_sfb silently dropped the extended bands' scalefactor
+    // codewords and desynced everything after the body (round 406,
+    // found via a 51-bit deficit against a trailer-validated boundary
+    // on real content).
+    let sect_extent = sections
+        .sect_end
+        .iter()
+        .map(|&e| e as usize)
+        .max()
+        .unwrap_or(max_sfb as usize)
+        .max(max_sfb as usize)
+        .min(sfb_offset.len().saturating_sub(1));
+    let end_bin = sfb_offset[sect_extent] as usize;
     let mut quant_spec = vec![0i32; end_bin];
-    let mut max_quant_idx = vec![0u32; max_sfb as usize];
+    let mut max_quant_idx = vec![0u32; sect_extent];
     for i in 0..sections.num_sec_lsf as usize {
         let cb = sections.sect_cb[i] as u32;
         if cb == 0 || cb > 11 {
@@ -175,8 +197,10 @@ pub fn parse_asf_spectral_data(
             asf_hcb(cb).ok_or_else(|| Error::invalid("ac4: asf_spectral_data: bad codebook"))?;
         let dim = CB_DIM[cb as usize];
         let unsig = UNSIGNED_CB[cb as usize];
-        let sect_start_line = sfb_offset[sections.sect_start[i] as usize] as usize;
-        let sect_end_line = sfb_offset[sections.sect_end[i] as usize] as usize;
+        let sect_start_line =
+            sfb_offset[(sections.sect_start[i] as usize).min(sect_extent)] as usize;
+        let sect_end_line =
+            sfb_offset[(sections.sect_end[i] as usize).min(sect_extent)] as usize;
         let mut k = sect_start_line;
         let mut tmp = [0i32; 4];
         while k < sect_end_line {
@@ -216,8 +240,8 @@ pub fn parse_asf_spectral_data(
             k += step;
         }
     }
-    // Compute max_quant_idx per sfb.
-    for sfb in 0..max_sfb as usize {
+    // Compute max_quant_idx per sfb (over the sections' full extent).
+    for sfb in 0..sect_extent {
         let a = sfb_offset[sfb] as usize;
         let b = sfb_offset[sfb + 1] as usize;
         let mut m: u32 = 0;

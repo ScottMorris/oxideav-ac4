@@ -1929,9 +1929,12 @@ pub(crate) fn parse_aspx_data_1ch_body(
     tools.aspx_qmode_env_primary = Some(qmode);
     let dd = aspx::parse_aspx_delta_dir(br, &framing)?;
     if let Ok(tables) = aspx::derive_aspx_frequency_tables(cfg, xover as u32) {
+        // Table 55 Note 1: num_sbg_noise is the *derived* count from
+        // §5.7.6.3.1 (frequency-table derivation), NOT the config's
+        // aspx_noise_sbg field (which is an input to that derivation).
         let hfgen = aspx::parse_aspx_hfgen_iwc_1ch(
             br,
-            cfg.num_noise_sbgroups(),
+            tables.counts.num_sbg_noise,
             tables.counts.num_sbg_sig_highres,
             nats,
         )?;
@@ -2057,10 +2060,12 @@ pub(crate) fn parse_aspx_data_2ch_body(
                 br.bit_position()
             );
         }
+        // Table 56 Note 1: derived num_sbg_noise, not the config field
+        // (see the 1ch site above).
         let hfgen = aspx::parse_aspx_hfgen_iwc_2ch(
             br,
             balance,
-            cfg.num_noise_sbgroups(),
+            tables.counts.num_sbg_noise,
             tables.counts.num_sbg_sig_highres,
             nats,
         )?;
@@ -3031,10 +3036,21 @@ pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
     let _p3 = br.bit_position();
     let _snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
     if _trace {
+        let geom: Vec<(u8, u16, u16)> = sections
+            .sect_cb
+            .iter()
+            .zip(sections.sect_start.iter().zip(sections.sect_end.iter()))
+            .map(|(&cb, (&s, &e))| (cb, s, e))
+            .collect();
         eprintln!(
-            "BODY m={max_sfb} in@{_p0} sect={} cbs={:?} spec={} sf={} snf={} out@{}",
-            _p1 - _p0, sections.sect_cb, _p2 - _p1, _p3 - _p2,
-            br.bit_position() - _p3, br.bit_position()
+            "BODY m={max_sfb} in@{_p0} sect={} geom={:?} lsf={} spec={} sf={} snf={} out@{}",
+            _p1 - _p0,
+            geom,
+            sections.num_sec_lsf,
+            _p2 - _p1,
+            _p3 - _p2,
+            br.bit_position() - _p3,
+            br.bit_position()
         );
     }
     let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
@@ -3566,6 +3582,17 @@ pub fn walk_ac4_substream_sticky(
     if substream_bytes.is_empty() {
         return Err(Error::invalid("ac4: empty substream"));
     }
+    // AC4_DUMP_SUBS=<dir>: save raw substreams as subNN.bin for the
+    // offline boundary-scan harnesses (debug_scan_* tests).
+    if let Some(dir) = std::env::var_os("AC4_DUMP_SUBS") {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DUMP_N: AtomicU32 = AtomicU32::new(0);
+        let n = DUMP_N.fetch_add(1, Ordering::Relaxed);
+        if n < 64 {
+            let p = std::path::Path::new(&dir).join(format!("sub{n:02}.bin"));
+            let _ = std::fs::write(p, substream_bytes);
+        }
+    }
     let mut br = BitReader::new(substream_bytes);
 
     // §4.3.4.1 audio_size_value — 15-bit value, optional variable_bits(7)
@@ -3715,6 +3742,320 @@ pub fn walk_ac4_substream_sticky(
 
 #[cfg(test)]
 mod tests {
+
+    /// Exploratory scan harness for the round-405 boundary hunt (see
+    /// riptide docs/ac4-decoder-accuracy-plan.md §7h). Run explicitly:
+    ///
+    ///   AC4_SCAN_FILE=/path/sub00.bin AC4_SCAN_WALL=17704 \
+    ///     cargo test --release -- --ignored debug_scan_ch1_boundary --nocapture
+    ///
+    /// Scans candidate start positions for the additional-2ch second
+    /// body inside a captured substream, parses the body with the
+    /// production decoder, then validates the remaining tail as the
+    /// 7_X ASPX trailer sequence (aspx_data_2ch x2 + 1ch + 2ch) using
+    /// the production parsers. Candidates whose trailer walk ends at
+    /// the wall are the true channel split.
+    #[test]
+    #[ignore]
+    fn debug_scan_ch1_boundary() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let wall: u64 = std::env::var("AC4_SCAN_WALL")
+            .expect("AC4_SCAN_WALL")
+            .parse()
+            .unwrap();
+        let m: u32 = std::env::var("AC4_SCAN_MSFB")
+            .unwrap_or_else(|_| "54".into())
+            .parse()
+            .unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").unwrap_or_else(|_| "14200".into()).parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_HI").unwrap_or_else(|_| "14800".into()).parse().unwrap();
+        let data = std::fs::read(&path).expect("read scan file");
+        // Recover the frame's aspx_config: audio_data starts at byte 2;
+        // mode(2 bits) then aspx_config(15) on the I-frame.
+        let mut cbr = BitReader::with_position(&data, 2);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        eprintln!("scan: cfg={cfg:?}");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let mut hits = 0;
+        for start_bit in lo..hi {
+            // Body parse from candidate start (bit-level positioning).
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(start_bit as u32).unwrap();
+            let Some(body) = decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m) else {
+                continue;
+            };
+            let nz = body.iter().filter(|v| **v != 0.0).count();
+            if nz < 100 {
+                continue;
+            }
+            let body_end = br.bit_position();
+            if body_end >= wall {
+                continue;
+            }
+            // Trailer validation with production parsers: 2ch,2ch,1ch,2ch.
+            let mut tools = SubstreamTools::default();
+            let mut ok = true;
+            for i in 0..4 {
+                let r = if i == 2 {
+                    parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, true, 2048)
+                } else {
+                    parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, true, 2048)
+                };
+                if r.is_err() || br.bit_position() > wall {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let end = br.bit_position();
+                let slack = wall as i64 - end as i64;
+                if slack.abs() <= 16 {
+                    hits += 1;
+                    eprintln!(
+                        "HIT: ch1_start={start_bit} body_end={body_end} trailer_end={end} slack={slack} nz={nz}"
+                    );
+                } else if slack.abs() <= 200 {
+                    eprintln!(
+                        "near: ch1_start={start_bit} body_end={body_end} trailer_end={end} slack={slack} nz={nz}"
+                    );
+                }
+            }
+        }
+        eprintln!("scan done, {hits} exact hits");
+    }
+
+    /// Round-406 backward-chaining scan: given a PROVEN element boundary
+    /// (AC4_SCAN_TARGET, e.g. the trailer-validated ch1 start), find all
+    /// (start_bit, max_sfb) pairs whose sf_data body parse ends exactly
+    /// at the target using ONLY legal codebooks (sect_cb <= 11 per
+    /// §4.3.6.3.1 — values 12-15 shall not be used; their appearance
+    /// marks a desynced parse, which invalidated the round-405 forward
+    /// chain). Run:
+    ///
+    ///   AC4_SCAN_FILE=... AC4_SCAN_TARGET=14538 AC4_SCAN_LO=11300 \
+    ///     AC4_SCAN_HI=11500 cargo test --release -- --ignored \
+    ///     debug_scan_body_backchain --nocapture
+    #[test]
+    #[ignore]
+    fn debug_scan_body_backchain() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET")
+            .expect("AC4_SCAN_TARGET")
+            .parse()
+            .unwrap();
+        // Optional range mode: accept ends in [target - tslack, target].
+        let tslack: u64 = std::env::var("AC4_SCAN_TSLACK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let lo: usize = std::env::var("AC4_SCAN_LO").unwrap_or_else(|_| "11300".into()).parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_HI").unwrap_or_else(|_| "11500".into()).parse().unwrap();
+        let data = std::fs::read(&path).expect("read scan file");
+        let tl = 2048u32;
+        let sfbo = sfb_offset::sfb_offset_48(tl).unwrap();
+        let mut hits = 0;
+        for start_bit in lo..hi {
+            for m in 1..=63u32 {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(start_bit as u32).unwrap();
+                let Ok(sections) = asf_data::parse_asf_section_data(&mut br, 0, tl, m) else {
+                    continue;
+                };
+                if sections.sect_cb.iter().any(|&cb| cb > 11) {
+                    continue;
+                }
+                let Ok((qspec, mqi)) =
+                    asf_data::parse_asf_spectral_data(&mut br, &sections, sfbo, m)
+                else {
+                    continue;
+                };
+                if asf_data::parse_asf_scalefac_data(&mut br, &sections, &mqi, m, tl).is_err() {
+                    continue;
+                }
+                if asf_data::parse_asf_snf_data(&mut br, &sections, &mqi, m, tl).is_err() {
+                    continue;
+                }
+                let end = br.bit_position();
+                if end + tslack >= target && end <= target {
+                    hits += 1;
+                    let nz = qspec.iter().filter(|v| **v != 0).count();
+                    let geom: Vec<(u8, u16, u16)> = sections
+                        .sect_cb
+                        .iter()
+                        .zip(sections.sect_start.iter().zip(sections.sect_end.iter()))
+                        .map(|(&cb, (&s, &e))| (cb, s, e))
+                        .collect();
+                    eprintln!(
+                        "BHIT: start={start_bit} m={m} end={end} nz={nz} geom={geom:?}"
+                    );
+                }
+            }
+        }
+        eprintln!("backchain scan done, {hits} exact hits");
+    }
+
+    /// Round-406 all-in-one I-frame backchain pipeline. For a dumped
+    /// I-frame substream (AC4_SCAN_FILE), independently derives the
+    /// additional-2ch structure from the two hard anchors (the
+    /// audio_size wall and legal-codebook exact-end chaining):
+    ///   1. scan (start, m) for body1 = sf_data + 4 ASPX trailers → wall
+    ///   2. scan (start, m) for body0 ending exactly at body1.start
+    ///   3. decode the element head backward from body0.start
+    /// Prints one PIPE: line per consistent solution — used to infer
+    /// the ms_used count rule across tracks.
+    #[test]
+    #[ignore]
+    fn debug_scan_iframe_pipeline() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        // The additional-2ch bodies chain only under the untruncated
+        // section grammar (see AC4_SECT_NO_TRUNC in asf_data.rs).
+        std::env::set_var("AC4_SECT_NO_TRUNC", "1");
+        let data = std::fs::read(&path).expect("read scan file");
+        // audio_size header (15 + b_more_bits), byte-aligned payload.
+        let mut hr = BitReader::new(&data);
+        let short = hr.read_u32(15).unwrap();
+        let more = hr.read_bit().unwrap();
+        assert!(!more, "variable_bits audio_size not handled in pipeline");
+        let audio_size = short;
+        hr.align_to_byte();
+        let off = hr.byte_position() as u64;
+        let wall = (off + audio_size as u64) * 8;
+        // aspx_config after the 2-bit codec mode.
+        let mut cbr = BitReader::with_position(&data, off as usize);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        eprintln!("PIPE file={path} wall={wall} cfg={cfg:?}");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let tl = 2048u32;
+        let sfbo = sfb_offset::sfb_offset_48(tl).unwrap();
+        // ---- stage 1: body1 + trailers → wall ----
+        let lo = wall.saturating_sub(4200) as usize;
+        let hi = wall.saturating_sub(300) as usize;
+        let mut stage1: Vec<(usize, u32, u64)> = Vec::new(); // (start, m, body_end)
+        for start_bit in lo..hi {
+            for m in 1..=63u32 {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(start_bit as u32).unwrap();
+                let Some(body) = decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m) else {
+                    continue;
+                };
+                if body.iter().filter(|v| **v != 0.0).count() < 200 {
+                    continue;
+                }
+                let body_end = br.bit_position();
+                if body_end >= wall {
+                    continue;
+                }
+                // try both trailer orders: part-1 (2,2,1,2) and part-2 (2,2,2,1)
+                for order in [[2u8, 2, 1, 2], [2, 2, 2, 1]] {
+                    let mut br2 = BitReader::with_position(&data, 0);
+                    br2.skip(body_end as u32).unwrap();
+                    let mut tools = SubstreamTools::default();
+                    let mut ok = true;
+                    for ch in order {
+                        let r = if ch == 1 {
+                            parse_aspx_data_1ch_body(&mut br2, &mut tools, &cfg, true, 2048)
+                        } else {
+                            parse_aspx_data_2ch_body(&mut br2, &mut tools, &cfg, true, 2048)
+                        };
+                        if r.is_err() || br2.bit_position() > wall {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if ok {
+                        let slack = wall as i64 - br2.bit_position() as i64;
+                        if (0..=8).contains(&slack) {
+                            stage1.push((start_bit, m, body_end));
+                            eprintln!(
+                                "PIPE s1: ch1_start={start_bit} m={m} body_end={body_end} slack={slack} order={order:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        stage1.dedup();
+        if stage1.len() > 24 {
+            eprintln!("PIPE s1 ambiguous ({} candidates), keeping first 24", stage1.len());
+            stage1.truncate(24);
+        }
+        // ---- stage 2: body0 ending at each ch1_start ----
+        for &(ch1_start, m1, _) in stage1.iter() {
+            let t = ch1_start as u64;
+            for start_bit in ch1_start.saturating_sub(4200)..ch1_start.saturating_sub(60) {
+                for m in 1..=63u32 {
+                    let mut br = BitReader::with_position(&data, 0);
+                    br.skip(start_bit as u32).unwrap();
+                    let Ok(sections) = asf_data::parse_asf_section_data(&mut br, 0, tl, m) else {
+                        continue;
+                    };
+                    if sections.sect_cb.iter().any(|&cb| cb > 11) {
+                        continue;
+                    }
+                    let Ok((_q, mqi)) =
+                        asf_data::parse_asf_spectral_data(&mut br, &sections, sfbo, m)
+                    else {
+                        continue;
+                    };
+                    if asf_data::parse_asf_scalefac_data(&mut br, &sections, &mqi, m, tl).is_err()
+                    {
+                        continue;
+                    }
+                    if asf_data::parse_asf_snf_data(&mut br, &sections, &mqi, m, tl).is_err() {
+                        continue;
+                    }
+                    if br.bit_position() != t {
+                        continue;
+                    }
+                    // ---- stage 3: head backward from start_bit ----
+                    let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+                    let v = |lo: usize, n: usize| {
+                        let mut x = 0u32;
+                        for i in 0..n {
+                            x = (x << 1) | bit(lo + i) as u32;
+                        }
+                        x
+                    };
+                    // [bmsp=1][blong=1][msfb 6][sap 2][ms k] ending at start_bit
+                    for k in 0..=64usize {
+                        let e = match start_bit.checked_sub(10 + k) {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        if bit(e) != 1 || bit(e + 1) != 1 {
+                            continue;
+                        }
+                        let msfb = v(e + 2, 6);
+                        let sap = v(e + 8, 2);
+                        if sap == 3 || (sap != 1 && k != 0) || (sap == 1 && k == 0) {
+                            continue;
+                        }
+                        if msfb == m1 || msfb == m {
+                            eprintln!(
+                                "PIPE sol: head@{e} msfb={msfb} sap={sap} ms_count={k} body0=({start_bit},m={m}) body1=({ch1_start},m={m1})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("PIPE done");
+    }
     use super::*;
     use oxideav_core::bits::BitWriter;
 
