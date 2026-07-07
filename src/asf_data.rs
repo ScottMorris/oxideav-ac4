@@ -56,17 +56,34 @@ pub struct AsfSections {
 /// 103) that drives `n_sect_bits`. `transform_length` is the resolved
 /// length used for the `num_sfb_48` cap. `max_sfb` is the group's
 /// per-group max scale factor band.
+/// Section-length field width per Table 39: `n_sect_bits = 3` iff
+/// `get_transf_length(g) <= 2`, i.e. the block is a partial block with
+/// transform-length code 0..2; code 3 (1024/960/768) and long frames
+/// (code 4) use 5 bits. In the 44.1/48 kHz family the code<=2 sizes are
+/// all < 768 samples and the code-3/long sizes all >= 768, so the
+/// resolved transform length decides this unambiguously — unlike the
+/// `transf_length[]` field, which the transform-info parser leaves at 0
+/// for long frames (round 403 root cause: long frames read 3-bit
+/// section lengths and desynced every non-silent frame's sf_data). The
+/// 96/192 kHz families double/quadruple these sizes; HSF is not wired
+/// yet, so the 768 threshold is 48 kHz-family only.
+///
+/// Returns `(n_sect_bits, sect_esc_val)`.
+pub fn sect_len_bits(transform_length: u32) -> (u32, u32) {
+    if transform_length < 768 {
+        (3, 7)
+    } else {
+        (5, 31)
+    }
+}
+
 pub fn parse_asf_section_data(
     br: &mut BitReader<'_>,
-    transf_length_idx: u32,
+    _transf_length_idx: u32,
     transform_length: u32,
     max_sfb: u32,
 ) -> Result<AsfSections> {
-    let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
-        (3u32, 7u32)
-    } else {
-        (5u32, 31u32)
-    };
+    let (n_sect_bits, sect_esc_val) = sect_len_bits(transform_length);
     let num_sfb = num_sfb_48(transform_length)
         .ok_or_else(|| Error::invalid("ac4: asf_section_data: unsupported transform_length"))?;
 
@@ -166,18 +183,26 @@ pub fn parse_asf_spectral_data(
             let cb_idx = huff_decode(br, hcb.len, hcb.cw)?;
             split_qspec(hcb, cb_idx, &mut tmp);
             let step = dim as usize;
-            for t in 0..step {
-                let mut q = tmp[t];
-                if unsig && q != 0 {
-                    let s = br.read_u32(1)?;
-                    if s == 1 {
-                        q = -q;
+            // Table 40 bit order: the codeword is followed by *all* of
+            // its sign bits (one per non-zero line, in line order), and
+            // only then by the HCB11 extension codes (one per line with
+            // preliminary magnitude 16, in line order). Interleaving
+            // sign/ext per line desyncs whenever line 0 escapes and a
+            // later line is non-zero.
+            if unsig {
+                for q in tmp.iter_mut().take(step) {
+                    if *q != 0 {
+                        let s = br.read_u32(1)?;
+                        if s == 1 {
+                            *q = -*q;
+                        }
                     }
                 }
+            }
+            for t in 0..step {
+                let mut q = tmp[t];
                 if cb == 11 && q.unsigned_abs() == 16 {
                     let ext = ext_decode(br)?;
-                    // sign was already applied if unsigned; re-apply
-                    // sign via sign of q.
                     q = if q.is_negative() {
                         -(ext as i32)
                     } else {

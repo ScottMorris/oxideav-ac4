@@ -1561,11 +1561,12 @@ pub fn parse_7x_audio_data_outer(
     // envelope for the additional-channel pair in pure-ASPX mode (the
     // ASPX_ACPL_{1,2} paths fold the additional-channel ASPX into the
     // single aspx_data_1ch above).
-    if matches!(mode, SevenXCodecMode::Aspx)
-        && crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+    if matches!(mode, SevenXCodecMode::Aspx) {
+        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
-    {
-        return Ok(());
+        {
+            return Ok(());
+        }
     }
 
     // ACPL pair for ASPX_ACPL_{1,2} — `acpl_data_1ch()×2`, lands in
@@ -1769,12 +1770,8 @@ mod tests {
     ///
     /// The decoder reads the body and produces an all-zero scaled
     /// spectrum of length `sfb_offset[max_sfb]`.
-    fn write_zero_sf_data_body(bw: &mut BitWriter, max_sfb: u32, transf_length_idx: u32) {
-        let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
-            (3, 7)
-        } else {
-            (5, 31)
-        };
+    fn write_zero_sf_data_body(bw: &mut BitWriter, max_sfb: u32, transform_length: u32) {
+        let (n_sect_bits, sect_esc_val) = crate::asf_data::sect_len_bits(transform_length);
         // sect_cb = 0.
         bw.write_u32(0, 4);
         // sect_len = 1 + sum of increments; we want sect_len == max_sfb.
@@ -1805,14 +1802,10 @@ mod tests {
     fn write_zero_sf_data_body_grouped(
         bw: &mut BitWriter,
         max_sfb: u32,
-        transf_length_idx: u32,
+        transform_length: u32,
         num_groups: u32,
     ) {
-        let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
-            (3, 7)
-        } else {
-            (5, 31)
-        };
+        let (n_sect_bits, sect_esc_val) = crate::asf_data::sect_len_bits(transform_length);
         for _ in 0..num_groups {
             bw.write_u32(0, 4); // sect_cb = 0
             let mut remaining = max_sfb.saturating_sub(1);
@@ -1903,7 +1896,7 @@ mod tests {
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -1936,7 +1929,7 @@ mod tests {
     fn parse_mono_data_lfe_walks_sf_data_body() {
         let mut bw = BitWriter::new();
         bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 @ tl=1920
-        write_zero_sf_data_body(&mut bw, 5, 0);
+        write_zero_sf_data_body(&mut bw, 5, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2037,7 +2030,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 12, 0);
+            write_zero_sf_data_body(&mut bw, 12, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2066,7 +2059,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 20, 0);
+            write_zero_sf_data_body(&mut bw, 20, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2100,7 +2093,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 15, 0);
+            write_zero_sf_data_body(&mut bw, 15, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2129,7 +2122,7 @@ mod tests {
                             // LFE mono_data(1): sf_info_lfe() implies b_long_frame=1
                             // with no bits read.
         bw.write_u32(4, 3); // max_sfb[0] -- n_msfbl_bits = 3 for tl=1920
-        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+        write_zero_sf_data_body(&mut bw, 4, 1920); // round 38: LFE body
                                                 // coding_config = 3, then five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true);
@@ -2139,7 +2132,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2167,8 +2160,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(20, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 20, 0);
-        write_zero_sf_data_body(&mut bw, 20, 0);
+        write_zero_sf_data_body(&mut bw, 20, 1920);
+        write_zero_sf_data_body(&mut bw, 20, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2197,14 +2190,14 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #1
-        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #2
+        write_zero_sf_data_body(&mut bw, 10, 1920); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 10, 1920); // sf_data #2
                                                  // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #1
-        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #2
+        write_zero_sf_data_body(&mut bw, 12, 1920); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 12, 1920); // sf_data #2
                                                  // mono_data(0): spec_frontend bit + transform + psy.
         bw.write_bit(false); // spec_frontend = 0 (ASF)
         bw.write_bit(true); // b_long_frame
@@ -2257,14 +2250,14 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 14, 0);
+            write_zero_sf_data_body(&mut bw, 14, 1920);
         }
         // two_channel_data: long-frame, max_sfb=18, chparam=0.
         bw.write_bit(true);
         bw.write_u32(18, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 18, 0);
-        write_zero_sf_data_body(&mut bw, 18, 0);
+        write_zero_sf_data_body(&mut bw, 18, 1920);
+        write_zero_sf_data_body(&mut bw, 18, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2301,7 +2294,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 22, 0);
+            write_zero_sf_data_body(&mut bw, 22, 1920);
         }
         // mono_data(0): spec_frontend + transform + psy.
         bw.write_bit(false);
@@ -2368,8 +2361,8 @@ mod tests {
     fn decode_mch_sf_data_long_frame_all_zero_two_channels() {
         let mut bw = BitWriter::new();
         // Two stacked sf_data bodies for max_sfb=8 at tl=1920.
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2439,7 +2432,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2469,7 +2462,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 8, 0);
+            write_zero_sf_data_body(&mut bw, 8, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2493,7 +2486,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 6, 0);
+            write_zero_sf_data_body(&mut bw, 6, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2518,7 +2511,7 @@ mod tests {
         bw.write_u32(2, 4);
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2549,8 +2542,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(15, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam_info sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 15, 0);
-        write_zero_sf_data_body(&mut bw, 15, 0);
+        write_zero_sf_data_body(&mut bw, 15, 1920);
+        write_zero_sf_data_body(&mut bw, 15, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2583,9 +2576,9 @@ mod tests {
         let tl_idx = 2u32; // matches transf_length=2 (tl=480 short-frame).
         let mut bw = BitWriter::new();
         // Channel 0: one grouped body spanning both window groups.
-        write_zero_sf_data_body_grouped(&mut bw, max_sfb, tl_idx, 2);
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, 480, 2);
         // Channel 1: ditto.
-        write_zero_sf_data_body_grouped(&mut bw, max_sfb, tl_idx, 2);
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, 480, 2);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2625,7 +2618,7 @@ mod tests {
         let max_sfb = 6u32;
         let tl_idx = 2u32;
         let mut bw = BitWriter::new();
-        write_zero_sf_data_body_grouped(&mut bw, max_sfb, tl_idx, 3);
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, 480, 3);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2761,7 +2754,7 @@ mod tests {
         let tl_idx = 2u32;
         let mut bw = BitWriter::new();
         // Only one body when num_window_groups=2 expects two.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        write_zero_sf_data_body(&mut bw, max_sfb, 480);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2904,8 +2897,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         // mono_data(0): spec_frontend bit + asf_transform_info long +
         // sf_info(ASF, 0, 0).
         bw.write_bit(false); // spec_frontend = ASF
@@ -2944,15 +2937,15 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // Joint-MDCT residual layer (ASPX_ACPL_1 only): max_sfb_master
         // is read with n_side_bits=5 @ tl=1920 (Table 106).
         bw.write_u32(8, 5); // max_sfb_master = 8
         bw.write_u32(0, 2); // chparam_info residual ch0 (sap_mode=0)
         bw.write_u32(0, 2); // chparam_info residual ch1
-        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch0 sf_data
-        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch1 sf_data
+        write_zero_sf_data_body(&mut bw, 8, 1920); // residual ch0 sf_data
+        write_zero_sf_data_body(&mut bw, 8, 1920); // residual ch1 sf_data
                                                 // Pad to be safe.
         bw.align_to_byte();
         while bw.byte_len() < 64 {
@@ -3010,7 +3003,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // Pad with zeros for downstream aspx/acpl walkers (which are
         // try-and-bail).
@@ -3053,15 +3046,15 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(12, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // Joint-MDCT residual layer (ASPX_ACPL_1):
         // max_sfb_master uses n_side_bits = 5 @ tl=1920.
         bw.write_u32(6, 5); // max_sfb_master = 6
         bw.write_u32(0, 2); // chparam residual ch0
         bw.write_u32(0, 2); // chparam residual ch1
-        write_zero_sf_data_body(&mut bw, 6, 0);
-        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
         // Cfg0 trailer: mono_data(0) for the centre channel.
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
@@ -3144,7 +3137,7 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // max_sfb_master = 0 (n_side_bits = 5 @ tl=1920).
         bw.write_u32(0, 5);
@@ -3204,7 +3197,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 15, 0);
+            write_zero_sf_data_body(&mut bw, 15, 1920);
         }
         // SIMPLE additional-channel block: b_use_sap_add_ch = 0.
         bw.write_bit(false);
@@ -3212,8 +3205,8 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3245,7 +3238,7 @@ mod tests {
                             // LFE mono_data(1): sf_info_lfe() implies b_long_frame=1
                             // with no bits read.
         bw.write_u32(4, 3); // max_sfb[0] (n_msfbl_bits=3 @ tl=1920)
-        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+        write_zero_sf_data_body(&mut bw, 4, 1920); // round 38: LFE body
                                                 // coding_config = 3 -> five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true); // b_long_frame
@@ -3255,15 +3248,15 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3292,22 +3285,22 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // two_channel_data #1:
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
                              // additional two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         // Trailing mono_data(0) for Cfg0 (centre).
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
@@ -3343,15 +3336,15 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 11, 0);
+            write_zero_sf_data_body(&mut bw, 11, 1920);
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
         bw.write_bit(true);
         bw.write_u32(9, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 9, 0);
-        write_zero_sf_data_body(&mut bw, 9, 0);
+        write_zero_sf_data_body(&mut bw, 9, 1920);
+        write_zero_sf_data_body(&mut bw, 9, 1920);
         // Trailing mono_data(0) for Cfg2 (back surround).
         bw.write_bit(false);
         bw.write_bit(true);
@@ -3386,21 +3379,21 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3433,7 +3426,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 12, 0);
+            write_zero_sf_data_body(&mut bw, 12, 1920);
         }
         // SIMPLE additional-channel block with SAP.
         bw.write_bit(true); // b_use_sap_add_ch = 1
@@ -3443,8 +3436,8 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3477,14 +3470,14 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3523,20 +3516,20 @@ mod tests {
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // two_channel_data #1:
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // ASPX_ACPL_1 joint-MDCT residual layer (n_side_bits=5 @ tl=1920).
         bw.write_u32(6, 5); // max_sfb_master = 6
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 6, 0);
-        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
         // Cfg0 trailer: mono_data(0) for the centre.
         bw.write_bit(false);
         bw.write_bit(true);
@@ -3583,14 +3576,14 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         // max_sfb_master = 0 (n_side_bits=5).
         bw.write_u32(0, 5);
         bw.align_to_byte();

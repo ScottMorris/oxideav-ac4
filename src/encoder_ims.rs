@@ -473,10 +473,10 @@ pub fn build_mono_simple_asf_tone_body(
     bw.write_bit(true); // b_long_frame = 1
     bw.write_u32(max_sfb, 6); // max_sfb[0]
                               // asf_section_data: one section covering 0..max_sfb with cb=5
-                              // (HCB5, dim=2, signed). n_sect_bits = 3 (transf_length_idx=0
-                              // for long frame).
+                              // (HCB5, dim=2, signed). n_sect_bits = 5 per Table 39 (long
+                              // frame -> get_transf_length() = 4).
     bw.write_u32(5, 4); // sect_cb
-    write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+    write_sect_len_incr(&mut bw, max_sfb, 5, 31);
     // asf_spectral_data: emit `tone_cb_idx` for pair `tone_pair_idx`,
     // and codeword 40 (q0=0, q1=0) for every other pair.
     let sfbo = crate::sfb_offset::sfb_offset_48(transform_length).expect("invalid tl");
@@ -7175,7 +7175,7 @@ mod tests {
         let (n_msfb_bits, _, _) = crate::tables::n_msfb_bits_48(n as u32).unwrap();
         bw.write_u32(max_sfb, n_msfb_bits);
         bw.write_u32(cb as u32, 4);
-        write_sect_len_incr(&mut bw, max_sfb, 3, 7);
+        write_sect_len_incr(&mut bw, max_sfb, 5, 31);
         write_spectral_data_single_section(&mut bw, &qspec, sfbo, max_sfb, cb as u32);
         let sections = single_section(max_sfb, cb);
         write_scalefac_data(

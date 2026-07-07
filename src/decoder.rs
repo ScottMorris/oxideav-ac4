@@ -46,11 +46,15 @@ pub struct Ac4Decoder {
     /// for the substream (e.g. single-substream frame where
     /// `b_size_present == 0`).
     pub last_substream: Option<asf::Ac4SubstreamInfo>,
-    /// Per-channel overlap-add state (length = transform_length samples).
-    /// Keyed by channel index; resized on transform-length change.
-    overlap: Vec<Vec<f32>>,
-    /// Transform length of the previous frame (for overlap sizing).
-    prev_transform_length: u32,
+    /// Per-channel block-switching overlap-add state (§5.5.2.2
+    /// Pseudocodes 63/64), keyed by channel slot. Persists across
+    /// transform-length changes — transitions are handled by
+    /// asymmetric windows, not by dropping history.
+    ola: Vec<mdct::BlockSwitchOla>,
+    /// Current frame length in samples (the §5.5.3 full-block grid the
+    /// per-block OLA centres partial blocks in). Set at the top of
+    /// `receive_frame`; 0 until the first frame.
+    cur_frame_samples: usize,
     /// Per-channel A-SPX persistent state — noise generator
     /// `noise_idx_prev` (§5.7.6.4.3 Pseudocode 103), tone generator
     /// `sine_idx_prev` (§5.7.6.4.4 Pseudocode 105), and the
@@ -155,8 +159,8 @@ impl Ac4Decoder {
             eof: false,
             last_info: None,
             last_substream: None,
-            overlap: Vec::new(),
-            prev_transform_length: 0,
+            ola: Vec::new(),
+            cur_frame_samples: 0,
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
@@ -529,27 +533,35 @@ impl Ac4Decoder {
         out
     }
 
-    /// Run IMDCT + KBD overlap-add for a single channel, returning
-    /// floating-point PCM (suitable for the A-SPX QMF pipeline).
+    /// Run IMDCT + block-switching overlap-add (§5.5.2.2 Pseudocodes
+    /// 63/64) for a single channel, returning floating-point PCM
+    /// (suitable for the A-SPX QMF pipeline). Handles long↔short
+    /// transform transitions with the spec's asymmetric transition
+    /// windows; overlap history is never dropped on a length change.
     fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
-        // Transform-length change clears *all* channel overlap state so
-        // the next frame starts from a consistent history.
-        if self.prev_transform_length != n as u32 {
-            self.overlap.clear();
-            self.prev_transform_length = n as u32;
+        // The §5.5.3 full-block grid partial blocks are centred in:
+        // the frame length when this block subdivides it evenly,
+        // otherwise the block is its own grid (defensive — permitted
+        // block lengths always divide the frame length).
+        let n_full = if self.cur_frame_samples >= n && self.cur_frame_samples % n.max(1) == 0 {
+            self.cur_frame_samples
+        } else {
+            n
+        };
+        while self.ola.len() <= ch {
+            self.ola.push(mdct::BlockSwitchOla::new(n_full));
         }
-        while self.overlap.len() <= ch {
-            self.overlap.push(vec![0.0_f32; n]);
-        }
-        if self.overlap[ch].len() != n {
-            self.overlap[ch] = vec![0.0_f32; n];
+        if self.ola[ch].n_full() != n_full {
+            // Frame geometry changed (sample-rate/frame-length
+            // reconfig) — a genuine stream discontinuity, so a state
+            // reset is correct here.
+            self.ola[ch] = mdct::BlockSwitchOla::new(n_full);
         }
         let mut x = vec![0.0_f32; n];
         let copy = scaled.len().min(n);
         x[..copy].copy_from_slice(&scaled[..copy]);
         let y = mdct::imdct(&x);
-        let window = mdct::kbd_window(n as u32);
-        mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
+        self.ola[ch].process_block(&y)
     }
 
     /// Convert an f32 PCM buffer to i16, clamping to the i16 range.
@@ -1869,6 +1881,9 @@ impl Decoder for Ac4Decoder {
                 info.frame_length
             }
         };
+        // Publish the frame grid for the per-block OLA (the §5.5.3
+        // full-block length partial blocks are centred in).
+        self.cur_frame_samples = samples as usize;
         // Best-effort walk of our substream group's audio substream. The
         // exact byte offset of substream 0 is `toc_len + payload_base`,
         // where `toc_len` is the length of the byte-aligned ac4_toc()
@@ -1940,7 +1955,7 @@ impl Decoder for Ac4Decoder {
         // frame's channel count. Any channel without decoded spectra
         // stays silent. We detach the per-channel inputs from
         // `last_substream` up front so the IMDCT step can mutate
-        // `self.overlap` without a borrow conflict.
+        // `self.ola` without a borrow conflict.
         let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
         // Detach the inputs + the ASPX tables once so we can run IMDCT
         // (which mutates overlap state) and the ASPX extension without

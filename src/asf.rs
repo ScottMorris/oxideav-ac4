@@ -4327,9 +4327,9 @@ mod tests {
         bw.write_u32(10, 6);
         // sf_data body (all-zero spectra):
         //   section: cb_idx = 5 (4 bits) + sect_len for max_sfb=10 via
-        //   n_sect_bits=3 (long frame at 1920), esc=7.
+        //   n_sect_bits=5 (long frame at 1920), esc=31.
         bw.write_u32(5, 4);
-        write_sect_len_incr(&mut bw, 10, 3, 7);
+        write_sect_len_incr(&mut bw, 10, 5, 31);
         // spectral pairs — cb 5 is dim=2, so pairs = end_line / 2.
         // sfb_offset_48 @ 1920 index 10 = ?
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
@@ -4402,7 +4402,7 @@ mod tests {
         bw.write_bit(true); // b_long_frame = 1
         bw.write_u32(10, 6); // max_sfb
         bw.write_u32(5, 4); // cb
-        write_sect_len_incr(&mut bw, 10, 3, 7);
+        write_sect_len_incr(&mut bw, 10, 5, 31);
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
         let end_line = sfbo[10] as u32;
         let hcb = huffman::asf_hcb(5).unwrap();
@@ -4460,7 +4460,7 @@ mod tests {
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb
         bw.write_u32(5, 4);
-        write_sect_len_incr(&mut bw, 10, 3, 7);
+        write_sect_len_incr(&mut bw, 10, 5, 31);
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
         let end_line = sfbo[10] as u32;
         let hcb = huffman::asf_hcb(5).unwrap();

@@ -917,7 +917,16 @@ fn parse_presentation_v1_info(
         // b_pres_ndot, substream_index (2 + optional variable_bits(2)).
         let _b_alternative = br.read_bit()?;
         let b_pres_ndot = br.read_bit()?;
-        info.b_iframe = !b_pres_ndot; // ndot = "not intra-coded" → invert.
+        // `b_pres_ndot` = "no dependency over time": 1 ⇒ the substream can
+        // be decoded independently of preceding frames, i.e. it *is* an
+        // I-frame. So `b_iframe = b_pres_ndot`, NOT its negation. (An
+        // earlier `!b_pres_ndot` misread "ndot" as "not intra-coded" and
+        // inverted it, so every P-frame spuriously read the I-frame-only
+        // `aspx_config()` — a 15-bit desync that shredded the whole
+        // channel element. The spec's `b_audio_ndot`/`b_pres_ndot` share
+        // this "1 = independent" polarity; the reference decoder reads the
+        // bit straight into its `iframe` flag with no inversion.)
+        info.b_iframe = b_pres_ndot;
         let si = br.read_u32(2)?;
         if si == 3 {
             let _ = variable_bits(br, 2)?;

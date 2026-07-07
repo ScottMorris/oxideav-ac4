@@ -151,22 +151,65 @@ fn downmix_stereo_append(interleaved: &[u8], n_channels: usize, out: &mut Vec<u8
     }
 }
 
+/// Decoder slot order is L R C Ls Rs [Lb Rb] LFE (LFE always last); WAV
+/// consumers assume canonical channel-mask order, so 5.1/7.1 output is
+/// permuted to FL FR FC LFE BL BR [SL SR] and declared with an explicit
+/// WAVEFORMATEXTENSIBLE channel mask. A mask-less multichannel WAV makes
+/// ffmpeg guess a default layout (LFE at index 3), silently mislabelling
+/// every channel behind it.
+fn channel_permutation(channels: u16) -> Option<(&'static [usize], u32)> {
+    match channels {
+        // WAV slot i takes decoder slot PERM[i].
+        6 => Some((&[0, 1, 2, 5, 3, 4], 0x3F)),
+        // AC-4 7_X Ls/Rs are side surrounds, Lb/Rb back surrounds.
+        8 => Some((&[0, 1, 2, 7, 5, 6, 3, 4], 0x63F)),
+        _ => None,
+    }
+}
+
 fn write_wav(path: &str, pcm: &[u8], channels: u16, sample_rate: u32) -> io::Result<()> {
+    let permuted;
+    let (pcm, mask) = match channel_permutation(channels) {
+        Some((perm, mask)) => {
+            let nch = channels as usize;
+            let mut out = vec![0u8; pcm.len()];
+            for (fo, fi) in out.chunks_exact_mut(nch * 2).zip(pcm.chunks_exact(nch * 2)) {
+                for (c, &src) in perm.iter().enumerate() {
+                    fo[c * 2..c * 2 + 2].copy_from_slice(&fi[src * 2..src * 2 + 2]);
+                }
+            }
+            permuted = out;
+            (permuted.as_slice(), Some(mask))
+        }
+        None => (pcm, None),
+    };
+
     let mut f = fs::File::create(path)?;
     let data_len = pcm.len() as u32;
     let byte_rate = sample_rate * channels as u32 * 2;
     let block_align = channels * 2;
+    let fmt_len: u32 = if mask.is_some() { 40 } else { 16 };
     f.write_all(b"RIFF")?;
-    f.write_all(&(36 + data_len).to_le_bytes())?;
+    f.write_all(&(20 + fmt_len + data_len).to_le_bytes())?;
     f.write_all(b"WAVE")?;
     f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?; // PCM
+    f.write_all(&fmt_len.to_le_bytes())?;
+    f.write_all(&(if mask.is_some() { 0xFFFEu16 } else { 1u16 }).to_le_bytes())?;
     f.write_all(&channels.to_le_bytes())?;
     f.write_all(&sample_rate.to_le_bytes())?;
     f.write_all(&byte_rate.to_le_bytes())?;
     f.write_all(&block_align.to_le_bytes())?;
     f.write_all(&16u16.to_le_bytes())?; // bits per sample
+    if let Some(mask) = mask {
+        f.write_all(&22u16.to_le_bytes())?; // cbSize
+        f.write_all(&16u16.to_le_bytes())?; // valid bits per sample
+        f.write_all(&mask.to_le_bytes())?;
+        // KSDATAFORMAT_SUBTYPE_PCM
+        f.write_all(&[
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38,
+            0x9B, 0x71,
+        ])?;
+    }
     f.write_all(b"data")?;
     f.write_all(&data_len.to_le_bytes())?;
     f.write_all(pcm)?;

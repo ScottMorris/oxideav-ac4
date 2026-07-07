@@ -635,7 +635,7 @@ fn prepare_stereo_channel(coeffs: &[f32], sfbo: &[u16], max_sfb: u32) -> StereoC
         natural_q_per_band.push(q);
     }
     let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-    let dp_sections = dp_optimise_sections(&cost_table, 16);
+    let dp_sections = dp_optimise_sections(crate::encoder_asf::tl_of_sfbo(sfbo), &cost_table, 16);
     let sections = build_sections_from_dp(&dp_sections, max_sfb);
     let snf = compute_snf_dpcm_for_zero_quant_bands(
         coeffs,
@@ -689,14 +689,14 @@ fn write_stereo_split_data(
 
     // L sf_data(ASF).
     let (qspec_l, sf_l, max_q_l, sections_l, snf_l) = &analysis_l;
-    write_section_data(bw, sections_l);
+    write_section_data(bw, crate::encoder_asf::tl_of_sfbo(sfbo), sections_l);
     write_spectral_data_sections(bw, qspec_l, sfbo, sections_l);
     write_scalefac_data(bw, sf_l, &sections_l.sfb_cb, max_q_l, max_sfb);
     write_snf_data(bw, snf_l.as_deref(), &sections_l.sfb_cb, max_q_l, max_sfb);
 
     // R sf_data(ASF).
     let (qspec_r, sf_r, max_q_r, sections_r, snf_r) = &analysis_r;
-    write_section_data(bw, sections_r);
+    write_section_data(bw, crate::encoder_asf::tl_of_sfbo(sfbo), sections_r);
     write_spectral_data_sections(bw, qspec_r, sfbo, sections_r);
     write_scalefac_data(bw, sf_r, &sections_r.sfb_cb, max_q_r, max_sfb);
     write_snf_data(bw, snf_r.as_deref(), &sections_r.sfb_cb, max_q_r, max_sfb);
@@ -3137,14 +3137,17 @@ fn write_lfe_mono_data(
     let n_msfbl_cap = (1u32 << n_msfbl_bits) - 1;
     let max_sfb_lfe_clamped = max_sfb_lfe.min(n_msfbl_cap);
 
-    // asf_transform_info(): b_long_frame = 1 (LFE is always long-frame).
-    bw.write_bit(true);
-    // sf_info_lfe(): max_sfb[0] in n_msfbl_bits.
+    // sf_info_lfe() (Table 35): b_long_frame = 1 is *implicit* — no
+    // transform-info bits are transmitted for the LFE channel, so the
+    // element starts directly with max_sfb[0]. (An earlier revision
+    // wrote a spurious b_long_frame bit here; the decoder correctly
+    // reads none, and under spec-width section lengths the stray bit
+    // desynced the whole element.)
     bw.write_u32(max_sfb_lfe_clamped, n_msfbl_bits);
     // LFE sf_data(ASF): section + spectral + scalefac + snf.
     let (qspec, sf, max_q, sections, snf) =
         prepare_stereo_channel(coeffs_lfe, sfbo, max_sfb_lfe_clamped);
-    write_section_data(bw, &sections);
+    write_section_data(bw, crate::encoder_asf::tl_of_sfbo(sfbo), &sections);
     write_spectral_data_sections(bw, &qspec, sfbo, &sections);
     write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb_lfe_clamped);
     write_snf_data(
@@ -3211,7 +3214,7 @@ fn write_two_channel_data(
     // Two sf_data(ASF) bodies, one per channel.
     for coeffs in [coeffs_l, coeffs_r] {
         let (qspec, sf, max_q, sections, snf) = prepare_stereo_channel(coeffs, sfbo, max_sfb);
-        write_section_data(bw, &sections);
+        write_section_data(bw, crate::encoder_asf::tl_of_sfbo(sfbo), &sections);
         write_spectral_data_sections(bw, &qspec, sfbo, &sections);
         write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb);
         write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb);
@@ -3241,7 +3244,7 @@ fn write_mono_data_centre(bw: &mut BitWriter, transform_length: u32, max_sfb: u3
     bw.write_u32(max_sfb, n_msfb_bits);
     // sf_data(ASF).
     let (qspec, sf, max_q, sections, snf) = prepare_stereo_channel(coeffs, sfbo, max_sfb);
-    write_section_data(bw, &sections);
+    write_section_data(bw, crate::encoder_asf::tl_of_sfbo(sfbo), &sections);
     write_spectral_data_sections(bw, &qspec, sfbo, &sections);
     write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb);
     write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb);
@@ -6662,7 +6665,7 @@ fn write_acpl_1_residual_layer(
     for coeffs in [coeffs_ls, coeffs_rs] {
         let (qspec, sf, max_q, sections, snf) =
             prepare_stereo_channel(coeffs, sfbo, max_sfb_master);
-        write_section_data(bw, &sections);
+        write_section_data(bw, crate::encoder_asf::tl_of_sfbo(sfbo), &sections);
         write_spectral_data_sections(bw, &qspec, sfbo, &sections);
         write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb_master);
         write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb_master);
@@ -6788,7 +6791,7 @@ fn write_acpl_1_residual_layer_sap(
     for coeffs in [&s3, &s4] {
         let (qspec, sf, max_q, sections, snf) =
             prepare_stereo_channel(coeffs, sfbo, max_sfb_master);
-        write_section_data(bw, &sections);
+        write_section_data(bw, crate::encoder_asf::tl_of_sfbo(sfbo), &sections);
         write_spectral_data_sections(bw, &qspec, sfbo, &sections);
         write_scalefac_data(bw, &sf, &sections.sfb_cb, &max_q, max_sfb_master);
         write_snf_data(bw, snf.as_deref(), &sections.sfb_cb, &max_q, max_sfb_master);
