@@ -1303,8 +1303,14 @@ pub struct StickyConfig {
     /// `aspx_config()` from the last I-frame.
     pub aspx_config: Option<aspx::AspxConfig>,
     /// `aspx_xover_subband_offset` (3 bits, Tables 51 / 52) from the
-    /// last I-frame.
+    /// last I-frame — LAST value seen (kept for the single-trailer
+    /// stereo/mono paths).
     pub aspx_xover: Option<u8>,
+    /// Round 406c: per-trailer-slot xover offsets. Multi-trailer
+    /// elements (7_X: 2ch,2ch,1ch,2ch) carry a DIFFERENT xover per
+    /// channel pair on the I-frame (observed 0,0,·,4 on real content);
+    /// P-frame trailer k must reuse slot k, not the last scalar.
+    pub aspx_xover_slots: [Option<u8>; 8],
     /// `acpl_config_1ch(PARTIAL)` from the last I-frame
     /// (ASPX_ACPL_1 modes).
     pub acpl_config_1ch_partial: Option<crate::acpl::AcplConfig1ch>,
@@ -1321,6 +1327,8 @@ impl StickyConfig {
     pub fn seed(&self, tools: &mut SubstreamTools) {
         tools.aspx_config = self.aspx_config;
         tools.aspx_xover_subband_offset = self.aspx_xover;
+        tools.aspx_xover_slots = self.aspx_xover_slots;
+        tools.aspx_trailer_slot = 0;
         tools.acpl_config_1ch_partial = self.acpl_config_1ch_partial;
         tools.acpl_config_1ch_full = self.acpl_config_1ch_full;
         tools.acpl_config_2ch = self.acpl_config_2ch;
@@ -1330,6 +1338,7 @@ impl StickyConfig {
     pub fn harvest(&mut self, tools: &SubstreamTools) {
         self.aspx_config = tools.aspx_config;
         self.aspx_xover = tools.aspx_xover_subband_offset;
+        self.aspx_xover_slots = tools.aspx_xover_slots;
         self.acpl_config_1ch_partial = tools.acpl_config_1ch_partial;
         self.acpl_config_1ch_full = tools.acpl_config_1ch_full;
         self.acpl_config_2ch = tools.acpl_config_2ch;
@@ -1410,6 +1419,12 @@ pub struct SubstreamTools {
     /// `aspx_balance` — 1-bit flag from `aspx_data_2ch()` (Table 52).
     /// Present only in stereo ASPX substreams; otherwise `None`.
     pub aspx_balance: Option<bool>,
+    /// Per-trailer-slot sticky xover offsets (see
+    /// [`StickyConfig::aspx_xover_slots`]) and the running slot cursor
+    /// advanced by each `aspx_data_*` body parse within a frame.
+    pub aspx_xover_slots: [Option<u8>; 8],
+    /// Cursor into `aspx_xover_slots`, reset per frame by seed()/default.
+    pub aspx_trailer_slot: usize,
     /// `aspx_xover_subband_offset` — 3-bit I-frame-sticky field that
     /// leads `aspx_data_1ch` / `aspx_data_2ch` (Tables 51 / 52). Only
     /// populated for I-frames; carries the crossover-subband offset
@@ -1910,14 +1925,19 @@ pub(crate) fn parse_aspx_data_1ch_body(
     // Table 51: `if (b_iframe) aspx_xover_subband_offset;` — non-I-
     // frames reuse the sticky value from the last I-frame, which the
     // caller pre-seeds into `tools` (see [`StickyConfig::seed`]).
+    let slot = tools.aspx_trailer_slot.min(7);
+    tools.aspx_trailer_slot += 1;
     let xover = if b_iframe {
         let x = br.read_u32(3)? as u8;
         tools.aspx_xover_subband_offset = Some(x);
+        tools.aspx_xover_slots[slot] = Some(x);
         x
     } else {
-        tools.aspx_xover_subband_offset.ok_or_else(|| {
-            Error::invalid("ac4: non-iframe aspx_data_1ch without sticky xover offset")
-        })?
+        tools.aspx_xover_slots[slot]
+            .or(tools.aspx_xover_subband_offset)
+            .ok_or_else(|| {
+                Error::invalid("ac4: non-iframe aspx_data_1ch without sticky xover offset")
+            })?
     };
     let nats = aspx::num_aspx_timeslots(frame_len_base);
     let framing = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
@@ -1995,14 +2015,19 @@ pub(crate) fn parse_aspx_data_2ch_body(
     // Table 52: `if (b_iframe) aspx_xover_subband_offset;` — non-I-
     // frames reuse the sticky value from the last I-frame, which the
     // caller pre-seeds into `tools` (see [`StickyConfig::seed`]).
+    let slot = tools.aspx_trailer_slot.min(7);
+    tools.aspx_trailer_slot += 1;
     let xover = if b_iframe {
         let x = br.read_u32(3)? as u8;
         tools.aspx_xover_subband_offset = Some(x);
+        tools.aspx_xover_slots[slot] = Some(x);
         x
     } else {
-        tools.aspx_xover_subband_offset.ok_or_else(|| {
-            Error::invalid("ac4: non-iframe aspx_data_2ch without sticky xover offset")
-        })?
+        tools.aspx_xover_slots[slot]
+            .or(tools.aspx_xover_subband_offset)
+            .ok_or_else(|| {
+                Error::invalid("ac4: non-iframe aspx_data_2ch without sticky xover offset")
+            })?
     };
     let nats = aspx::num_aspx_timeslots(frame_len_base);
     let framing_ch0 = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
@@ -4068,6 +4093,71 @@ mod tests {
             }
         }
         eprintln!("PIPE done");
+    }
+
+    /// Round-406c P-frame trailer anchor scan. Finds the start bit of
+    /// the 4-trailer ASPX block (2ch,2ch,1ch,2ch, b_iframe=false) whose
+    /// walk ends at the audio_size wall, using the per-slot sticky
+    /// xovers from the preceding I-frame (AC4_SCAN_XOVERS="0,0,0,4")
+    /// and the aspx_config parsed from AC4_SCAN_CFG_FILE (an I-frame
+    /// substream dump).
+    #[test]
+    #[ignore]
+    fn debug_scan_pframe_trailers() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let cfg_path = std::env::var("AC4_SCAN_CFG_FILE").expect("AC4_SCAN_CFG_FILE");
+        let xovers: Vec<u8> = std::env::var("AC4_SCAN_XOVERS")
+            .expect("AC4_SCAN_XOVERS")
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let data = std::fs::read(&path).expect("read scan file");
+        let cdata = std::fs::read(&cfg_path).expect("read cfg file");
+        let mut hr = BitReader::new(&data);
+        let short = hr.read_u32(15).unwrap();
+        assert!(!hr.read_bit().unwrap());
+        hr.align_to_byte();
+        let wall = (hr.byte_position() as u64 + short as u64) * 8;
+        let mut hr2 = BitReader::new(&cdata);
+        let cshort = hr2.read_u32(15).unwrap();
+        let _ = hr2.read_bit().unwrap();
+        hr2.align_to_byte();
+        let coff = hr2.byte_position();
+        let _ = cshort;
+        let mut cbr = BitReader::with_position(&cdata, coff);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        eprintln!("PTRL file={path} wall={wall} xovers={xovers:?}");
+        let lo = wall.saturating_sub(4000) as usize;
+        let hi = wall.saturating_sub(60) as usize;
+        for start_bit in lo..hi {
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(start_bit as u32).unwrap();
+            let mut tools = SubstreamTools::default();
+            for (i, &x) in xovers.iter().enumerate() {
+                tools.aspx_xover_slots[i] = Some(x);
+            }
+            let mut ok = true;
+            for ch in [2u8, 2, 1, 2] {
+                let r = if ch == 1 {
+                    parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                } else {
+                    parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                };
+                if r.is_err() || br.bit_position() > wall {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let slack = wall as i64 - br.bit_position() as i64;
+                if (0..=8).contains(&slack) {
+                    eprintln!("PTRL hit: T={start_bit} end={} slack={slack}", br.bit_position());
+                }
+            }
+        }
+        eprintln!("PTRL done");
     }
     use super::*;
     use oxideav_core::bits::BitWriter;
