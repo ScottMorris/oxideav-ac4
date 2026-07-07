@@ -302,8 +302,20 @@ pub fn parse_asf_scalefac_data(
             first_scf_found = true;
         }
         // sf_gain[sfb] = 2^((scale_factor - 100) / 4).
+        // AC4_SF_INVERT=1: experimental inverted semantics
+        // 2^((100 - sf)/4) — probing whether sf is a quantizer-step
+        // exponent (bigger = quieter); real streams carry sf up to
+        // ~246 for near-silent channels, which explodes under the
+        // spec-literal reading (round 407 experiment).
         let sf = scale_factor;
-        let exp = (sf as f32 - 100.0) * 0.25;
+        let exp = if std::env::var_os("AC4_SF_LEGACY_UNSIGNED").is_some() {
+            (sf as f32 - 100.0) * 0.25
+        } else {
+            // Round 407: signed 8-bit scale factors (see the grouped
+            // variant above for the full story).
+            let s8 = ((sf + 128) & 0xFF) - 128;
+            (s8 as f32 - 100.0) * 0.25
+        };
         sf_gain[sfb] = 2.0_f32.powf(exp);
     }
     Ok(sf_gain)
@@ -464,7 +476,17 @@ pub fn parse_asf_scalefac_data_grouped(
                 first_scf_found = true;
             }
             let sf = scale_factor;
-            let exp = (sf as f32 - 100.0) * 0.25;
+            let exp = if std::env::var_os("AC4_SF_LEGACY_UNSIGNED").is_some() {
+                (sf as f32 - 100.0) * 0.25
+            } else {
+                // Round 407: scale factors are SIGNED 8-bit — real streams
+                // carry ref values like 246 (= -10) on near-silent
+                // channels, which read as 2^36.5 hot under the spec's
+                // literal unsigned formula (the root cause of the
+                // full-scale-noise output). Wrap into [-128, 127].
+                let s8 = ((sf + 128) & 0xFF) - 128;
+                (s8 as f32 - 100.0) * 0.25
+            };
             sf_gain[sfb] = 2.0_f32.powf(exp);
         }
         out.push(sf_gain);

@@ -3130,6 +3130,14 @@ pub(crate) fn decode_asf_long_mono_body_with_max_sfb_ext(
         );
     }
     let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
+    if std::env::var_os("AC4_TRACE_GAINS").is_some() {
+        let gmax = sf_gain.iter().cloned().fold(0.0f32, f32::max);
+        let smax = scaled.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        eprintln!(
+            "GAINS m={max_sfb} sf_gain_max={gmax:.3e} scaled_max={smax:.3e} out@{}",
+            br.bit_position()
+        );
+    }
     Some(scaled)
 }
 
