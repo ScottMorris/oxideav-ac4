@@ -387,12 +387,25 @@ pub fn parse_two_channel_data(
     // sf_info + chparam_info (joint MDCT stereo processing) and two
     // fully independent per-channel sf_infos.
     let b_msp = br.read_bit()?;
+    // AC4_TRACE_BODIES=1: per-element diagnostic used by the round-40x
+    // conformance work (see riptide docs/ac4-decoder-accuracy-plan.md).
+    let _trace = std::env::var_os("AC4_TRACE_BODIES").is_some();
+    let _p_in = br.bit_position();
+    if _trace {
+        eprintln!("2CH b_msp={} in@{}", b_msp as u8, _p_in - 1);
+    }
     if b_msp {
         let ti = parse_asf_transform_info(br, frame_len_base)?;
         let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
         let max_sfb_g = psy.max_sfb_0;
         let chparam = parse_chparam_info(br, &[max_sfb_g])?;
         let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+        if _trace {
+            eprintln!(
+                "2CH shared long={} m={} ng={} out@{}",
+                ti.b_long_frame, psy.max_sfb_0, psy.num_window_groups, br.bit_position()
+            );
+        }
         Ok(TwoChannelData {
             b_enable_mdct_stereo_proc: true,
             transform_info: Some(ti),
@@ -414,6 +427,13 @@ pub fn parse_two_channel_data(
         let (s1, w1) = decode_mch_sf_data_channels(br, &ti1, &psy1, 1);
         scaled.extend(s1);
         scaled_windows.extend(w1);
+        if _trace {
+            eprintln!(
+                "2CH separate long=({},{}) m=({},{}) out@{}",
+                ti0.b_long_frame, ti1.b_long_frame, psy0.max_sfb_0, psy1.max_sfb_0,
+                br.bit_position()
+            );
+        }
         Ok(TwoChannelData {
             b_enable_mdct_stereo_proc: false,
             transform_info: Some(ti0),
@@ -1180,6 +1200,7 @@ fn parse_aspx_acpl_1_2_inner_body(
     //    sticky state on P-frames (§4.2.6.6 Table 25 gates only the
     //    *configs* on b_iframe; the data elements are always present).
     let Some(aspx_cfg) = tools.aspx_config else {
+        if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL no-aspx-cfg @{}", br.bit_position()); }
         return Ok(());
     };
     // aspx_data_2ch() then aspx_data_1ch().
@@ -1456,6 +1477,7 @@ pub fn parse_7x_audio_data_outer(
         }
     }
     if !body_ok {
+        if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL switch-body @{}", br.bit_position()); }
         return Ok(());
     }
 
@@ -1465,7 +1487,7 @@ pub fn parse_7x_audio_data_outer(
     if matches!(mode, SevenXCodecMode::Simple | SevenXCodecMode::Aspx) {
         let b_use_sap_add_ch = match br.read_bit() {
             Ok(b) => b,
-            Err(_) => return Ok(()),
+            Err(_) => { if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL sap-gate"); } return Ok(()); }
         };
         tools.seven_x_b_use_sap_add_ch = Some(b_use_sap_add_ch);
         if b_use_sap_add_ch {
@@ -1493,7 +1515,7 @@ pub fn parse_7x_audio_data_outer(
                 }
                 tools.seven_x_additional_channel_data = Some(d);
             }
-            Err(_) => return Ok(()),
+            Err(_) => { if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL add-2ch @{}", br.bit_position()); } return Ok(()); }
         }
     }
 
@@ -1582,19 +1604,24 @@ pub fn parse_7x_audio_data_outer(
     // + aspx_data_1ch }` — covers the L/R + Ls/Rs front pair and the
     // additional-channel pair plus the centre mono.
     if !matches!(mode, SevenXCodecMode::Simple) {
-        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
+        if let Err(e) =
+            crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
         {
+            if std::env::var_os("AC4_T").is_some() {
+                eprintln!("BAIL aspx-2ch#1 @{} err={e:?}", br.bit_position());
+            }
             return Ok(());
         }
         if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
+            if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-2ch#2 @{}", br.bit_position()); }
             return Ok(());
         }
         if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
+            if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-1ch @{}", br.bit_position()); }
             return Ok(());
         }
     }
@@ -1606,6 +1633,7 @@ pub fn parse_7x_audio_data_outer(
         if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
+            if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-extra @{}", br.bit_position()); }
             return Ok(());
         }
     }
@@ -1644,6 +1672,7 @@ pub fn parse_7x_audio_data_outer(
             }
         }
     }
+    tools.walk_complete = true;
     Ok(())
 }
 

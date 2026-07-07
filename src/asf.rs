@@ -1340,6 +1340,12 @@ impl StickyConfig {
 /// the outer layers of `audio_data()` without touching Huffman tables.
 #[derive(Debug, Clone, Default)]
 pub struct SubstreamTools {
+    /// True only when the channel-element walk reached its natural end
+    /// with every element parsed — no try-and-bail early return fired.
+    /// Combined with the AC4_PARSE_STATS consumption delta this is the
+    /// real correctness meter: a walk that merely ran into the bounded
+    /// audio_data wall mid-element leaves this false.
+    pub walk_complete: bool,
     /// Channel mode that drove the `audio_data()` switch. Copied from
     /// the parent `ac4_substream_info()`.
     pub channel_mode_channels: u16,
@@ -3014,10 +3020,23 @@ pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
         return None;
     }
     let sfbo = sfb_offset::sfb_offset_48(tl)?;
+    // AC4_TRACE_BODIES=1: sub-element sizes for the conformance work.
+    let _trace = std::env::var_os("AC4_TRACE_BODIES").is_some();
+    let _p0 = br.bit_position();
     let sections = asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
+    let _p1 = br.bit_position();
     let (qspec, mqi) = asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
+    let _p2 = br.bit_position();
     let sf_gain = asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    let _p3 = br.bit_position();
     let _snf = asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
+    if _trace {
+        eprintln!(
+            "BODY m={max_sfb} in@{_p0} sect={} cbs={:?} spec={} sf={} snf={} out@{}",
+            _p1 - _p0, sections.sect_cb, _p2 - _p1, _p3 - _p2,
+            br.bit_position() - _p3, br.bit_position()
+        );
+    }
     let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
     Some(scaled)
 }
@@ -3562,9 +3581,12 @@ pub fn walk_ac4_substream_sticky(
     // byte_align to enter audio_data().
     br.align_to_byte();
     let audio_data_offset = br.byte_position() as u32;
-    // Bound the walk at the end of audio_data: `audio_size` counts from
-    // its own 2-byte size field, so audio_data spans exactly
-    // `audio_size - 2` bytes from here. Without this clamp a runaway
+    // Bound the walk at the end of audio_data: `audio_size` counts the
+    // audio_data payload itself (it does NOT include the 2-byte size
+    // field), so audio_data spans exactly `audio_size` bytes from here
+    // — verified empirically: with a wall 2 bytes shorter, 46% of real
+    // frames all stopped at exactly delta == 2 (the artificial wall),
+    // and with this wall they complete at delta == 0. Without this clamp a runaway
     // Huffman loop reads on into fill/metadata (and, for substream
     // slices that extend to the frame end, arbitrarily far) and a
     // misparse can masquerade as a completed walk. With it, every
@@ -3572,7 +3594,7 @@ pub fn walk_ac4_substream_sticky(
     // garbage out of downstream state and makes the AC4_PARSE_STATS
     // delta a truthful bail-vs-complete meter.
     let audio_end = (audio_data_offset as usize)
-        .saturating_add((audio_size as usize).saturating_sub(2))
+        .saturating_add(audio_size as usize)
         .min(substream_bytes.len());
     let bounded = &substream_bytes[..audio_end];
     let mut br = BitReader::with_position(bounded, audio_data_offset as usize);
@@ -3669,7 +3691,11 @@ pub fn walk_ac4_substream_sticky(
     // docs/ac4-decoder-accuracy-plan.md §7c/§7f.
     if std::env::var_os("AC4_PARSE_STATS").is_some() {
         let consumed = br.bit_position() as i64 / 8 - audio_data_offset as i64;
-        eprintln!("AC4_PARSE_STATS delta={}", audio_size as i64 - consumed);
+        eprintln!(
+            "AC4_PARSE_STATS delta={} complete={}",
+            audio_size as i64 - consumed,
+            tools.walk_complete as u8
+        );
     }
 
     // Every I-frame refreshes the sticky configs for the P-frames that
