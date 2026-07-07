@@ -4686,8 +4686,14 @@ mod tests {
                 for &(s1, m1) in &l1 {
                     for ka in [0u32, m1, m2, m3, ms_alt] {
                         for kb in [0u32, m1, m2, m3, ms_alt] {
-                            let hl = 13 + (ka + kb) as usize + 4;
+                            // [blong 1][msfb 6][matsel 4][sapA 2][sapB 2] = 15
+                            let hl = 15 + (ka + kb) as usize;
                             let Some(e) = s1.checked_sub(hl) else { continue };
+                            if let Ok(want) = std::env::var("AC4_SCAN_HEAD") {
+                                if e != want.parse::<usize>().unwrap() {
+                                    continue;
+                                }
+                            }
                             if bit(e) != 1 {
                                 continue;
                             }
@@ -4714,6 +4720,129 @@ mod tests {
             }
         }
         eprintln!("3ch tree done, {hits} hits");
+    }
+
+    /// Round-407c: forward 3ch chain from a PINNED head position.
+    /// Head fields are read from the bits (blong must be 1); chparam
+    /// ms counts tried from {0, msfb, AC4_SCAN_MS}; three bodies with
+    /// independent max_sfb each are chained forward and must end at
+    /// AC4_SCAN_TARGET.
+    #[test]
+    #[ignore]
+    fn debug_scan_3ch_forward() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let head: usize = std::env::var("AC4_SCAN_HEAD").expect("AC4_SCAN_HEAD").parse().unwrap();
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let ms_alt: u32 = std::env::var("AC4_SCAN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        let data = std::fs::read(&path).expect("read scan file");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        let v = |lo: usize, n: usize| {
+            let mut x = 0u32;
+            for i in 0..n {
+                x = (x << 1) | bit(lo + i) as u32;
+            }
+            x
+        };
+        assert_eq!(bit(head), 1, "b_long must be 1 at the pinned head");
+        let msfb = v(head + 1, 6);
+        let matsel = v(head + 7, 4);
+        let sap_a = v(head + 11, 2);
+        eprintln!("FWD3 head@{head}: msfb={msfb} matsel={matsel} sapA={sap_a}");
+        // Deterministic variant: production chparam parse (handles
+        // sap_data) + three untruncated bodies at max_sfb = msfb (the
+        // add-pair grammar generalized).
+        if std::env::var_os("AC4_SCAN_NOTRUNC").is_some() {
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip((head + 11) as u32).unwrap();
+            for i in 0..2 {
+                match parse_chparam_info(&mut br, &[msfb]) {
+                    Ok(c) => eprintln!("FWD3 chp{i} sap={} @{}", c.sap_mode, br.bit_position()),
+                    Err(e) => {
+                        eprintln!("FWD3 chp{i} ERR {e:?}");
+                        return;
+                    }
+                }
+            }
+            for chn in 0..3 {
+                let before = br.bit_position();
+                // try discovery bound first, fall back to msfb
+                let m_use = crate::mch::discover_add_pair_body0_bound(br, &ti, msfb)
+                    .unwrap_or(msfb);
+                let w = decode_asf_long_mono_body_with_max_sfb_ext(&mut br, &ti, m_use, true);
+                eprintln!(
+                    "FWD3 body{chn}: m={m_use} [{before}..{}) ok={} (target {target})",
+                    br.bit_position(),
+                    w.is_some()
+                );
+                if w.is_none() {
+                    break;
+                }
+            }
+            return;
+        }
+        let ka_opts: Vec<u32> = if sap_a == 1 { vec![msfb, ms_alt] } else { vec![0] };
+        // AC4_SCAN_BODIES_AT: skip head arithmetic, start the m-sweep
+        // at an exact known body position.
+        if let Ok(at) = std::env::var("AC4_SCAN_BODIES_AT") {
+            let s1: usize = at.parse().unwrap();
+            sweep_three_bodies(&data, &ti, s1, target);
+            eprintln!("FWD3 done");
+            return;
+        }
+        for ka in ka_opts {
+            let pb = head + 13 + ka as usize;
+            let sap_b = v(pb, 2);
+            if sap_b == 3 {
+                continue;
+            }
+            let kb_opts: Vec<u32> = if sap_b == 1 { vec![msfb, ms_alt] } else { vec![0] };
+            for &kb in &kb_opts {
+                let s1 = pb + 2 + kb as usize;
+                eprintln!("FWD3 trying sapA={sap_a}+{ka} sapB={sap_b}+{kb} bodies@{s1}");
+                for m1 in 1..=63u32 {
+                    let mut br = BitReader::with_position(&data, 0);
+                    br.skip(s1 as u32).unwrap();
+                    if decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m1).is_none() {
+                        continue;
+                    }
+                    let e1 = br.bit_position();
+                    if e1 >= target {
+                        continue;
+                    }
+                    for m2 in 1..=63u32 {
+                        let mut b2 = BitReader::with_position(&data, 0);
+                        b2.skip(e1 as u32).unwrap();
+                        if decode_asf_long_mono_body_with_max_sfb(&mut b2, &ti, m2).is_none() {
+                            continue;
+                        }
+                        let e2 = b2.bit_position();
+                        if e2 >= target {
+                            continue;
+                        }
+                        for m3 in 1..=63u32 {
+                            let mut b3 = BitReader::with_position(&data, 0);
+                            b3.skip(e2 as u32).unwrap();
+                            if decode_asf_long_mono_body_with_max_sfb(&mut b3, &ti, m3).is_none() {
+                                continue;
+                            }
+                            if b3.bit_position() == target {
+                                eprintln!(
+                                    "FWD3 HIT: sap=({sap_a}+{ka},{sap_b}+{kb}) b1=({s1},m{m1},end{e1}) b2=({e1},m{m2},end{e2}) b3=({e2},m{m3},end{target})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("FWD3 done");
     }
 
     /// Probe: run the production transform/psy/five-channel-info head
@@ -4767,6 +4896,59 @@ mod tests {
             );
             if w.is_none() {
                 break;
+            }
+        }
+    }
+
+    /// Parse one body with legality checks; returns (end, geom) or None.
+    fn legal_body_at(
+        data: &[u8],
+        ti: &AsfTransformInfo,
+        start: usize,
+        m: u32,
+    ) -> Option<(u64, Vec<(u8, u16, u16)>)> {
+        use oxideav_core::bits::BitReader;
+        let tl = ti.transform_length_0;
+        let sfbo = sfb_offset::sfb_offset_48(tl)?;
+        let mut br = BitReader::with_position(data, 0);
+        br.skip(start as u32).ok()?;
+        let sections = asf_data::parse_asf_section_data(&mut br, 0, tl, m).ok()?;
+        if sections.sect_cb.iter().any(|&cb| cb > 11) {
+            return None;
+        }
+        let (_q, mqi) = asf_data::parse_asf_spectral_data(&mut br, &sections, sfbo, m).ok()?;
+        asf_data::parse_asf_scalefac_data(&mut br, &sections, &mqi, m, tl).ok()?;
+        asf_data::parse_asf_snf_data(&mut br, &sections, &mqi, m, tl).ok()?;
+        let geom = sections
+            .sect_cb
+            .iter()
+            .zip(sections.sect_start.iter().zip(sections.sect_end.iter()))
+            .map(|(&cb, (&s, &e))| (cb, s, e))
+            .collect();
+        Some((br.bit_position(), geom))
+    }
+
+    fn sweep_three_bodies(data: &[u8], ti: &AsfTransformInfo, s1: usize, target: u64) {
+        for m1 in 1..=63u32 {
+            let Some((e1, g1)) = legal_body_at(data, ti, s1, m1) else { continue };
+            if e1 >= target {
+                continue;
+            }
+            for m2 in 1..=63u32 {
+                let Some((e2, g2)) = legal_body_at(data, ti, e1 as usize, m2) else { continue };
+                if e2 >= target {
+                    continue;
+                }
+                for m3 in 1..=63u32 {
+                    let Some((e3, g3)) = legal_body_at(data, ti, e2 as usize, m3) else {
+                        continue;
+                    };
+                    if e3 == target {
+                        eprintln!(
+                            "FWD3 HIT: b1=({s1},m{m1},end{e1}) g1={g1:?} b2=(m{m2},end{e2}) g2={g2:?} b3=(m{m3}) g3={g3:?}"
+                        );
+                    }
+                }
             }
         }
     }

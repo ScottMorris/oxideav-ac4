@@ -536,6 +536,85 @@ pub(crate) fn discover_add_pair_body0_bound(
     None
 }
 
+/// Generalized round-407c body-bound discovery: parse ONE long-frame
+/// sf_data body under the untruncated-section grammar, discovering its
+/// scalefac/SNF band bound by trying candidates ascending and
+/// validating each against an oracle on the FOLLOWING bits:
+///   - `next_bodies > 0`: the next body must parse legally (sections
+///     with cb <= 11) under SOME bound of its own (checked shallowly
+///     with its section+spectral prefix, which is bound-independent);
+///   - `next_bodies == 0`: the following bits must look like the next
+///     element head (caller-provided check).
+///
+/// Returns (bound, end_bit_position) without consuming the reader.
+///
+/// Background: real content transmits scalefac/SNF for FEWER bands
+/// than the sections span, and the transmitted max_sfb explains only
+/// some bodies (add-pair body1) — proven by exact-end backchaining on
+/// frames 0/1 (3ch bodies with bounds 11/8/30 against max_sfb=6).
+pub(crate) fn discover_body_bound(
+    br0: BitReader<'_>,
+    ti: &AsfTransformInfo,
+    hint: u32,
+    oracle: impl Fn(BitReader<'_>) -> bool,
+) -> Option<(u32, u64)> {
+    use crate::asf_data;
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    let num_sfb = crate::tables::num_sfb_48(tl)?;
+    // Candidate order matters: the TRANSMITTED max_sfb (hint) is
+    // correct for validated elements (frame-0 3ch m=56, add-pair
+    // body1) — try it first so proven frames stay bit-exact; fall
+    // back to ascending discovery for the bodies whose bound the
+    // header demonstrably does not describe.
+    let hint = hint.min(num_sfb).max(1);
+    let candidates = std::iter::once(hint).chain((1..=num_sfb).filter(move |&k| k != hint));
+    for k in candidates {
+        let mut tr = br0;
+        let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut tr, tl_idx, tl, k, true)
+        else {
+            continue;
+        };
+        // NOTE: cb 12-15 sentinel sections are real on some frames —
+        // no legality filter here (that's a scan-side discriminator).
+        let Ok((_q, mqi)) = asf_data::parse_asf_spectral_data(&mut tr, &sections, sfbo, k)
+        else {
+            continue;
+        };
+        if asf_data::parse_asf_scalefac_data(&mut tr, &sections, &mqi, k, tl).is_err() {
+            continue;
+        }
+        if asf_data::parse_asf_snf_data(&mut tr, &sections, &mqi, k, tl).is_err() {
+            continue;
+        }
+        if oracle(tr) {
+            return Some((k, tr.bit_position()));
+        }
+    }
+    None
+}
+
+/// Oracle helper: do the bits at `br` parse as a legal body prefix
+/// (untruncated sections, cb <= 11, spectral decodes)? Bound-agnostic:
+/// uses max_sfb = 1, whose section+spectral prefix equals any small
+/// bound's.
+pub(crate) fn legal_body_prefix(mut br: BitReader<'_>, ti: &AsfTransformInfo) -> bool {
+    use crate::asf_data;
+    let tl = ti.transform_length_0;
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else {
+        return false;
+    };
+    let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut br, ti.transf_length[0], tl, 1, true)
+    else {
+        return false;
+    };
+    if sections.sect_cb.iter().any(|&cb| cb > 11) {
+        return false;
+    }
+    asf_data::parse_asf_spectral_data(&mut br, &sections, sfbo, 1).is_ok()
+}
+
 /// The additional-channel pair's FIRST body gates scalefac/SNF over
 /// this many bands, independent of the transmitted max_sfb (round 406,
 /// empirical — constant 2 across tracks; its single section and the
@@ -724,6 +803,12 @@ pub fn parse_three_channel_data(
             br.bit_position()
         );
     }
+    // Round 407c: a discovery-first walk was tried here and REVERTED —
+    // frame-0's 3ch bodies need the truncating grammar while frame-1's
+    // need untruncated sections with bounds (11,8,30) that nothing in
+    // the header describes (see the RE guide's open problems). The
+    // per-body grammar discriminator is still unknown; the legacy
+    // fixed-max_sfb walk keeps validated frames bit-exact.
     let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 3);
     if std::env::var_os("AC4_TRACE_BODIES").is_some() {
         eprintln!("3CH bodies out@{}", br.bit_position());
@@ -810,6 +895,43 @@ pub fn parse_five_channel_data(
 /// long-frame single-window channel would produce, ready for a
 /// straight per-window IMDCT.
 pub(crate) type WindowSpectrum = (u32, Vec<f32>);
+
+/// Round-407c discovery walk: decode `n_channels` long-frame bodies,
+/// discovering each body's scalefac/SNF bound via [`discover_body_bound`].
+/// Bodies 0..n-1 use "next body prefix parses" as the oracle; the last
+/// body uses `final_oracle` (next-element head check supplied by the
+/// element walker). Falls back to `None` per channel when discovery
+/// fails — the caller can then retry the legacy fixed-max_sfb path.
+pub(crate) fn decode_mch_sf_data_channels_discover(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+    n_channels: usize,
+    final_oracle: &dyn Fn(BitReader<'_>) -> bool,
+) -> Option<Vec<Option<Vec<f32>>>> {
+    if !(ti.b_long_frame && psy.num_window_groups == 1) {
+        return None;
+    }
+    let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_channels);
+    for ch in 0..n_channels {
+        let last = ch + 1 == n_channels;
+        let found = if last {
+            discover_body_bound(*br, ti, psy.max_sfb_0, |tr| final_oracle(tr))
+        } else {
+            discover_body_bound(*br, ti, psy.max_sfb_0, |tr| legal_body_prefix(tr, ti))
+        };
+        // Try the transmitted max_sfb as a first-class candidate too:
+        // when the plain bound also satisfies the oracle at the same
+        // or earlier position, prefer discovery's (ascending-k) pick.
+        let (bound, _end) = found?;
+        let body = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, ti, bound, true)?;
+        if std::env::var_os("AC4_TRACE_BODIES").is_some() {
+            eprintln!("DISC ch{ch} bound={bound} out@{}", br.bit_position());
+        }
+        out.push(Some(body));
+    }
+    Some(out)
+}
 
 pub(crate) fn decode_mch_sf_data_channels(
     br: &mut BitReader<'_>,
