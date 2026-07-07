@@ -4429,14 +4429,25 @@ mod tests {
     #[test]
     #[ignore]
     fn debug_parse_5ch_head_at() {
+        let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_POS_HI")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(pos + 1);
+        for p in pos..hi {
+            parse_head_probe_at(p);
+        }
+    }
+
+    fn parse_head_probe_at(pos: usize) {
         use oxideav_core::bits::BitReader;
         let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
-        let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
         let data = std::fs::read(&path).expect("read");
         let mut br = BitReader::with_position(&data, 0);
         br.skip(pos as u32).unwrap();
-        let ti = parse_asf_transform_info(&mut br, 2048).unwrap();
-        let psy = parse_asf_psy_info(&mut br, &ti, 2048, false, false).unwrap();
+        eprintln!("--- probe@{pos}");
+        let Ok(ti) = parse_asf_transform_info(&mut br, 2048) else { return };
+        let Ok(psy) = parse_asf_psy_info(&mut br, &ti, 2048, false, false) else { return };
         eprintln!(
             "HEAD ti: long={} tl=({},{}) len=({},{}) | psy: m0={} m1={} diff={} ng={} nwin={} grp={:?} @{}",
             ti.b_long_frame, ti.transf_length[0], ti.transf_length[1],
@@ -4445,7 +4456,9 @@ mod tests {
             psy.num_window_groups, psy.num_windows, psy.scale_factor_grouping,
             br.bit_position()
         );
-        let info = crate::mch::parse_five_channel_info(&mut br, &[psy.max_sfb_0]).unwrap();
+        let Ok(info) = crate::mch::parse_five_channel_info(&mut br, &[psy.max_sfb_0]) else {
+            return;
+        };
         eprintln!(
             "5CHINFO matsel={} saps={:?} bodies@{}",
             info.chel_matsel,

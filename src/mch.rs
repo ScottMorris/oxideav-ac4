@@ -879,6 +879,20 @@ pub(crate) fn decode_asf_grouped_body_windows(
     psy: &AsfPsyInfo,
     max_sfb_in: u32,
 ) -> Option<Vec<WindowSpectrum>> {
+    decode_asf_grouped_body_windows_ab(br, ti, psy, max_sfb_in, max_sfb_in)
+}
+
+/// [`decode_asf_grouped_body_windows`] with distinct first/second-half
+/// max_sfb values for `b_different_framing` bodies (get_max_sfb(g)
+/// returns max_sfb[1] for groups past the framing boundary —
+/// Pseudocode 5).
+pub(crate) fn decode_asf_grouped_body_windows_ab(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+    max_sfb_a: u32,
+    max_sfb_b: u32,
+) -> Option<Vec<WindowSpectrum>> {
     // Real short-frame content can legitimately collapse ALL of its
     // physical windows into a *single* group (`num_window_groups == 1`
     // with `num_windows > 1` — every `scale_factor_grouping` bit set to
@@ -890,7 +904,7 @@ pub(crate) fn decode_asf_grouped_body_windows(
         return None;
     }
     let (tl_idx_per_g, tl_per_g, max_sfb_per_g, num_win_in_group_per_g) =
-        crate::asf::derive_per_group_with_max_sfb(ti, psy, max_sfb_in, max_sfb_in);
+        crate::asf::derive_per_group_with_max_sfb(ti, psy, max_sfb_a, max_sfb_b);
     let n = tl_per_g.len();
     let mut base_sfbo_per_g: Vec<&'static [u16]> = Vec::with_capacity(n);
     let mut widened_sfbo_per_g: Vec<Vec<u16>> = Vec::with_capacity(n);
