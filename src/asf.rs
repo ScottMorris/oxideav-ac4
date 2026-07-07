@@ -4424,6 +4424,290 @@ mod tests {
         eprintln!("2ch chain scan done, {hits} hits");
     }
 
+    /// Round-407: direct P-frame additional-pair hunt. Scans for the
+    /// PROVEN head signature [bmsp=1][blong=1][msfb 6][sap][ms bits]
+    /// (sap=1 -> ms = AC4_SCAN_MS, default 50; sap=0/2 -> none), then
+    /// validates: body0 via the self-discovering bound, body1 with
+    /// max_sfb = msfb, then the 4 aspx trailers (b_iframe=false,
+    /// per-slot xovers from AC4_SCAN_XOVERS) ending at the wall.
+    #[test]
+    #[ignore]
+    fn debug_scan_pframe_addpair() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        std::env::set_var("AC4_SECT_NO_TRUNC", "1");
+        let cfg_path = std::env::var("AC4_SCAN_CFG_FILE").expect("AC4_SCAN_CFG_FILE");
+        let ms: usize = std::env::var("AC4_SCAN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let xovers: Vec<u8> = std::env::var("AC4_SCAN_XOVERS")
+            .expect("AC4_SCAN_XOVERS")
+            .split(',')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let data = std::fs::read(&path).expect("read scan file");
+        let cdata = std::fs::read(&cfg_path).expect("read cfg file");
+        let mut hr = BitReader::new(&data);
+        let short = hr.read_u32(15).unwrap();
+        assert!(!hr.read_bit().unwrap());
+        hr.align_to_byte();
+        let wall = (hr.byte_position() as u64 + short as u64) * 8;
+        let mut hr2 = BitReader::new(&cdata);
+        let _ = hr2.read_u32(15).unwrap();
+        let _ = hr2.read_bit().unwrap();
+        hr2.align_to_byte();
+        let coff = hr2.byte_position();
+        let mut cbr = BitReader::with_position(&cdata, coff);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        eprintln!("ADDP file={path} wall={wall} ms={ms} xovers={xovers:?}");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        let v = |lo: usize, n: usize| {
+            let mut x = 0u32;
+            for i in 0..n {
+                x = (x << 1) | bit(lo + i) as u32;
+            }
+            x
+        };
+        let lo = 40usize;
+        let hi = (wall as usize).saturating_sub(500);
+        let mut hits = 0;
+        for e in lo..hi {
+            if bit(e) != 1 || bit(e + 1) != 1 {
+                continue;
+            }
+            let msfb = v(e + 2, 6);
+            if msfb == 0 {
+                continue;
+            }
+            let sap = v(e + 8, 2);
+            if sap == 3 {
+                continue;
+            }
+            let b0_start = e + 10 + if sap == 1 { ms } else { 0 };
+            if b0_start + 100 >= wall as usize {
+                continue;
+            }
+            // body0: self-discovering bound.
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(b0_start as u32).unwrap();
+            let Some(m0) = crate::mch::discover_add_pair_body0_bound(br, &ti, msfb) else {
+                continue;
+            };
+            let Some(_b0) =
+                decode_asf_long_mono_body_with_max_sfb_ext(&mut br, &ti, m0, true)
+            else {
+                continue;
+            };
+            let b1_start = br.bit_position();
+            let Some(_b1) =
+                decode_asf_long_mono_body_with_max_sfb_ext(&mut br, &ti, msfb, true)
+            else {
+                continue;
+            };
+            let b1_end = br.bit_position();
+            if b1_end >= wall {
+                continue;
+            }
+            // trailers
+            let mut tools = SubstreamTools::default();
+            for (i, &x) in xovers.iter().enumerate() {
+                tools.aspx_xover_slots[i] = Some(x);
+            }
+            let mut ok = true;
+            for ch in [2u8, 2, 1, 2] {
+                let r = if ch == 1 {
+                    parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                } else {
+                    parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                };
+                if r.is_err() || br.bit_position() > wall {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let slack = wall as i64 - br.bit_position() as i64;
+            if (0..=8).contains(&slack) {
+                hits += 1;
+                eprintln!(
+                    "ADDP hit: head@{e} msfb={msfb} sap={sap} m0={m0} body0=[{b0_start}..{b1_start}) body1=[{b1_start}..{b1_end}) slack={slack}"
+                );
+            }
+        }
+        eprintln!("addpair scan done, {hits} hits");
+    }
+
+    /// Round-407: three_channel_data chain scan — head
+    /// [blong=1][msfb 6][matsel 4][chpA][chpB] + three LONG bodies of
+    /// the same max_sfb ending exactly at AC4_SCAN_TARGET. chparam ms
+    /// counts tried: 0 (sap 0/2), msfb, and AC4_SCAN_MS (default 50).
+    #[test]
+    #[ignore]
+    fn debug_scan_3ch_chain() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").unwrap_or_else(|_| "40".into()).parse().unwrap();
+        let ms_alt: u32 = std::env::var("AC4_SCAN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        let data = std::fs::read(&path).expect("read scan file");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        let v = |lo: usize, n: usize| {
+            let mut x = 0u32;
+            for i in 0..n {
+                x = (x << 1) | bit(lo + i) as u32;
+            }
+            x
+        };
+        let mut hits = 0;
+        for s0 in lo..(target as usize - 90) {
+            for m in 1..=63u32 {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(s0 as u32).unwrap();
+                let mut ends = [0u64; 3];
+                let mut ok = true;
+                for e in ends.iter_mut() {
+                    match decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m) {
+                        Some(_) => *e = br.bit_position(),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if br.bit_position() > target {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok || ends[2] != target {
+                    continue;
+                }
+                for ka in [0u32, m, ms_alt] {
+                    for kb in [0u32, m, ms_alt] {
+                        let hl = 1 + 6 + 4 + 2 + 2 + (ka + kb) as usize;
+                        let Some(e) = s0.checked_sub(hl) else { continue };
+                        if bit(e) != 1 || v(e + 1, 6) != m {
+                            continue;
+                        }
+                        let matsel = v(e + 7, 4);
+                        let sap_a = v(e + 11, 2);
+                        if (sap_a == 1) != (ka > 0) || sap_a == 3 {
+                            continue;
+                        }
+                        let sap_b = v(e + 13 + ka as usize, 2);
+                        if (sap_b == 1) != (kb > 0) || sap_b == 3 {
+                            continue;
+                        }
+                        hits += 1;
+                        eprintln!(
+                            "3CHAIN: head@{e} m={m} matsel={matsel} saps=({sap_a}+{ka},{sap_b}+{kb}) bodies={ends:?}"
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!("3chain scan done, {hits} hits");
+    }
+
+    /// Round-407: three_channel_data TREE search with independent
+    /// per-body max_sfb. Level 3 = bodies ending at AC4_SCAN_TARGET;
+    /// level 2 = bodies ending at each level-3 start; level 1 =
+    /// bodies ending at each level-2 start; then the head
+    /// [blong=1][msfb 6][matsel 4][chpA][chpB] must sit immediately
+    /// before level-1's start (ms counts 0 / msfb / AC4_SCAN_MS).
+    #[test]
+    #[ignore]
+    fn debug_scan_3ch_tree() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").unwrap_or_else(|_| "40".into()).parse().unwrap();
+        let ms_alt: u32 = std::env::var("AC4_SCAN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(50);
+        let data = std::fs::read(&path).expect("read scan file");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        let v = |lo: usize, n: usize| {
+            let mut x = 0u32;
+            for i in 0..n {
+                x = (x << 1) | bit(lo + i) as u32;
+            }
+            x
+        };
+        let scan_ending_at = |t: u64, wlo: usize| -> Vec<(usize, u32)> {
+            let mut out = Vec::new();
+            for st in wlo..(t as usize).saturating_sub(20) {
+                for m in 1..=63u32 {
+                    let mut br = BitReader::with_position(&data, 0);
+                    br.skip(st as u32).unwrap();
+                    if decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m).is_some()
+                        && br.bit_position() == t
+                    {
+                        out.push((st, m));
+                    }
+                }
+            }
+            out
+        };
+        let l3 = scan_ending_at(target, lo);
+        eprintln!("TREE l3: {} candidates", l3.len());
+        let mut hits = 0;
+        for &(s3, m3) in &l3 {
+            let l2 = scan_ending_at(s3 as u64, lo);
+            for &(s2, m2) in &l2 {
+                let l1 = scan_ending_at(s2 as u64, lo);
+                for &(s1, m1) in &l1 {
+                    for ka in [0u32, m1, m2, m3, ms_alt] {
+                        for kb in [0u32, m1, m2, m3, ms_alt] {
+                            let hl = 13 + (ka + kb) as usize + 4;
+                            let Some(e) = s1.checked_sub(hl) else { continue };
+                            if bit(e) != 1 {
+                                continue;
+                            }
+                            let msfb = v(e + 1, 6);
+                            if msfb != m1 && msfb != m2 && msfb != m3 {
+                                continue;
+                            }
+                            let matsel = v(e + 7, 4);
+                            let sap_a = v(e + 11, 2);
+                            if (sap_a == 1) != (ka > 0) || sap_a == 3 {
+                                continue;
+                            }
+                            let sap_b = v(e + 13 + ka as usize, 2);
+                            if (sap_b == 1) != (kb > 0) || sap_b == 3 {
+                                continue;
+                            }
+                            hits += 1;
+                            eprintln!(
+                                "TREE hit: head@{e} msfb={msfb} matsel={matsel} saps=({sap_a}+{ka},{sap_b}+{kb}) b1=({s1},m{m1}) b2=({s2},m{m2}) b3=({s3},m{m3})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("3ch tree done, {hits} hits");
+    }
+
     /// Probe: run the production transform/psy/five-channel-info head
     /// parsers at AC4_SCAN_POS and print everything.
     #[test]

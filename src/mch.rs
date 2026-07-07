@@ -483,7 +483,7 @@ pub(crate) fn aspx_core_band_count(cfg: &crate::aspx::AspxConfig, tl: u32) -> Op
 /// scalefac/SNF band bound by validating each candidate tail length
 /// against a full parse of body1. Returns the winning bound
 /// (`k + 1` bands for `k` scalefac codewords read).
-fn discover_add_pair_body0_bound(
+pub(crate) fn discover_add_pair_body0_bound(
     br0: BitReader<'_>,
     ti: &AsfTransformInfo,
     max_sfb_1: u32,
