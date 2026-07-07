@@ -4342,6 +4342,206 @@ mod tests {
         }
         eprintln!("PPIPE done");
     }
+
+    /// Round-406e: joint scan for a b_msp=1 LONG two_channel_data
+    /// whose SECOND body ends exactly at AC4_SCAN_TARGET. Chains:
+    /// head [bmsp=1][blong=1][msfb 6][sap 2 (+ms bits)] + body0(m) +
+    /// body1(m) == target, with msfb field == m. Prints every
+    /// consistent chain.
+    #[test]
+    #[ignore]
+    fn debug_scan_2ch_chain() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET")
+            .expect("AC4_SCAN_TARGET")
+            .parse()
+            .unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").unwrap_or_else(|_| "56".into()).parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_HI").unwrap_or_else(|_| "0".into()).parse().unwrap();
+        let hi = if hi == 0 { target as usize - 60 } else { hi };
+        // ms-loop candidates for the head chparam when sap==1: plain
+        // max_sfb or the aspx core count (50) — both observed.
+        let ms_alt: u32 = std::env::var("AC4_SCAN_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let data = std::fs::read(&path).expect("read scan file");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let bit = |i: usize| (data[i / 8] >> (7 - (i % 8))) & 1;
+        let v = |lo: usize, n: usize| {
+            let mut x = 0u32;
+            for i in 0..n {
+                x = (x << 1) | bit(lo + i) as u32;
+            }
+            x
+        };
+        let mut hits = 0;
+        for s0 in lo..hi {
+            for m in 1..=63u32 {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(s0 as u32).unwrap();
+                let Some(_b0) = decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m) else {
+                    continue;
+                };
+                let mid = br.bit_position();
+                if mid >= target {
+                    continue;
+                }
+                let Some(_b1) = decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m) else {
+                    continue;
+                };
+                if br.bit_position() != target {
+                    continue;
+                }
+                // head candidates: sap!=1 (10 bits) or sap==1 with m or
+                // ms_alt ms bits.
+                for k in [0u32, m, ms_alt] {
+                    let hl = 10 + k as usize;
+                    let Some(e) = s0.checked_sub(hl) else { continue };
+                    if bit(e) != 1 || bit(e + 1) != 1 {
+                        continue;
+                    }
+                    if v(e + 2, 6) != m {
+                        continue;
+                    }
+                    let sap = v(e + 8, 2);
+                    if (sap == 1) != (k > 0) || sap == 3 {
+                        continue;
+                    }
+                    hits += 1;
+                    eprintln!(
+                        "CHAIN: head@{e} m={m} sap={sap} ms={k} body0=[{s0}..{mid}) body1=[{mid}..{target})"
+                    );
+                }
+            }
+        }
+        eprintln!("2ch chain scan done, {hits} hits");
+    }
+
+    /// Probe: run the production transform/psy/five-channel-info head
+    /// parsers at AC4_SCAN_POS and print everything.
+    #[test]
+    #[ignore]
+    fn debug_parse_5ch_head_at() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
+        let data = std::fs::read(&path).expect("read");
+        let mut br = BitReader::with_position(&data, 0);
+        br.skip(pos as u32).unwrap();
+        let ti = parse_asf_transform_info(&mut br, 2048).unwrap();
+        let psy = parse_asf_psy_info(&mut br, &ti, 2048, false, false).unwrap();
+        eprintln!(
+            "HEAD ti: long={} tl=({},{}) len=({},{}) | psy: m0={} m1={} diff={} ng={} nwin={} grp={:?} @{}",
+            ti.b_long_frame, ti.transf_length[0], ti.transf_length[1],
+            ti.transform_length_0, ti.transform_length_1,
+            psy.max_sfb_0, psy.max_sfb_1, psy.b_different_framing,
+            psy.num_window_groups, psy.num_windows, psy.scale_factor_grouping,
+            br.bit_position()
+        );
+        let info = crate::mch::parse_five_channel_info(&mut br, &[psy.max_sfb_0]).unwrap();
+        eprintln!(
+            "5CHINFO matsel={} saps={:?} bodies@{}",
+            info.chel_matsel,
+            info.chparam.iter().map(|c| c.sap_mode).collect::<Vec<_>>(),
+            br.bit_position()
+        );
+        for ch in 0..5 {
+            let before = br.bit_position();
+            let w = crate::mch::decode_asf_grouped_body_windows(&mut br, &ti, &psy, psy.max_sfb_0);
+            eprintln!(
+                "GBODY ch{ch}: [{before}..{}) ok={}",
+                br.bit_position(),
+                w.is_some()
+            );
+            if w.is_none() {
+                break;
+            }
+        }
+    }
+
+    /// Grouped-body backchain: head parsed at AC4_SCAN_POS gives
+    /// ti/psy; scan start bits whose grouped body parse ends exactly
+    /// at AC4_SCAN_TARGET. Tries max_sfb = m0 and (diff-framing) m1.
+    #[test]
+    #[ignore]
+    fn debug_scan_grouped_backchain() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").expect("AC4_SCAN_LO").parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_HI").expect("AC4_SCAN_HI").parse().unwrap();
+        let data = std::fs::read(&path).expect("read");
+        let mut hbr = BitReader::with_position(&data, 0);
+        hbr.skip(pos as u32).unwrap();
+        let ti = parse_asf_transform_info(&mut hbr, 2048).unwrap();
+        let psy = parse_asf_psy_info(&mut hbr, &ti, 2048, false, false).unwrap();
+        let mut cands: Vec<u32> = vec![psy.max_sfb_0];
+        if psy.b_different_framing && psy.max_sfb_1 != psy.max_sfb_0 {
+            cands.push(psy.max_sfb_1);
+        }
+        let mut hits = 0;
+        for start in lo..hi {
+            for &m in &cands {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(start as u32).unwrap();
+                let w = crate::mch::decode_asf_grouped_body_windows(&mut br, &ti, &psy, m);
+                if w.is_some() && br.bit_position() == target {
+                    hits += 1;
+                    eprintln!("GHIT: start={start} m={m} end={target}");
+                }
+            }
+        }
+        eprintln!("grouped backchain done, {hits} hits");
+    }
+
+    /// Exhaustive 5-body chain: bodies start at AC4_SCAN_LO, must end
+    /// at AC4_SCAN_TARGET; each body's max_sfb is either psy.max_sfb_0
+    /// or max_sfb_1 (2^5 = 32 chains).
+    #[test]
+    #[ignore]
+    fn debug_scan_5ch_chain() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let start: usize = std::env::var("AC4_SCAN_LO").expect("AC4_SCAN_LO").parse().unwrap();
+        let data = std::fs::read(&path).expect("read");
+        let mut hbr = BitReader::with_position(&data, 0);
+        hbr.skip(pos as u32).unwrap();
+        let ti = parse_asf_transform_info(&mut hbr, 2048).unwrap();
+        let psy = parse_asf_psy_info(&mut hbr, &ti, 2048, false, false).unwrap();
+        for mask in 0u32..32 {
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(start as u32).unwrap();
+            let mut ends = Vec::new();
+            let mut ok = true;
+            for ch in 0..5 {
+                let m = if mask & (1 << ch) != 0 { psy.max_sfb_1 } else { psy.max_sfb_0 };
+                let w = crate::mch::decode_asf_grouped_body_windows(&mut br, &ti, &psy, m);
+                if w.is_none() {
+                    ok = false;
+                    break;
+                }
+                ends.push(br.bit_position());
+            }
+            if ok {
+                let end = *ends.last().unwrap();
+                let d = end as i64 - target as i64;
+                if d.abs() < 400 {
+                    eprintln!("5CHAIN mask={mask:05b} ends={ends:?} delta={d}");
+                }
+            }
+        }
+        eprintln!("5chain done");
+    }
     use super::*;
     use oxideav_core::bits::BitWriter;
 

@@ -708,7 +708,26 @@ pub fn parse_three_channel_data(
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
     let info = parse_three_channel_info(br, &[psy.max_sfb_0])?;
+    if std::env::var_os("AC4_TRACE_BODIES").is_some() {
+        eprintln!(
+            "3CH long={} tl=({},{}) m0={} m1={} ng={} grp={:?} matsel={} saps=({},{}) bodies@{}",
+            ti.b_long_frame,
+            ti.transf_length[0],
+            ti.transf_length[1],
+            psy.max_sfb_0,
+            psy.max_sfb_1,
+            psy.num_window_groups,
+            psy.scale_factor_grouping,
+            info.chel_matsel,
+            info.chparam[0].sap_mode,
+            info.chparam[1].sap_mode,
+            br.bit_position()
+        );
+    }
     let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 3);
+    if std::env::var_os("AC4_TRACE_BODIES").is_some() {
+        eprintln!("3CH bodies out@{}", br.bit_position());
+    }
     Ok(ThreeChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
