@@ -614,16 +614,8 @@ pub(crate) fn resync_7x_addpair<'a>(
     frame_len_base: u32,
 ) -> Option<(BitReader<'a>, [Option<u8>; 8])> {
     let wall = tools.wall_bits?;
-    let ti = AsfTransformInfo {
-        b_long_frame: true,
-        transf_length: [0, 0],
-        transform_length_0: frame_len_base,
-        transform_length_1: frame_len_base,
-    };
-    let ms = aspx_core_band_count(cfg, frame_len_base).unwrap_or(50);
     // The additional pair + trailers never exceed ~9000 bits on real
-    // content (largest observed: frame-0's ~6400) — scanning earlier
-    // positions only burns time on impossible candidates.
+    // content — scanning earlier positions only burns time.
     let mut floor_br = floor_br;
     let floor0 = floor_br.bit_position();
     let floor_min = wall.saturating_sub(9000);
@@ -632,179 +624,72 @@ pub(crate) fn resync_7x_addpair<'a>(
     }
     let floor = floor_br.bit_position();
     let hi = wall.saturating_sub(400);
-    // Two passes: the proven bmsp=1 signature first over the whole
-    // range; the looser bmsp=0 shape only if nothing matched (it
-    // otherwise steals earlier false positions from proven heads).
-    for allow_bmsp0 in [false, true] {
-    let mut e = floor;
     let mut brute_budget: u32 = 16;
+    let dbg_want: Option<u64> = std::env::var("AC4_RESYNC_DEBUG")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    // Round 407n: candidate validation IS the production additional-
+    // pair parser (parse_two_channel_data_additional handles bmsp
+    // 0/1, sap 0-3, and long/grouped bodies alike), followed by the
+    // wall-distance gate and the trailer-chain oracle. This replaces
+    // the earlier hand-rolled long-only head patterns, extending
+    // resync to short/grouped additional pairs (the dominant failure
+    // class at 44.5% coverage).
+    let mut e = floor;
     while e < hi {
-        // Position a copy at e.
         let mut hr = floor_br;
         if hr.skip((e - floor) as u32).is_err() {
             return None;
         }
         let head = hr;
-        // Cheap pattern gate. bmsp=1: shared sf_info + chparam.
-        // bmsp=0 (round 407k): two independent long sf_infos.
-        let Ok(bmsp) = hr.read_bit() else { return None };
-        if !bmsp {
-            if !allow_bmsp0 {
-                e += 1;
-                continue;
-            }
-            let Ok(bl0) = hr.read_bit() else { return None };
-            let Ok(m0f) = hr.read_u32(6) else { return None };
-            let Ok(bl1) = hr.read_bit() else { return None };
-            let Ok(m1f) = hr.read_u32(6) else { return None };
-            if !(bl0 && bl1 && m0f != 0 && m1f != 0) {
-                e += 1;
-                continue;
-            }
-            // body0 with its own field; body1 with the second.
-            if !legal_body_prefix(hr, &ti) {
-                e += 1;
-                continue;
-            }
-            let Some(b0m) = discover_add_pair_body0_bound(hr, &ti, m1f) else {
-                e += 1;
-                continue;
-            };
-            let mut vr = hr;
-            if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, b0m, true)
-                .is_none()
-            {
-                e += 1;
-                continue;
-            }
-            if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, m1f, true)
-                .is_none()
-            {
-                e += 1;
-                continue;
-            }
-            if wall.saturating_sub(vr.bit_position()) > 1200 {
-                e += 1;
-                continue;
-            }
-            let ok = validate_7x_trailers_slots_budgeted(
-                vr,
-                tools,
-                cfg,
-                b_iframe,
-                frame_len_base,
-                brute_budget > 0,
-            );
-            if ok.is_none() {
-                brute_budget = brute_budget.saturating_sub(1);
-                e += 1;
-                continue;
-            }
-            if std::env::var_os("AC4_T").is_some() {
-                eprintln!(
-                    "RESYNC 7x add-pair(bmsp0) @{} (floor {floor}, m {m0f}/{m1f}, b0m {b0m})",
-                    head.bit_position()
-                );
-            }
-            return Some((head, ok.unwrap()));
-        }
-        let Ok(blong) = hr.read_bit() else { return None };
-        if !blong {
-            e += 1;
-            continue;
-        }
-        let Ok(msfb) = hr.read_u32(6) else { return None };
-        if msfb == 0 {
-            e += 1;
-            continue;
-        }
-        let Ok(sap) = hr.read_u32(2) else { return None };
-        if sap == 1 {
-            if hr.skip(ms).is_err() {
-                e += 1;
-                continue;
-            }
-        } else if sap == 3 {
-            // Round 407k: sap_data heads exist on real frames (the
-            // frame-4/5 class) — consume it with the production
-            // parser over the aspx-core band count.
-            if crate::asf::parse_sap_data(&mut hr, &[ms]).is_err() {
-                e += 1;
-                continue;
-            }
-        }
-        let dbg = std::env::var("AC4_RESYNC_DEBUG")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|want| want == e)
-            .unwrap_or(false);
-        // body0 legality prefix, then full discovery + body1.
-        if !legal_body_prefix(hr, &ti) {
+        let dbg = dbg_want == Some(e);
+        let mut pr = hr;
+        let Ok(_d) = parse_two_channel_data_additional(&mut pr, frame_len_base, Some(cfg))
+        else {
             if dbg {
-                eprintln!("RSDBG e={e}: legal_body_prefix REJECT");
-            }
-            e += 1;
-            continue;
-        }
-        let Some(m0) = discover_add_pair_body0_bound(hr, &ti, msfb) else {
-            if dbg {
-                eprintln!("RSDBG e={e}: discovery REJECT (msfb={msfb} sap={sap})");
+                eprintln!("RSDBG e={e}: add-pair parse REJECT");
             }
             e += 1;
             continue;
         };
-        let mut vr = hr;
-        if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, m0, true)
-            .is_none()
-        {
+        let endp = pr.bit_position();
+        if endp >= wall || wall - endp > 1200 {
+            if dbg {
+                eprintln!("RSDBG e={e}: wall-distance REJECT (end {endp})");
+            }
             e += 1;
             continue;
         }
-        if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, msfb, true)
-            .is_none()
-        {
-            e += 1;
-            continue;
-        }
-        // The four trailers span ~250-400 bits on real content; a
-        // candidate whose bodies end far from the wall cannot be the
-        // additional pair. This gate kills nearly every false
-        // candidate before the expensive trailer validation.
-        if wall.saturating_sub(vr.bit_position()) > 1200 {
-            e += 1;
-            continue;
-        }
-        // Trailers with slot self-discovery (round 407e). The 4096
-        // brute is budgeted to the first candidate that gets here.
         let ok = validate_7x_trailers_slots_budgeted(
-            vr,
+            pr,
             tools,
             cfg,
             b_iframe,
             frame_len_base,
             brute_budget > 0,
         );
-        if ok.is_none() {
-            brute_budget = brute_budget.saturating_sub(1);
-        }
         if dbg {
             eprintln!(
-                "RSDBG e={e}: m0={m0} trailers {:?} (harvested slots={:?}) iframe={b_iframe}",
+                "RSDBG e={e}: end {endp} trailers {:?} (harvested slots={:?})",
                 ok.as_ref().map(|s| &s[..4]),
                 &tools.aspx_xover_slots[..4]
             );
         }
-        if let Some(slots) = ok {
-            if std::env::var_os("AC4_T").is_some() {
-                eprintln!(
-                    "RESYNC 7x add-pair @{} (floor {floor}, msfb={msfb}, m0={m0})",
-                    head.bit_position()
-                );
+        match ok {
+            Some(slots) => {
+                if std::env::var_os("AC4_T").is_some() {
+                    eprintln!(
+                        "RESYNC 7x add-pair @{} (floor {floor}, end {endp})",
+                        head.bit_position()
+                    );
+                }
+                return Some((head, slots));
             }
-            return Some((head, slots));
+            None => {
+                brute_budget = brute_budget.saturating_sub(1);
+            }
         }
         e += 1;
-    }
     }
     None
 }
