@@ -536,6 +536,149 @@ pub(crate) fn discover_add_pair_body0_bound(
     None
 }
 
+/// Rebuild a cached section list's `sfb_cb` for a different scalefac
+/// bound (the 407m/407p caches share section parses across bounds;
+/// `sfb_cb` is sized to the bound it was first built with).
+fn refit_sfb_cb(mut secs: crate::asf_data::AsfSections, k: u32) -> crate::asf_data::AsfSections {
+    let mut cb = vec![0u8; k as usize];
+    for i in 0..secs.sect_cb.len() {
+        let c = secs.sect_cb[i];
+        let a = secs.sect_start[i] as usize;
+        let b = (secs.sect_end[i] as usize).min(k as usize);
+        for x in cb.iter_mut().take(b).skip(a) {
+            *x = c;
+        }
+    }
+    secs.sfb_cb = cb;
+    secs
+}
+
+/// Round-407p: joint body-bound search for the sub05 class — add
+/// pairs where BOTH bodies span past their scalefac bounds and
+/// body1's bound differs from the transmitted max_sfb, so the
+/// body1-closes-at-msfb discovery oracle can never accept the truth.
+/// Parses the (bmsp=1, long, sap 0/1/2) head shape, then sweeps
+/// (k0, k1) with section/spectral caching; every terminal position
+/// within trailer distance of the wall is a candidate for the
+/// caller's trailer oracle. Returns candidate (k0, k1, end) triples.
+fn resync_joint_bound_candidates(
+    head: BitReader<'_>,
+    cfg: &crate::aspx::AspxConfig,
+    frame_len_base: u32,
+    wall: u64,
+) -> Vec<(u32, u32, u64)> {
+    use crate::asf_data;
+    let mut out = Vec::new();
+    let mut hr = head;
+    let Ok(bmsp) = hr.read_bit() else { return out };
+    if !bmsp {
+        return out;
+    }
+    let Ok(blong) = hr.read_bit() else { return out };
+    if !blong {
+        return out;
+    }
+    let Ok(_msfb) = hr.read_u32(6) else { return out };
+    let Ok(sap) = hr.read_u32(2) else { return out };
+    if sap == 3 {
+        return out;
+    }
+    if sap == 1 {
+        let ms = aspx_core_band_count(cfg, frame_len_base).unwrap_or(50);
+        if hr.skip(ms).is_err() {
+            return out;
+        }
+    }
+    let ti = AsfTransformInfo {
+        b_long_frame: true,
+        transf_length: [0, 0],
+        transform_length_0: frame_len_base,
+        transform_length_1: frame_len_base,
+    };
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else {
+        return out;
+    };
+    let Some(num_sfb) = crate::tables::num_sfb_48(tl) else {
+        return out;
+    };
+    // body0 sweep with section/spectral cache
+    let mut c0: Option<(Vec<u16>, asf_data::AsfSections, Vec<u32>, BitReader)> = None;
+    for k0 in 1..=num_sfb {
+        let mut b0 = hr;
+        let Ok(s0) = asf_data::parse_asf_section_data_ext(&mut b0, tl_idx, tl, k0, true) else {
+            continue;
+        };
+        if s0.sect_cb.iter().any(|&cb| cb > 11) {
+            continue;
+        }
+        let g0: Vec<u16> = s0
+            .sect_end
+            .iter()
+            .copied()
+            .chain(s0.sect_cb.iter().map(|&c| c as u16))
+            .collect();
+        let (secs0, mqi0, mut r0) = match c0.as_ref() {
+            Some((g, cs, cm, cr)) if *g == g0 => (refit_sfb_cb(cs.clone(), k0), cm.clone(), *cr),
+            _ => {
+                let Ok((_q, m)) = asf_data::parse_asf_spectral_data(&mut b0, &s0, sfbo, k0)
+                else {
+                    continue;
+                };
+                c0 = Some((g0, s0.clone(), m.clone(), b0));
+                (s0, m, b0)
+            }
+        };
+        if asf_data::parse_asf_scalefac_data(&mut r0, &secs0, &mqi0, k0, tl).is_err() {
+            continue;
+        }
+        if asf_data::parse_asf_snf_data(&mut r0, &secs0, &mqi0, k0, tl).is_err() {
+            continue;
+        }
+        // body1 sweep from r0
+        let mut c1: Option<(Vec<u16>, asf_data::AsfSections, Vec<u32>, BitReader)> = None;
+        for k1 in 1..=num_sfb {
+            let mut b1 = r0;
+            let Ok(s1) = asf_data::parse_asf_section_data_ext(&mut b1, tl_idx, tl, k1, true)
+            else {
+                continue;
+            };
+            if s1.sect_cb.iter().any(|&cb| cb > 11) {
+                continue;
+            }
+            let g1: Vec<u16> = s1
+                .sect_end
+                .iter()
+                .copied()
+                .chain(s1.sect_cb.iter().map(|&c| c as u16))
+                .collect();
+            let (secs1, mqi1, mut r1) = match c1.as_ref() {
+                Some((g, cs, cm, cr)) if *g == g1 => (refit_sfb_cb(cs.clone(), k1), cm.clone(), *cr),
+                _ => {
+                    let Ok((_q, m)) = asf_data::parse_asf_spectral_data(&mut b1, &s1, sfbo, k1)
+                    else {
+                        continue;
+                    };
+                    c1 = Some((g1, s1.clone(), m.clone(), b1));
+                    (s1, m, b1)
+                }
+            };
+            if asf_data::parse_asf_scalefac_data(&mut r1, &secs1, &mqi1, k1, tl).is_err() {
+                continue;
+            }
+            if asf_data::parse_asf_snf_data(&mut r1, &secs1, &mqi1, k1, tl).is_err() {
+                continue;
+            }
+            let end = r1.bit_position();
+            if end < wall && wall - end <= 1200 {
+                out.push((k0, k1, end));
+            }
+        }
+    }
+    out
+}
+
 /// Round-407j: locate the I-frame trailer block's 1ch+final pair by
 /// hard constraints and return (1ch_start, slot2, slot3). See the
 /// call site for rationale.
@@ -612,7 +755,7 @@ pub(crate) fn resync_7x_addpair<'a>(
     cfg: &crate::aspx::AspxConfig,
     b_iframe: bool,
     frame_len_base: u32,
-) -> Option<(BitReader<'a>, [Option<u8>; 8])> {
+) -> Option<(BitReader<'a>, [Option<u8>; 8], Option<(u32, u32)>)> {
     let wall = tools.wall_bits?;
     // The additional pair + trailers never exceed ~9000 bits on real
     // content — scanning earlier positions only burns time.
@@ -650,8 +793,47 @@ pub(crate) fn resync_7x_addpair<'a>(
         let head = hr;
         let dbg = dbg_want == Some(e);
         let mut pr = hr;
-        let Ok(_d) = parse_two_channel_data_additional(&mut pr, frame_len_base, Some(cfg))
-        else {
+        let parsed = parse_two_channel_data_additional(&mut pr, frame_len_base, Some(cfg));
+        let Ok(_d) = parsed else {
+            // Round 407p (loose pass only): the sub05 class — both
+            // bodies span past their bounds and body1's bound differs
+            // from msfb — never parses under the production fn; sweep
+            // (k0, k1) jointly with the trailer chain as the oracle.
+            if !strict {
+                for (k0, k1, endj) in
+                    resync_joint_bound_candidates(hr, cfg, frame_len_base, wall)
+                {
+                    let mut jr = floor_br;
+                    if jr.skip((endj - floor) as u32).is_err() {
+                        break;
+                    }
+                    let mut jp = jr;
+                    if matches!(
+                        tools.seven_x_coding_config,
+                        Some(FiveXCodingConfig::Cfg0Stereo2plusMono)
+                            | Some(FiveXCodingConfig::Cfg2FourMono)
+                    ) && parse_mono_data(&mut jp, false, frame_len_base).is_err()
+                    {
+                        continue;
+                    }
+                    if let Some(slots) = validate_7x_trailers_slots_budgeted(
+                        jp,
+                        tools,
+                        cfg,
+                        b_iframe,
+                        frame_len_base,
+                        brute_budget > 0,
+                    ) {
+                        if std::env::var_os("AC4_T").is_some() {
+                            eprintln!(
+                                "RESYNC 7x add-pair(joint k0={k0} k1={k1}) @{}",
+                                head.bit_position()
+                            );
+                        }
+                        return Some((head, slots, Some((k0, k1))));
+                    }
+                }
+            }
             if dbg {
                 eprintln!("RSDBG e={e}: add-pair parse REJECT");
             }
@@ -711,7 +893,7 @@ pub(crate) fn resync_7x_addpair<'a>(
                         head.bit_position()
                     );
                 }
-                return Some((head, slots));
+                return Some((head, slots, None));
             }
             None => {
                 brute_budget = brute_budget.saturating_sub(1);
@@ -867,7 +1049,7 @@ pub(crate) fn discover_body_bound(
             .chain(sections.sect_cb.iter().map(|&c| c as u16))
             .collect();
         let (secs, mqi, mut tr) = match cache.as_ref() {
-            Some((g, cs, cm, cr)) if *g == geom => (cs.clone(), cm.clone(), *cr),
+            Some((g, cs, cm, cr)) if *g == geom => (refit_sfb_cb(cs.clone(), k), cm.clone(), *cr),
             _ => {
                 let Ok((_q, m)) = asf_data::parse_asf_spectral_data(&mut tr, &sections, sfbo, k)
                 else {
@@ -2231,7 +2413,7 @@ pub fn parse_7x_audio_data_outer(
         // ---- resync fallback (ASPX only — needs the trailer oracle) ----
         if !add_done && matches!(mode, SevenXCodecMode::Aspx) {
             if let Some(cfg) = add_cfg.as_ref() {
-                if let Some((head, slots)) =
+                if let Some((head, slots, joint)) =
                     resync_7x_addpair(switch_floor, tools, cfg, b_iframe, frame_len_base)
                 {
                     *br = head;
@@ -2241,7 +2423,42 @@ pub fn parse_7x_audio_data_outer(
                     // were not parsed — clear the stale slots.
                     tools.seven_x_b_use_sap_add_ch = None;
                     tools.seven_x_add_chparam_info = None;
-                    if let Ok(d) =
+                    if let Some((k0, k1)) = joint {
+                        // Round 407p: consume the head fields, then the
+                        // two bodies at the trailer-proven bounds.
+                        let ok = (|| -> Result<TwoChannelData> {
+                            let _bmsp = br.read_bit()?;
+                            let ti = parse_asf_transform_info(br, frame_len_base)?;
+                            let psy =
+                                parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
+                            let ms = aspx_core_band_count(cfg, ti.transform_length_0)
+                                .unwrap_or(psy.max_sfb_0);
+                            let chparam = parse_chparam_info(br, &[ms])?;
+                            let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(
+                                br, &ti, k0, true,
+                            );
+                            let b1 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(
+                                br, &ti, k1, true,
+                            );
+                            Ok(TwoChannelData {
+                                b_enable_mdct_stereo_proc: true,
+                                transform_info: Some(ti),
+                                psy_info: Some(psy),
+                                transform_info_1: None,
+                                psy_info_1: None,
+                                chparam: Some(chparam),
+                                scaled_spec_per_channel: vec![b0, b1],
+                                scaled_spec_windows_per_channel: vec![None, None],
+                            })
+                        })();
+                        if let Ok(d) = ok {
+                            if let Some(ti) = d.transform_info.as_ref() {
+                                update_largest(ti.transform_length_0, &mut largest_tl);
+                            }
+                            tools.seven_x_additional_channel_data = Some(d);
+                            add_done = true;
+                        }
+                    } else if let Ok(d) =
                         parse_two_channel_data_additional(br, frame_len_base, add_cfg.as_ref())
                     {
                         if let Some(ti) = d.transform_info.as_ref() {
