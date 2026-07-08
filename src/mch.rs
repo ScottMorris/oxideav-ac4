@@ -623,6 +623,10 @@ pub(crate) fn resync_7x_addpair<'a>(
     let ms = aspx_core_band_count(cfg, frame_len_base).unwrap_or(50);
     let floor = floor_br.bit_position();
     let hi = wall.saturating_sub(400);
+    // Two passes: the proven bmsp=1 signature first over the whole
+    // range; the looser bmsp=0 shape only if nothing matched (it
+    // otherwise steals earlier false positions from proven heads).
+    for allow_bmsp0 in [false, true] {
     let mut e = floor;
     let mut brute_budget: u32 = 16;
     while e < hi {
@@ -632,11 +636,68 @@ pub(crate) fn resync_7x_addpair<'a>(
             return None;
         }
         let head = hr;
-        // Cheap pattern gate.
+        // Cheap pattern gate. bmsp=1: shared sf_info + chparam.
+        // bmsp=0 (round 407k): two independent long sf_infos.
         let Ok(bmsp) = hr.read_bit() else { return None };
         if !bmsp {
-            e += 1;
-            continue;
+            if !allow_bmsp0 {
+                e += 1;
+                continue;
+            }
+            let Ok(bl0) = hr.read_bit() else { return None };
+            let Ok(m0f) = hr.read_u32(6) else { return None };
+            let Ok(bl1) = hr.read_bit() else { return None };
+            let Ok(m1f) = hr.read_u32(6) else { return None };
+            if !(bl0 && bl1 && m0f != 0 && m1f != 0) {
+                e += 1;
+                continue;
+            }
+            // body0 with its own field; body1 with the second.
+            if !legal_body_prefix(hr, &ti) {
+                e += 1;
+                continue;
+            }
+            let Some(b0m) = discover_add_pair_body0_bound(hr, &ti, m1f) else {
+                e += 1;
+                continue;
+            };
+            let mut vr = hr;
+            if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, b0m, true)
+                .is_none()
+            {
+                e += 1;
+                continue;
+            }
+            if crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(&mut vr, &ti, m1f, true)
+                .is_none()
+            {
+                e += 1;
+                continue;
+            }
+            if wall.saturating_sub(vr.bit_position()) > 1200 {
+                e += 1;
+                continue;
+            }
+            let ok = validate_7x_trailers_slots_budgeted(
+                vr,
+                tools,
+                cfg,
+                b_iframe,
+                frame_len_base,
+                brute_budget > 0,
+            );
+            if ok.is_none() {
+                brute_budget = brute_budget.saturating_sub(1);
+                e += 1;
+                continue;
+            }
+            if std::env::var_os("AC4_T").is_some() {
+                eprintln!(
+                    "RESYNC 7x add-pair(bmsp0) @{} (floor {floor}, m {m0f}/{m1f}, b0m {b0m})",
+                    head.bit_position()
+                );
+            }
+            return Some((head, ok.unwrap()));
         }
         let Ok(blong) = hr.read_bit() else { return None };
         if !blong {
@@ -649,13 +710,19 @@ pub(crate) fn resync_7x_addpair<'a>(
             continue;
         }
         let Ok(sap) = hr.read_u32(2) else { return None };
-        if sap == 3 {
-            e += 1;
-            continue;
-        }
-        if sap == 1 && hr.skip(ms).is_err() {
-            e += 1;
-            continue;
+        if sap == 1 {
+            if hr.skip(ms).is_err() {
+                e += 1;
+                continue;
+            }
+        } else if sap == 3 {
+            // Round 407k: sap_data heads exist on real frames (the
+            // frame-4/5 class) — consume it with the production
+            // parser over the aspx-core band count.
+            if crate::asf::parse_sap_data(&mut hr, &[ms]).is_err() {
+                e += 1;
+                continue;
+            }
         }
         let dbg = std::env::var("AC4_RESYNC_DEBUG")
             .ok()
@@ -728,6 +795,7 @@ pub(crate) fn resync_7x_addpair<'a>(
             return Some((head, slots));
         }
         e += 1;
+    }
     }
     None
 }
