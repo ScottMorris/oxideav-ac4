@@ -635,6 +635,12 @@ pub(crate) fn resync_7x_addpair<'a>(
     // the earlier hand-rolled long-only head patterns, extending
     // resync to short/grouped additional pairs (the dominant failure
     // class at 44.5% coverage).
+    // Two passes: the anchor-proven shape (bmsp=1 + long frame) wins
+    // outright; looser shapes (bmsp=0, grouped/short) only when no
+    // strict candidate exists anywhere — as first-class citizens they
+    // steal earlier false positions from proven heads (measured: a
+    // one-pass version cost 9pp of track-wide clean completion).
+    for strict in [true, false] {
     let mut e = floor;
     while e < hi {
         let mut hr = floor_br;
@@ -652,6 +658,13 @@ pub(crate) fn resync_7x_addpair<'a>(
             e += 1;
             continue;
         };
+        if strict
+            && !(_d.b_enable_mdct_stereo_proc
+                && _d.transform_info.as_ref().map(|t| t.b_long_frame) == Some(true))
+        {
+            e += 1;
+            continue;
+        }
         let endp = pr.bit_position();
         if endp >= wall || wall - endp > 1200 {
             if dbg {
@@ -690,6 +703,7 @@ pub(crate) fn resync_7x_addpair<'a>(
             }
         }
         e += 1;
+    }
     }
     None
 }
