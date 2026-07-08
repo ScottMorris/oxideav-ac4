@@ -950,25 +950,34 @@ pub(crate) fn validate_7x_trailers_slots_budgeted(
     let Some(wall) = tools.wall_bits else {
         return Some(tools.aspx_xover_slots); // no wall info — accept
     };
-    let attempt = |slots: [Option<u8>; 8]| -> bool {
+    let attempt = |slots: [Option<u8>; 8], f0_combo: u8| -> bool {
         let mut r2 = vr;
         let mut tt = tools.clone();
         tt.aspx_xover_slots = slots;
         tt.aspx_trailer_slot = 0;
-        for chs in [2u8, 2, 1, 2] {
+        for (i, &chs) in [2u8, 2, 1, 2].iter().enumerate() {
+            crate::aspx::set_f0_raw_mode((f0_combo >> i) & 1 == 1);
             let r = if chs == 1 {
                 crate::asf::parse_aspx_data_1ch_body(&mut r2, &mut tt, cfg, b_iframe, frame_len_base)
             } else {
                 crate::asf::parse_aspx_data_2ch_body(&mut r2, &mut tt, cfg, b_iframe, frame_len_base)
             };
             if r.is_err() || r2.bit_position() > wall {
+                crate::aspx::set_f0_raw_mode(false);
                 return false;
             }
         }
+        crate::aspx::set_f0_raw_mode(false);
         (0..=8).contains(&(wall as i64 - r2.bit_position() as i64))
     };
-    if attempt(tools.aspx_xover_slots) {
-        return Some(tools.aspx_xover_slots);
+    // Round 407q: the mixed-F0 phenomenon is not I-frame-only —
+    // P-frame trailers with dir-0 (F0-coded) envelopes need the same
+    // per-trailer mode sweep. Huffman-only first (cheap, historic),
+    // then the 15 mixed combos.
+    for combo in 0u8..16 {
+        if attempt(tools.aspx_xover_slots, combo) {
+            return Some(tools.aspx_xover_slots);
+        }
     }
     if b_iframe {
         // I-frames read their xovers from the bits — slots don't gate.
@@ -976,8 +985,12 @@ pub(crate) fn validate_7x_trailers_slots_budgeted(
     }
     // Last-known-good vector (persisted across frames) — cheap second try.
     if let Some(good) = tools.aspx_xover_slots_good {
-        if good != tools.aspx_xover_slots && attempt(good) {
-            return Some(good);
+        if good != tools.aspx_xover_slots {
+            for combo in 0u8..16 {
+                if attempt(good, combo) {
+                    return Some(good);
+                }
+            }
         }
     }
     // Round 407e postmortem: a free 8^4 vector search here OVERFITS —
