@@ -5220,6 +5220,75 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
+    fn debug_scan_mono_end() {
+        // Sweep production mono_data over starts; report exact-end hits
+        // on AC4_SCAN_TARGET. AC4_SCAN_LFE=1 uses the LFE flavour.
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").unwrap_or_else(|_| "2".into()).parse().unwrap();
+        let lfe = std::env::var_os("AC4_SCAN_LFE").is_some();
+        let data = std::fs::read(&path).expect("read");
+        let mut hits = 0;
+        for s0 in lo..target as usize {
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(s0 as u32).unwrap();
+            if crate::mch::parse_mono_data(&mut br, lfe, 2048).is_ok() && br.bit_position() == target {
+                eprintln!("MONO-HIT lfe={} start={s0} end={target}", lfe as u8);
+                hits += 1;
+            }
+        }
+        eprintln!("mono end-scan done, {hits} hits");
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_scan_5ch_m_end() {
+        // 5ch-at-51 with max_sfb OVERRIDE sweep: ti+psy read normally,
+        // then info+5 long bodies parsed at every m in 1..=63; report
+        // chains ending exactly at AC4_SCAN_TARGET. Also sweeps the
+        // psy-width hypothesis: header end offset AC4_SCAN_POS..HI.
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_POS_HI").ok().and_then(|v| v.parse().ok()).unwrap_or(lo + 1);
+        let data = std::fs::read(&path).expect("read");
+        let ti = AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: 2048,
+            transform_length_1: 2048,
+        };
+        let mut hits = 0;
+        for body_start_head in lo..hi {
+            for m in 1u32..=63 {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(body_start_head as u32).unwrap();
+                let Ok(_info) = crate::mch::parse_five_channel_info(&mut br, &[m]) else { continue };
+                let info_end = br.bit_position();
+                let mut ok = true;
+                let mut spans = Vec::new();
+                for _ch in 0..5 {
+                    let b0 = br.bit_position();
+                    if decode_asf_long_mono_body_with_max_sfb(&mut br, &ti, m).is_none() {
+                        ok = false;
+                        break;
+                    }
+                    spans.push((b0, br.bit_position()));
+                    if br.bit_position() > target { ok = false; break; }
+                }
+                if ok && br.bit_position() == target {
+                    hits += 1;
+                    eprintln!("5CH-M-HIT head_end={body_start_head} m={m} info_end={info_end} spans={spans:?}");
+                }
+            }
+        }
+        eprintln!("5ch m-sweep done, {hits} hits");
+    }
+
     fn debug_parse_7x_front_at() {
         // Two-hypothesis P-frame front test: parse three_channel_data +
         // two_channel_data starting at AC4_SCAN_POS..AC4_SCAN_POS_HI and
