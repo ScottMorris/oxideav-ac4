@@ -5158,6 +5158,68 @@ mod tests {
     #[ignore]
     #[test]
     #[ignore]
+    fn debug_scan_7x_front_chain() {
+        // P-frame front backchain with the PRODUCTION element parsers:
+        // find every start whose two_channel_data() ends exactly at
+        // AC4_SCAN_TARGET (the resync-proven sap-gate position), then
+        // chain three_channel_data() ending at each hit's start.
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").unwrap_or_else(|_| "40".into()).parse().unwrap();
+        let slack: u64 = std::env::var("AC4_SCAN_TSLACK").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let data = std::fs::read(&path).expect("read");
+        let mut hits2: Vec<u64> = Vec::new();
+        for s2 in lo..target as usize {
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(s2 as u32).unwrap();
+            if crate::mch::parse_two_channel_data(&mut br, 2048).is_ok() {
+                let e = br.bit_position();
+                if e >= target - slack && e <= target {
+                    eprintln!("2CH-HIT start={s2} end={e}");
+                    hits2.push(s2 as u64);
+                }
+            }
+        }
+        eprintln!("2ch pass done, {} hits", hits2.len());
+        for &h in &hits2 {
+            for s3 in lo..h as usize {
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(s3 as u32).unwrap();
+                if crate::mch::parse_three_channel_data(&mut br, 2048).is_ok()
+                    && br.bit_position() == h
+                {
+                    eprintln!("CHAIN: 3ch@{s3}..{h} + 2ch@{h}..target");
+                }
+            }
+        }
+        eprintln!("front chain scan done");
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_parse_7x_5ch_at() {
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let data = std::fs::read(&path).expect("read");
+        let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_POS_HI").ok().and_then(|v| v.parse().ok()).unwrap_or(pos + 1);
+        for p in pos..hi {
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(p as u32).unwrap();
+            match crate::mch::parse_five_channel_data(&mut br, 2048) {
+                Ok(_) => eprintln!("5CH@{p}: ok end@{}", br.bit_position()),
+                Err(e) => eprintln!("5CH@{p}: ERR {e:?} @{}", br.bit_position()),
+            }
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(p as u32).unwrap();
+            match crate::mch::parse_four_channel_data(&mut br, 2048) {
+                Ok(_) => eprintln!("4CH@{p}: ok end@{}", br.bit_position()),
+                Err(e) => eprintln!("4CH@{p}: ERR {e:?} @{}", br.bit_position()),
+            }
+        }
+    }
+
     fn debug_parse_7x_front_at() {
         // Two-hypothesis P-frame front test: parse three_channel_data +
         // two_channel_data starting at AC4_SCAN_POS..AC4_SCAN_POS_HI and
@@ -5193,6 +5255,8 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore]
     fn debug_parse_5ch_head_at() {
         let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
         let hi: usize = std::env::var("AC4_SCAN_POS_HI")
