@@ -5156,6 +5156,43 @@ mod tests {
     /// parsers at AC4_SCAN_POS and print everything.
     #[test]
     #[ignore]
+    #[test]
+    #[ignore]
+    fn debug_parse_7x_front_at() {
+        // Two-hypothesis P-frame front test: parse three_channel_data +
+        // two_channel_data starting at AC4_SCAN_POS..AC4_SCAN_POS_HI and
+        // report the chain end — compare against the resync-proven
+        // add-pair head (minus the sap gate) to pick the true grammar.
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let data = std::fs::read(&path).expect("read");
+        let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
+        let hi: usize = std::env::var("AC4_SCAN_POS_HI")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(pos + 1);
+        for p in pos..hi {
+            let mut br = BitReader::with_position(&data, 0);
+            br.skip(p as u32).unwrap();
+            let t0 = br.bit_position();
+            match crate::mch::parse_three_channel_data(&mut br, 2048) {
+                Ok(d) => {
+                    let t1 = br.bit_position();
+                    let (tl, m) = d
+                        .transform_info
+                        .as_ref()
+                        .map(|ti| (ti.transform_length_0, ti.b_long_frame))
+                        .unwrap_or((0, false));
+                    let m0 = d.psy_info.as_ref().map(|p| p.max_sfb_0).unwrap_or(0);
+                    eprintln!("3CH@{p}: ok [{t0}..{t1}) tl={tl} long={m} m0={m0}");
+                    match crate::mch::parse_two_channel_data(&mut br, 2048) {
+                        Ok(_) => eprintln!("  2CH: ok end@{}", br.bit_position()),
+                        Err(e) => eprintln!("  2CH: ERR {e:?} @{}", br.bit_position()),
+                    }
+                }
+                Err(e) => eprintln!("3CH@{p}: ERR {e:?} @{}", br.bit_position()),
+            }
+        }
+    }
+
     fn debug_parse_5ch_head_at() {
         let pos: usize = std::env::var("AC4_SCAN_POS").expect("AC4_SCAN_POS").parse().unwrap();
         let hi: usize = std::env::var("AC4_SCAN_POS_HI")

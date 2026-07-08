@@ -2245,6 +2245,15 @@ pub fn parse_7x_audio_data_outer(
         2 => FiveXCodingConfig::Cfg2FourMono,
         _ => FiveXCodingConfig::Cfg3Five,
     };
+    if std::env::var_os("AC4_TRACE_7X").is_some() {
+        eprintln!(
+            "7X iframe={} mode={:?} lfe_end_cc_start={} cc={} ",
+            b_iframe as u8,
+            mode,
+            br.bit_position() - 2,
+            cc
+        );
+    }
     tools.seven_x_coding_config = Some(coding_cfg);
     // Round 407d: remember where the channel-data switch starts — the
     // resync scan floor when the front walk desyncs.
