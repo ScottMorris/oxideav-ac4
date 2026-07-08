@@ -31,6 +31,23 @@ use crate::huffman::{
 };
 use crate::tables::num_sfb_48;
 
+
+/// Synthesis-war calibration: AC4_SF_GAIN_BITS=<k> adds k to the log2
+/// scale-factor gain exponent of every CODED band (reference-measured
+/// at ~+57.7 on frame 0 post-matrix vs the E-AC-3 decode of the same
+/// master; see riptide docs two-wars section). Sentinel / no-sf bands
+/// keep gain 1.0 and fall away relatively — they are not real audio.
+pub(crate) fn sf_gain_bits() -> f32 {
+    use std::sync::OnceLock;
+    static K: OnceLock<f32> = OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("AC4_SF_GAIN_BITS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+    })
+}
+
 /// Decoded section information for one window group.
 #[derive(Debug, Default, Clone)]
 pub struct AsfSections {
@@ -310,13 +327,26 @@ pub fn parse_asf_scalefac_data(
         let sf = scale_factor;
         let exp = if std::env::var_os("AC4_SF_LEGACY_UNSIGNED").is_some() {
             (sf as f32 - 100.0) * 0.25
+        } else if std::env::var_os("AC4_SF_INVERT").is_some() {
+            // Synthesis-war probe: inverted semantics — sf is a
+            // quantizer-step exponent (bigger = quieter). Frame-0
+            // evidence: near-silent LFE ref=246, loud bodies 70-134.
+            (100.0 - sf as f32) * 0.25
+        } else if std::env::var_os("AC4_SF_REL").is_some() {
+            // Synthesis-war probe: sf relative to the body's
+            // reference_scale_factor (per-body level comes from
+            // elsewhere — SAP gains / global normalization).
+            (sf - reference_scale_factor as i32) as f32 * 0.25
         } else {
             // Round 407: signed 8-bit scale factors (see the grouped
             // variant above for the full story).
             let s8 = ((sf + 128) & 0xFF) - 128;
             (s8 as f32 - 100.0) * 0.25
         };
-        sf_gain[sfb] = 2.0_f32.powf(exp);
+        sf_gain[sfb] = 2.0_f32.powf(exp + sf_gain_bits());
+        if std::env::var_os("AC4_DUMP_SF").is_some() {
+            eprintln!("SFDUMP ref={reference_scale_factor} sfb={sfb} sf={sf} cb={}", sections.sfb_cb.get(sfb).copied().unwrap_or(255));
+        }
     }
     Ok(sf_gain)
 }
@@ -478,6 +508,13 @@ pub fn parse_asf_scalefac_data_grouped(
             let sf = scale_factor;
             let exp = if std::env::var_os("AC4_SF_LEGACY_UNSIGNED").is_some() {
                 (sf as f32 - 100.0) * 0.25
+            } else if std::env::var_os("AC4_SF_INVERT").is_some() {
+                // Synthesis-war probe: inverted semantics — see the
+                // non-grouped variant.
+                (100.0 - sf as f32) * 0.25
+            } else if std::env::var_os("AC4_SF_REL").is_some() {
+                // Synthesis-war probe: see non-grouped variant.
+                (sf - reference_scale_factor as i32) as f32 * 0.25
             } else {
                 // Round 407: scale factors are SIGNED 8-bit — real streams
                 // carry ref values like 246 (= -10) on near-silent
@@ -487,7 +524,7 @@ pub fn parse_asf_scalefac_data_grouped(
                 let s8 = ((sf + 128) & 0xFF) - 128;
                 (s8 as f32 - 100.0) * 0.25
             };
-            sf_gain[sfb] = 2.0_f32.powf(exp);
+            sf_gain[sfb] = 2.0_f32.powf(exp + sf_gain_bits());
         }
         out.push(sf_gain);
     }

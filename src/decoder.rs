@@ -583,8 +583,23 @@ impl Ac4Decoder {
 
     /// Convert an f32 PCM buffer to i16, clamping to the i16 range.
     fn pcm_f32_to_i16(pcm: &[f32]) -> Vec<i16> {
+        // Synthesis-war probe: AC4_OUT_GAIN_LOG2=<k> scales the f32 PCM
+        // by 2^k before the i16 conversion. The signed-SF dequant law
+        // leaves coded-band content ~2^58 below the sentinel bands (see
+        // riptide docs, two-wars section) — this knob lets the
+        // reference-correlation harness calibrate the missing global
+        // constant without touching the dequant path.
+        use std::sync::OnceLock;
+        static GAIN: OnceLock<f32> = OnceLock::new();
+        let g = *GAIN.get_or_init(|| {
+            std::env::var("AC4_OUT_GAIN_LOG2")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|k| 2.0_f32.powf(k))
+                .unwrap_or(1.0)
+        });
         pcm.iter()
-            .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .map(|&s| (s * g * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect()
     }
 
