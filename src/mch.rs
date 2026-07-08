@@ -621,6 +621,15 @@ pub(crate) fn resync_7x_addpair<'a>(
         transform_length_1: frame_len_base,
     };
     let ms = aspx_core_band_count(cfg, frame_len_base).unwrap_or(50);
+    // The additional pair + trailers never exceed ~9000 bits on real
+    // content (largest observed: frame-0's ~6400) — scanning earlier
+    // positions only burns time on impossible candidates.
+    let mut floor_br = floor_br;
+    let floor0 = floor_br.bit_position();
+    let floor_min = wall.saturating_sub(9000);
+    if floor0 < floor_min {
+        let _ = floor_br.skip((floor_min - floor0) as u32);
+    }
     let floor = floor_br.bit_position();
     let hi = wall.saturating_sub(400);
     // Two passes: the proven bmsp=1 signature first over the whole
@@ -922,6 +931,13 @@ pub(crate) fn discover_body_bound(
     // header demonstrably does not describe.
     let hint = hint.min(num_sfb).max(1);
     let candidates = std::iter::once(hint).chain((1..=num_sfb).filter(move |&k| k != hint));
+    // Round 407m perf: for a given start, the section list (and hence
+    // the spectral parse) is identical across every k that stops the
+    // section loop at the same boundary — for the common
+    // single-section bodies that's ALL k. Cache (sections, mqi,
+    // post-spectral reader) keyed by the section geometry so the
+    // 63-candidate sweep re-parses only the tiny scalefac/SNF tails.
+    let mut cache: Option<(Vec<u16>, asf_data::AsfSections, Vec<u32>, BitReader)> = None;
     for k in candidates {
         let mut tr = br0;
         let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut tr, tl_idx, tl, k, true)
@@ -930,14 +946,27 @@ pub(crate) fn discover_body_bound(
         };
         // NOTE: cb 12-15 sentinel sections are real on some frames —
         // no legality filter here (that's a scan-side discriminator).
-        let Ok((_q, mqi)) = asf_data::parse_asf_spectral_data(&mut tr, &sections, sfbo, k)
-        else {
-            continue;
+        let geom: Vec<u16> = sections
+            .sect_end
+            .iter()
+            .copied()
+            .chain(sections.sect_cb.iter().map(|&c| c as u16))
+            .collect();
+        let (secs, mqi, mut tr) = match cache.as_ref() {
+            Some((g, cs, cm, cr)) if *g == geom => (cs.clone(), cm.clone(), *cr),
+            _ => {
+                let Ok((_q, m)) = asf_data::parse_asf_spectral_data(&mut tr, &sections, sfbo, k)
+                else {
+                    continue;
+                };
+                cache = Some((geom, sections.clone(), m.clone(), tr));
+                (sections, m, tr)
+            }
         };
-        if asf_data::parse_asf_scalefac_data(&mut tr, &sections, &mqi, k, tl).is_err() {
+        if asf_data::parse_asf_scalefac_data(&mut tr, &secs, &mqi, k, tl).is_err() {
             continue;
         }
-        if asf_data::parse_asf_snf_data(&mut tr, &sections, &mqi, k, tl).is_err() {
+        if asf_data::parse_asf_snf_data(&mut tr, &secs, &mqi, k, tl).is_err() {
             continue;
         }
         if oracle(tr) {
@@ -954,9 +983,9 @@ pub(crate) fn discover_body_bound(
 pub(crate) fn legal_body_prefix(mut br: BitReader<'_>, ti: &AsfTransformInfo) -> bool {
     use crate::asf_data;
     let tl = ti.transform_length_0;
-    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else {
+    if crate::sfb_offset::sfb_offset_48(tl).is_none() {
         return false;
-    };
+    }
     let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut br, ti.transf_length[0], tl, 1, true)
     else {
         return false;
@@ -964,7 +993,22 @@ pub(crate) fn legal_body_prefix(mut br: BitReader<'_>, ti: &AsfTransformInfo) ->
     if sections.sect_cb.iter().any(|&cb| cb > 11) {
         return false;
     }
-    asf_data::parse_asf_spectral_data(&mut br, &sections, sfbo, 1).is_ok()
+    // Round 407m perf: bounded probe — decode at most 8 spectral
+    // codewords of the first coded section instead of the whole body.
+    // Nearly as selective against garbage, and O(1) instead of
+    // O(body) at the thousands of positions the resync scan visits.
+    let Some(&cb) = sections.sect_cb.iter().find(|&&c| c != 0 && c <= 11) else {
+        return true; // all-zero/sentinel sections: nothing to probe
+    };
+    let Some(hcb) = crate::huffman::asf_hcb(cb as u32) else {
+        return false;
+    };
+    for _ in 0..8 {
+        if crate::huffman::huff_decode(&mut br, hcb.len, hcb.cw).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 /// The additional-channel pair's FIRST body gates scalefac/SNF over
