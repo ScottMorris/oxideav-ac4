@@ -3715,6 +3715,7 @@ pub fn walk_ac4_substream_sticky(
     if substream_bytes.is_empty() {
         return Err(Error::invalid("ac4: empty substream"));
     }
+    let walk_t0 = std::time::Instant::now();
     // AC4_DUMP_SUBS=<dir>: save raw substreams as subNN.bin for the
     // offline boundary-scan harnesses (debug_scan_* tests).
     if let Some(dir) = std::env::var_os("AC4_DUMP_SUBS") {
@@ -3854,10 +3855,12 @@ pub fn walk_ac4_substream_sticky(
     if std::env::var_os("AC4_PARSE_STATS").is_some() {
         let consumed = br.bit_position() as i64 / 8 - audio_data_offset as i64;
         eprintln!(
-            "AC4_PARSE_STATS delta={} complete={} slots={:?}",
+            "AC4_PARSE_STATS delta={} complete={} slots={:?} ch={} ms={}",
             audio_size as i64 - consumed,
             tools.walk_complete as u8,
-            &tools.aspx_xover_slots[..4]
+            &tools.aspx_xover_slots[..4],
+            channels,
+            walk_t0.elapsed().as_millis()
         );
     }
 

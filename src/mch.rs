@@ -2187,6 +2187,11 @@ pub fn parse_7x_audio_data_outer(
     b_iframe: bool,
     frame_len_base: u32,
 ) -> Result<()> {
+    // AC4_PHASE_TIMING=1: coarse per-phase wall-clock breakdown of the
+    // 7_X walk (front / add-pair / resync / F0-combo / trailer-commit)
+    // for hunting the research-tax hot spots.
+    let _pt = std::env::var_os("AC4_PHASE_TIMING").is_some();
+    let _pt0 = std::time::Instant::now();
     // 7_X_codec_mode (2 bits — Table 98).
     let mode_bits = br.read_u32(2)?;
     let mode = SevenXCodecMode::from_u32(mode_bits);
@@ -2353,12 +2358,16 @@ pub fn parse_7x_audio_data_outer(
         }
     }
 
+    let _pt_front = _pt0.elapsed();
+    let mut _pt_add = std::time::Duration::ZERO;
+    let mut _pt_resync = std::time::Duration::ZERO;
     // SIMPLE / ASPX additional-channel block: optional `chparam_info()×2`
     // gated on `b_use_sap_add_ch`, then a `two_channel_data()` carrying
     // the extra 2 channels (the front-extension or surround-back pair).
     if matches!(mode, SevenXCodecMode::Simple | SevenXCodecMode::Aspx) {
         let add_cfg = tools.aspx_config.clone();
         let mut add_done = false;
+        let _pt_a0 = std::time::Instant::now();
         // ---- normal attempt (only from a healthy front walk) ----
         let normal_save = *br;
         'normal: {
@@ -2426,6 +2435,8 @@ pub fn parse_7x_audio_data_outer(
                 }
             }
         }
+        _pt_add = _pt_a0.elapsed();
+        let _pt_r0 = std::time::Instant::now();
         // ---- resync fallback (ASPX only — needs the trailer oracle) ----
         if !add_done && matches!(mode, SevenXCodecMode::Aspx) {
             if let Some(cfg) = add_cfg.as_ref() {
@@ -2486,6 +2497,7 @@ pub fn parse_7x_audio_data_outer(
                 }
             }
         }
+        _pt_resync = _pt_r0.elapsed();
         if !add_done {
             *br = normal_save;
             return Ok(());
@@ -2587,6 +2599,7 @@ pub fn parse_7x_audio_data_outer(
     // closes) and commit the first whose chain ends within 8 bits of
     // the wall.
     let mut f0_combo: u8 = 0;
+    let _pt_c0 = std::time::Instant::now();
     if matches!(mode, SevenXCodecMode::Aspx) {
         if let Some(w) = tools.wall_bits {
             let mut combos: Vec<u8> = (0u8..16).collect();
@@ -2639,6 +2652,8 @@ pub fn parse_7x_audio_data_outer(
             }
         }
     }
+    let _pt_combo = _pt_c0.elapsed();
+    let _pt_t0 = std::time::Instant::now();
     let trailer_floor_br = *br;
     if !matches!(mode, SevenXCodecMode::Simple) {
         crate::aspx::set_f0_raw_mode(f0_combo & 1 == 1);
@@ -2754,6 +2769,17 @@ pub fn parse_7x_audio_data_outer(
                 tools.acpl_data_1ch_pair[1] = Some(d1);
             }
         }
+    }
+    if _pt {
+        eprintln!(
+            "PHASE front={}ms add={}ms resync={}ms combo={}ms trail={}ms total={}ms",
+            _pt_front.as_millis(),
+            _pt_add.as_millis(),
+            _pt_resync.as_millis(),
+            _pt_combo.as_millis(),
+            _pt_t0.elapsed().as_millis(),
+            _pt0.elapsed().as_millis()
+        );
     }
     tools.walk_complete = true;
     Ok(())
