@@ -536,6 +536,66 @@ pub(crate) fn discover_add_pair_body0_bound(
     None
 }
 
+/// Round-407j: locate the I-frame trailer block's 1ch+final pair by
+/// hard constraints and return (1ch_start, slot2, slot3). See the
+/// call site for rationale.
+fn scan_iframe_tail_slots(
+    floor_br: BitReader<'_>,
+    wall: u64,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    frame_len_base: u32,
+) -> Option<(u64, u8, u8)> {
+    let floor = floor_br.bit_position();
+    let hi = wall.saturating_sub(40);
+    let mut e = floor;
+    while e < hi {
+        let mut hr = floor_br;
+        if hr.skip((e - floor) as u32).is_err() {
+            return None;
+        }
+        // '000' xover gate for the 1ch (five-frame-proven slot 2 = 0).
+        let probe = hr;
+        {
+            let mut g = probe;
+            match g.read_u32(3) {
+                Ok(0) => {}
+                _ => {
+                    e += 1;
+                    continue;
+                }
+            }
+        }
+        let mut vt = tools.clone();
+        vt.aspx_trailer_slot = 2;
+        let mut vr = probe;
+        if crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut vt, cfg, true, frame_len_base)
+            .is_err()
+        {
+            e += 1;
+            continue;
+        }
+        let y = vr.bit_position();
+        // final 2ch parse; its own xover read fills slot 3.
+        if crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut vt, cfg, true, frame_len_base)
+            .is_err()
+        {
+            e += 1;
+            continue;
+        }
+        if vr.bit_position() > wall || !(0..=8).contains(&(wall as i64 - vr.bit_position() as i64))
+        {
+            e += 1;
+            continue;
+        }
+        let s2 = vt.aspx_xover_slots[2]?;
+        let s3 = vt.aspx_xover_slots[3]?;
+        let _ = y;
+        return Some((e, s2, s3));
+    }
+    None
+}
+
 /// Round-407d resync-by-signature: starting from `floor_br`, scan bit
 /// positions for the PROVEN additional-pair head signature
 /// ([bmsp=1][blong=1][msfb!=0][sap!=3], with sap=1 implying the
@@ -2258,7 +2318,71 @@ pub fn parse_7x_audio_data_outer(
     // + aspx_data_1ch }` — covers the L/R + Ls/Rs front pair and the
     // additional-channel pair plus the centre mono.
     let _ttr = std::env::var_os("AC4_TRACE_BODIES").is_some();
+    // Round 407j: per-trailer F0-coding-mode search. Frame-0's
+    // fully-gated unique closure proves some trailers code their
+    // first envelope values as fixed-width raw fields while others
+    // use Table-58 Huffman (observed raw,raw,huff,huff); the selector
+    // rule is unknown, so for the 4-trailer ASPX layout we search the
+    // 16 per-trailer combinations on a reader copy (Huffman-first
+    // order — proven frames keep their old parse when it already
+    // closes) and commit the first whose chain ends within 8 bits of
+    // the wall.
+    let mut f0_combo: u8 = 0;
+    if matches!(mode, SevenXCodecMode::Aspx) {
+        if let Some(w) = tools.wall_bits {
+            let mut combos: Vec<u8> = (0u8..16).collect();
+            combos.sort_by_key(|c| (c.count_ones(), *c));
+            // The anchor-proven frame-0 pattern (raw,raw,huff,huff =
+            // 0b0011) goes first: the all-Huffman parse ALSO reaches
+            // the wall on rich I-frames (that's exactly the 31-bit
+            // masked drift this search exists to fix), so wall
+            // closure alone cannot rank them — the proven pattern
+            // wins ties by ordering. P-frame trailers are delta-time
+            // coded (no F0 reads), so this choice is a no-op there.
+            combos.retain(|&c| c != 3);
+            combos.insert(0, 3);
+            'combo: for &combo in &combos {
+                let mut vb = *br;
+                let mut vt = tools.clone();
+                let mut ok = true;
+                for (i, &chs) in [2u8, 2, 1, 2].iter().enumerate() {
+                    crate::aspx::set_f0_raw_mode((combo >> i) & 1 == 1);
+                    let r = if chs == 1 {
+                        crate::asf::parse_aspx_data_1ch_body(
+                            &mut vb,
+                            &mut vt,
+                            &aspx_cfg,
+                            b_iframe,
+                            frame_len_base,
+                        )
+                    } else {
+                        crate::asf::parse_aspx_data_2ch_body(
+                            &mut vb,
+                            &mut vt,
+                            &aspx_cfg,
+                            b_iframe,
+                            frame_len_base,
+                        )
+                    };
+                    if r.is_err() || vb.bit_position() > w {
+                        ok = false;
+                        break;
+                    }
+                }
+                crate::aspx::set_f0_raw_mode(false);
+                if ok && (0..=8).contains(&(w as i64 - vb.bit_position() as i64)) {
+                    f0_combo = combo;
+                    if std::env::var_os("AC4_T").is_some() && combo != 0 {
+                        eprintln!("F0 combo {combo:04b} selected @{}", br.bit_position());
+                    }
+                    break 'combo;
+                }
+            }
+        }
+    }
+    let trailer_floor_br = *br;
     if !matches!(mode, SevenXCodecMode::Simple) {
+        crate::aspx::set_f0_raw_mode(f0_combo & 1 == 1);
         let _t0 = br.bit_position();
         if let Err(e) =
             crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
@@ -2272,9 +2396,11 @@ pub fn parse_7x_audio_data_outer(
             eprintln!("TRL#1 2ch [{_t0}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
         let _t1 = br.bit_position();
+        crate::aspx::set_f0_raw_mode((f0_combo >> 1) & 1 == 1);
         if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
+            crate::aspx::set_f0_raw_mode(false);
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-2ch#2 @{}", br.bit_position()); }
             return Ok(());
         }
@@ -2282,9 +2408,11 @@ pub fn parse_7x_audio_data_outer(
             eprintln!("TRL#2 2ch [{_t1}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
         let _t2 = br.bit_position();
+        crate::aspx::set_f0_raw_mode((f0_combo >> 2) & 1 == 1);
         if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
+            crate::aspx::set_f0_raw_mode(false);
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-1ch @{}", br.bit_position()); }
             return Ok(());
         }
@@ -2297,11 +2425,40 @@ pub fn parse_7x_audio_data_outer(
     // ASPX_ACPL_{1,2} paths fold the additional-channel ASPX into the
     // single aspx_data_1ch above).
     if matches!(mode, SevenXCodecMode::Aspx) {
-        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
-        {
+        crate::aspx::set_f0_raw_mode((f0_combo >> 3) & 1 == 1);
+        let r = crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base);
+        crate::aspx::set_f0_raw_mode(false);
+        if r.is_err() {
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-extra @{}", br.bit_position()); }
             return Ok(());
+        }
+        // Round 407j: I-frame slot-harvest repair. The linear parse's
+        // internal boundaries can drift (the trailer-1/2 F0 quirk),
+        // corrupting slots [2]/[3] that every following P-frame needs.
+        // The 1ch+final tail pair is uniquely locatable by hard
+        // constraints ('000' xover for the 1ch — five-frame-proven
+        // slot 2 = 0 on this content class — then a final 2ch parse
+        // ending within 8 bits of the wall); rescan and overwrite the
+        // harvested tail slots from the anchored reads.
+        if b_iframe {
+            if let Some(w) = tools.wall_bits {
+                if let Some((x2, s2, s3)) =
+                    scan_iframe_tail_slots(trailer_floor_br, w, tools, &aspx_cfg, frame_len_base)
+                {
+                    if tools.aspx_xover_slots[2] != Some(s2)
+                        || tools.aspx_xover_slots[3] != Some(s3)
+                    {
+                        if std::env::var_os("AC4_T").is_some() {
+                            eprintln!(
+                                "SLOT-REPAIR 1ch@{x2}: slots[2] {:?}->{s2} slots[3] {:?}->{s3}",
+                                tools.aspx_xover_slots[2], tools.aspx_xover_slots[3]
+                            );
+                        }
+                        tools.aspx_xover_slots[2] = Some(s2);
+                        tools.aspx_xover_slots[3] = Some(s3);
+                    }
+                }
+            }
         }
     }
 

@@ -1950,6 +1950,24 @@ pub struct AspxHuffEnv {
 ///
 /// `data_type`, `quant_mode`, `stereo_mode` drive `get_aspx_hcb()`
 /// selection.
+/// Round-407j: per-trailer F0 coding mode. Frame-0's fully-gated
+/// unique closure proves the first-envelope values of SOME trailers
+/// are fixed-width raw fields while others are Table-58 Huffman —
+/// the selector rule is unknown, so the trailer walker searches the
+/// per-trailer mode combination against the wall/slot gates and sets
+/// this flag around each parse. Not thread-isolated: the decoder is
+/// single-threaded per substream.
+static F0_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the F0 coding mode for subsequent `aspx_huff_data` parses.
+pub fn set_f0_raw_mode(raw: bool) {
+    F0_RAW_MODE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn f0_raw_mode() -> bool {
+    F0_RAW_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn parse_aspx_huff_data(
     br: &mut BitReader<'_>,
     data_type: AspxDataType,
@@ -1969,24 +1987,22 @@ pub fn parse_aspx_huff_data(
         // closes them unanimously). Widths are being pinned via a
         // second I-frame anchor; until then the raw path is env-gated:
         // AC4_F0_SIG_BITS / AC4_F0_NOISE_BITS.
-        let raw_bits = match data_type {
-            AspxDataType::Signal => std::env::var("AC4_F0_SIG_BITS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok()),
-            AspxDataType::Noise => std::env::var("AC4_F0_NOISE_BITS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok()),
-        };
         if num_sbg >= 1 {
-            if let Some(bits) = raw_bits {
-                out.push(br.read_u32(bits)? as i32);
+            let hcb_f0 = lookup_aspx_hcb(get_aspx_hcb(
+                data_type,
+                quant_mode,
+                stereo_mode,
+                AspxHcbType::F0,
+            ));
+            if f0_raw_mode() {
+                // Raw width = ceil(log2(alphabet)) of the F0 codebook.
+                let n = hcb_f0.len.len() as u32;
+                let mut w = 0u32;
+                while (1u32 << w) < n {
+                    w += 1;
+                }
+                out.push(br.read_u32(w)? as i32);
             } else {
-                let hcb_f0 = lookup_aspx_hcb(get_aspx_hcb(
-                    data_type,
-                    quant_mode,
-                    stereo_mode,
-                    AspxHcbType::F0,
-                ));
                 out.push(hcb_f0.decode_delta(br)?);
             }
         }

@@ -1995,11 +1995,12 @@ pub(crate) fn parse_aspx_data_1ch_body(
     };
     let nats = aspx::num_aspx_timeslots(frame_len_base);
     let framing = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
-    let qmode = if matches!(framing.int_class, aspx::AspxIntClass::FixFix) && framing.num_env == 1 {
-        aspx::AspxQuantStep::Fine
-    } else {
-        cfg.quant_mode_env
-    };
+    // Round 407j: Table 52/51's "FIXFIX + num_env==1 forces qmode 0"
+    // override is NOT what this encoder does — the anchor-proven
+    // frame-0 trailer chain closes ONLY with the flat config qmode
+    // (per-channel override breaks the unique closure). Documented
+    // deviation; flat wins by anchor.
+    let qmode = cfg.quant_mode_env;
     tools.aspx_qmode_env_primary = Some(qmode);
     let dd = aspx::parse_aspx_delta_dir(br, &framing)?;
     // Round 407f: per-envelope frequency resolution is DERIVED for
@@ -2093,13 +2094,8 @@ pub(crate) fn parse_aspx_data_2ch_body(
     // Per Table 52: `aspx_qmode_env[0] = aspx_qmode_env[1]
     // = aspx_quant_mode_env` then clamp to 0 on FIXFIX +
     // num_env == 1.
-    let qmode_ch0 = if matches!(framing_ch0.int_class, aspx::AspxIntClass::FixFix)
-        && framing_ch0.num_env == 1
-    {
-        aspx::AspxQuantStep::Fine
-    } else {
-        cfg.quant_mode_env
-    };
+    // Round 407j: flat qmode (see the 1ch site note).
+    let qmode_ch0 = cfg.quant_mode_env;
     tools.aspx_qmode_env_primary = Some(qmode_ch0);
     // Table 52: aspx_balance (1 bit). If 0, aspx_framing(1)
     // follows for channel 1; otherwise channel 1 reuses
@@ -2111,13 +2107,7 @@ pub(crate) fn parse_aspx_data_2ch_body(
         let framing_ch1 = aspx::parse_aspx_framing(br, cfg, b_iframe, nats > 8)?;
         // Per Table 52 the ch1 qmode is recomputed against the ch1
         // framing (and re-clamped on FIXFIX + num_env == 1).
-        let qmode_ch1 = if matches!(framing_ch1.int_class, aspx::AspxIntClass::FixFix)
-            && framing_ch1.num_env == 1
-        {
-            aspx::AspxQuantStep::Fine
-        } else {
-            cfg.quant_mode_env
-        };
+        let qmode_ch1 = cfg.quant_mode_env;
         tools.aspx_qmode_env_secondary = Some(qmode_ch1);
         tools.aspx_framing_secondary = Some(framing_ch1);
         framing_ch1_ref = tools.aspx_framing_secondary.as_ref();
