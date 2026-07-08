@@ -660,9 +660,23 @@ pub(crate) fn resync_7x_addpair<'a>(
         };
         if strict
             && !(_d.b_enable_mdct_stereo_proc
-                && _d.transform_info.as_ref().map(|t| t.b_long_frame) == Some(true)
-                && _d.chparam.as_ref().map(|c| c.sap_mode != 3).unwrap_or(false))
+                && _d.transform_info.as_ref().map(|t| t.b_long_frame) == Some(true))
         {
+            e += 1;
+            continue;
+        }
+        // coding_config 0/2 place a mono_data(0) between the additional
+        // pair and the trailers (Table 33) — the validation chain must
+        // include it or fakes pass the clone and break the real walk.
+        if matches!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg0Stereo2plusMono)
+                | Some(FiveXCodingConfig::Cfg2FourMono)
+        ) && parse_mono_data(&mut pr, false, frame_len_base).is_err()
+        {
+            if dbg {
+                eprintln!("RSDBG e={e}: cc0/2 mono REJECT");
+            }
             e += 1;
             continue;
         }
