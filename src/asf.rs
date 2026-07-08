@@ -4278,35 +4278,46 @@ mod tests {
         let _mode = cbr.read_u32(2).unwrap();
         let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
         eprintln!("TSLOT file={path} tstart={tstart} wall={wall}");
-        for combo in 0u32..4096 {
-            let slots = [
-                (combo & 7) as u8,
-                ((combo >> 3) & 7) as u8,
-                ((combo >> 6) & 7) as u8,
-                ((combo >> 9) & 7) as u8,
-            ];
-            let mut br = BitReader::with_position(&data, 0);
-            br.skip(tstart as u32).unwrap();
-            let mut tools = SubstreamTools::default();
-            for (i, &x) in slots.iter().enumerate() {
-                tools.aspx_xover_slots[i] = Some(x);
-            }
-            let mut ok = true;
-            for chs in [2u8, 2, 1, 2] {
-                let r = if chs == 1 {
-                    parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, false, 2048)
-                } else {
-                    parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, false, 2048)
-                };
-                if r.is_err() || br.bit_position() > wall {
-                    ok = false;
-                    break;
+        // Round 407g: also sweep the 1ch's position within the block
+        // (order hypothesis) — Table 33 says [2,2,1,2] but that
+        // assumption has never been independently proven.
+        let orders: [[u8; 4]; 4] = [
+            [1, 2, 2, 2],
+            [2, 1, 2, 2],
+            [2, 2, 1, 2],
+            [2, 2, 2, 1],
+        ];
+        for (oi, order) in orders.iter().enumerate() {
+            for combo in 0u32..4096 {
+                let slots = [
+                    (combo & 7) as u8,
+                    ((combo >> 3) & 7) as u8,
+                    ((combo >> 6) & 7) as u8,
+                    ((combo >> 9) & 7) as u8,
+                ];
+                let mut br = BitReader::with_position(&data, 0);
+                br.skip(tstart as u32).unwrap();
+                let mut tools = SubstreamTools::default();
+                for (i, &x) in slots.iter().enumerate() {
+                    tools.aspx_xover_slots[i] = Some(x);
                 }
-            }
-            if ok {
-                let slack = wall as i64 - br.bit_position() as i64;
-                if (0..=8).contains(&slack) {
-                    eprintln!("TSLOT hit: slots={slots:?} slack={slack}");
+                let mut ok = true;
+                for &chs in order.iter() {
+                    let r = if chs == 1 {
+                        parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                    } else {
+                        parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, false, 2048)
+                    };
+                    if r.is_err() || br.bit_position() > wall {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok {
+                    let slack = wall as i64 - br.bit_position() as i64;
+                    if (0..=8).contains(&slack) {
+                        eprintln!("TSLOT hit: order#{oi}={order:?} slots={slots:?} slack={slack}");
+                    }
                 }
             }
         }
