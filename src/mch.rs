@@ -660,7 +660,8 @@ pub(crate) fn resync_7x_addpair<'a>(
         };
         if strict
             && !(_d.b_enable_mdct_stereo_proc
-                && _d.transform_info.as_ref().map(|t| t.b_long_frame) == Some(true))
+                && _d.transform_info.as_ref().map(|t| t.b_long_frame) == Some(true)
+                && _d.chparam.as_ref().map(|c| c.sap_mode != 3).unwrap_or(false))
         {
             e += 1;
             continue;
