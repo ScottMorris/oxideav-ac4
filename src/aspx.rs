@@ -1960,15 +1960,35 @@ pub fn parse_aspx_huff_data(
 ) -> Result<AspxHuffEnv> {
     let mut out = Vec::with_capacity(num_sbg as usize);
     if !direction {
-        // FREQ — F0 for index 0, DF for the rest.
-        let hcb_f0 = lookup_aspx_hcb(get_aspx_hcb(
-            data_type,
-            quant_mode,
-            stereo_mode,
-            AspxHcbType::F0,
-        ));
+        // FREQ — first value, then DF deltas.
+        //
+        // Round 407h: exhaustive backchaining on the pinned frame-0
+        // trailer pair proves the FIRST value is a FIXED-WIDTH RAW
+        // field on real content, not the Table-58 Huffman F0 read
+        // (no Huffman-F0 parametrization closes the anchors; raw-F0
+        // closes them unanimously). Widths are being pinned via a
+        // second I-frame anchor; until then the raw path is env-gated:
+        // AC4_F0_SIG_BITS / AC4_F0_NOISE_BITS.
+        let raw_bits = match data_type {
+            AspxDataType::Signal => std::env::var("AC4_F0_SIG_BITS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+            AspxDataType::Noise => std::env::var("AC4_F0_NOISE_BITS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok()),
+        };
         if num_sbg >= 1 {
-            out.push(hcb_f0.decode_delta(br)?);
+            if let Some(bits) = raw_bits {
+                out.push(br.read_u32(bits)? as i32);
+            } else {
+                let hcb_f0 = lookup_aspx_hcb(get_aspx_hcb(
+                    data_type,
+                    quant_mode,
+                    stereo_mode,
+                    AspxHcbType::F0,
+                ));
+                out.push(hcb_f0.decode_delta(br)?);
+            }
         }
         if num_sbg >= 2 {
             let hcb_df = lookup_aspx_hcb(get_aspx_hcb(
