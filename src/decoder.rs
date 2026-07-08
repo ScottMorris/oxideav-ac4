@@ -1572,9 +1572,29 @@ impl Ac4Decoder {
         if three_ok {
             let n3 = samples;
             const THREE_SLOTS: [usize; 3] = [0, 1, 2];
+            // Round 407l: apply the Table-178 matrix before synthesis
+            // when all three long spectra are present.
+            let mut matrixed: Option<Vec<Vec<f32>>> = None;
+            if let (Some(i0), Some(i1), Some(i2), Some(info)) = (
+                three.scaled_spec_per_channel[0].as_ref(),
+                three.scaled_spec_per_channel[1].as_ref(),
+                three.scaled_spec_per_channel[2].as_ref(),
+                three.info.as_ref(),
+            ) {
+                let mut sp = vec![i0.clone(), i1.clone(), i2.clone()];
+                Self::apply_three_channel_matrix(&mut sp, info, n3 as u32);
+                matrixed = Some(sp);
+            }
             for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {
-                let Some(scaled) = three.scaled_spec_per_channel[ch_in].as_ref() else {
-                    continue;
+                let owned;
+                let scaled: &Vec<f32> = if let Some(m) = matrixed.as_ref() {
+                    &m[ch_in]
+                } else {
+                    let Some(sc) = three.scaled_spec_per_channel[ch_in].as_ref() else {
+                        continue;
+                    };
+                    owned = sc;
+                    owned
                 };
                 let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
                 entries.push((
@@ -1613,6 +1633,107 @@ impl Ac4Decoder {
             num_ts_in_ats,
             pcm_per_channel,
         );
+    }
+
+    /// §5.3.3.3 / Table 178 — apply the three_channel_data transform
+    /// matrix in place. Round 407l: the table decomposes into two 2x2
+    /// butterflies (machine-verified against the spec text, 12/12):
+    ///
+    ///   B0 = [a0 b0; c0 d0] applied to (I_p, I_q) giving (T_hi, T_lo)
+    ///   variant A: out[q] = T_lo;  B1(T_hi, I_u): out[p] = a1*T_hi
+    ///     + b1*I_u, out[u] = c1*T_hi + d1*I_u
+    ///   variant C: out[p] = T_hi;  B1(I_u, T_lo): out[u] = a1*I_u
+    ///     + b1*T_lo, out[q] = c1*I_u + d1*T_lo
+    ///
+    /// Per-band a/b/c/d come from Pseudocode 59 (sap_mode 0 identity;
+    /// 2 or 1-with-ms_used the M/S butterfly; 3 = full SAP, applied
+    /// as identity until alpha gains are wired).
+    fn apply_three_channel_matrix(
+        specs: &mut [Vec<f32>],
+        info: &crate::mch::ThreeChannelInfo,
+        transform_length: u32,
+    ) {
+        if specs.len() < 3 {
+            return;
+        }
+        const MATSEL: [(usize, usize, bool); 12] = [
+            (0, 1, true),
+            (1, 0, true),
+            (0, 2, true),
+            (1, 2, false),
+            (0, 2, false),
+            (2, 1, false),
+            (1, 0, false),
+            (0, 1, false),
+            (2, 0, false),
+            (2, 1, true),
+            (2, 0, true),
+            (1, 2, true),
+        ];
+        let ms = info.chel_matsel as usize;
+        if std::env::var_os("AC4_TRACE_BODIES").is_some() {
+            eprintln!(
+                "MTX3 matsel={} saps=({},{})",
+                ms, info.chparam[0].sap_mode, info.chparam[1].sap_mode
+            );
+        }
+        if ms >= 12 {
+            return;
+        }
+        let (p, q, var_a) = MATSEL[ms];
+        let u = 3 - p - q;
+        let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+            return;
+        };
+        let n = specs.iter().map(|v| v.len()).min().unwrap_or(0);
+        let params = |cp: &crate::asf::ChparamInfo, sfb: usize| -> (f32, f32, f32, f32) {
+            match cp.sap_mode {
+                2 => (1.0, 1.0, 1.0, -1.0),
+                1 => {
+                    let used = cp
+                        .ms_used
+                        .first()
+                        .and_then(|row| row.get(sfb))
+                        .copied()
+                        .unwrap_or(false);
+                    if used {
+                        (1.0, 1.0, 1.0, -1.0)
+                    } else {
+                        (1.0, 0.0, 0.0, 1.0)
+                    }
+                }
+                _ => (1.0, 0.0, 0.0, 1.0),
+            }
+        };
+        for sfb in 0..sfbo.len().saturating_sub(1) {
+            let lo = sfbo[sfb] as usize;
+            let hi = (sfbo[sfb + 1] as usize).min(n);
+            if lo >= hi {
+                break;
+            }
+            let (a0, b0, c0, d0) = params(&info.chparam[0], sfb);
+            let (a1, b1, c1, d1) = params(&info.chparam[1], sfb);
+            for k in lo..hi {
+                let ip = specs[p][k];
+                let iq = specs[q][k];
+                let iu = specs[u][k];
+                let t_hi = a0 * ip + b0 * iq;
+                let t_lo = c0 * ip + d0 * iq;
+                let (op, oq, ou);
+                if var_a {
+                    op = a1 * t_hi + b1 * iu;
+                    ou = c1 * t_hi + d1 * iu;
+                    oq = t_lo;
+                } else {
+                    op = t_hi;
+                    ou = a1 * iu + b1 * t_lo;
+                    oq = c1 * iu + d1 * t_lo;
+                }
+                specs[p][k] = op;
+                specs[q][k] = oq;
+                specs[u][k] = ou;
+            }
+        }
     }
 
     /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 3`
