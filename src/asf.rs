@@ -5235,9 +5235,21 @@ mod tests {
         for s0 in lo..target as usize {
             let mut br = BitReader::with_position(&data, 0);
             br.skip(s0 as u32).unwrap();
-            if crate::mch::parse_mono_data(&mut br, lfe, 2048).is_ok() && br.bit_position() == target {
-                eprintln!("MONO-HIT lfe={} start={s0} end={target}", lfe as u8);
-                hits += 1;
+            match crate::mch::parse_mono_data(&mut br, lfe, 2048) {
+                Ok(_) => {
+                    let e = br.bit_position();
+                    if e == target {
+                        eprintln!("MONO-HIT lfe={} start={s0} end={target}", lfe as u8);
+                        hits += 1;
+                    } else if std::env::var_os("AC4_SCAN_VERBOSE").is_some() {
+                        eprintln!("MONO lfe={} start={s0} end={e}", lfe as u8);
+                    }
+                }
+                Err(e) => {
+                    if std::env::var_os("AC4_SCAN_VERBOSE").is_some() {
+                        eprintln!("MONO lfe={} start={s0} ERR {e:?} @{}", lfe as u8, br.bit_position());
+                    }
+                }
             }
         }
         eprintln!("mono end-scan done, {hits} hits");
@@ -5267,8 +5279,13 @@ mod tests {
             for m in 1u32..=63 {
                 let mut br = BitReader::with_position(&data, 0);
                 br.skip(body_start_head as u32).unwrap();
-                let Ok(_info) = crate::mch::parse_five_channel_info(&mut br, &[m]) else { continue };
-                let info_end = br.bit_position();
+                let info_end;
+                if std::env::var_os("AC4_SCAN_NOINFO").is_none() {
+                    let Ok(_info) = crate::mch::parse_five_channel_info(&mut br, &[m]) else { continue };
+                    info_end = br.bit_position();
+                } else {
+                    info_end = br.bit_position();
+                }
                 let mut ok = true;
                 let mut spans = Vec::new();
                 for _ch in 0..5 {
