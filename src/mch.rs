@@ -692,51 +692,54 @@ fn scan_iframe_tail_slots(
     let floor = floor_br.bit_position();
     let hi = wall.saturating_sub(40);
     let mut e = floor;
+    let mut fits: Vec<(u64, u8, u8)> = Vec::new();
     while e < hi {
         let mut hr = floor_br;
         if hr.skip((e - floor) as u32).is_err() {
-            return None;
+            break;
         }
-        // '000' xover gate for the 1ch (five-frame-proven slot 2 = 0).
         let probe = hr;
-        {
-            let mut g = probe;
-            match g.read_u32(3) {
-                Ok(0) => {}
-                _ => {
-                    e += 1;
-                    continue;
-                }
+        // Round 407r: sweep the 1ch/final F0 modes too (the mixed-F0
+        // phenomenon applies to any trailer with dir-0 envelopes) and
+        // collect ALL fits — later I-frames can produce ambiguous
+        // tail fits (frame 42 accepted a garbage s3=7); prefer the
+        // fit whose (s2, s3) matches the last-known-good vector.
+        for combo in 0u8..4 {
+            let mut vt = tools.clone();
+            vt.aspx_trailer_slot = 2;
+            let mut vr = probe;
+            crate::aspx::set_f0_raw_mode(combo & 1 == 1);
+            let r1 = crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut vt, cfg, true, frame_len_base);
+            if r1.is_err() {
+                continue;
+            }
+            crate::aspx::set_f0_raw_mode((combo >> 1) & 1 == 1);
+            let r2 = crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut vt, cfg, true, frame_len_base);
+            crate::aspx::set_f0_raw_mode(false);
+            if r2.is_err()
+                || vr.bit_position() > wall
+                || !(0..=8).contains(&(wall as i64 - vr.bit_position() as i64))
+            {
+                continue;
+            }
+            if let (Some(s2), Some(s3)) = (vt.aspx_xover_slots[2], vt.aspx_xover_slots[3]) {
+                fits.push((e, s2, s3));
             }
         }
-        let mut vt = tools.clone();
-        vt.aspx_trailer_slot = 2;
-        let mut vr = probe;
-        if crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut vt, cfg, true, frame_len_base)
-            .is_err()
-        {
-            e += 1;
-            continue;
-        }
-        let y = vr.bit_position();
-        // final 2ch parse; its own xover read fills slot 3.
-        if crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut vt, cfg, true, frame_len_base)
-            .is_err()
-        {
-            e += 1;
-            continue;
-        }
-        if vr.bit_position() > wall || !(0..=8).contains(&(wall as i64 - vr.bit_position() as i64))
-        {
-            e += 1;
-            continue;
-        }
-        let s2 = vt.aspx_xover_slots[2]?;
-        let s3 = vt.aspx_xover_slots[3]?;
-        let _ = y;
-        return Some((e, s2, s3));
+        crate::aspx::set_f0_raw_mode(false);
+        e += 1;
     }
-    None
+    if fits.is_empty() {
+        return None;
+    }
+    if let Some(good) = tools.aspx_xover_slots_good {
+        if let (Some(g2), Some(g3)) = (good[2], good[3]) {
+            if let Some(&f) = fits.iter().find(|(_, s2, s3)| *s2 == g2 && *s3 == g3) {
+                return Some(f);
+            }
+        }
+    }
+    Some(fits[0])
 }
 
 /// Round-407d resync-by-signature: starting from `floor_br`, scan bit
