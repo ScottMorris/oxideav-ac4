@@ -2801,6 +2801,7 @@ fn decode_asf_long_mono_body(
     let mut scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
     if let Some(snf_data) = snf {
         let mut rng: u32 = 0x1234_5678; // per-frame seed
+        if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH snf-inject"); }
         asf_data::inject_snf_noise(&mut scaled, &snf_data, sfbo, max_sfb, &mut rng);
     }
     Some(scaled)

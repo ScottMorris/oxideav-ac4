@@ -232,6 +232,10 @@ impl Ac4Decoder {
         compand_mode: aspx::CompandingMode,
         compand_sb0_override: Option<u32>,
     ) -> Vec<f32> {
+        // Synthesis-war kill switch: core PCM only, no HF extension.
+        if std::env::var_os("AC4_NO_ASPX").is_some() {
+            return pcm_in.to_vec();
+        }
         let extended = Self::aspx_extend_to_qmf(
             pcm_in,
             tables,
@@ -539,6 +543,19 @@ impl Ac4Decoder {
     /// transform transitions with the spec's asymmetric transition
     /// windows; overlap history is never dropped on a length change.
     fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
+        if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH imdct ch={} n={} energy={:.1}", ch, n, scaled.iter().map(|v| v*v).sum::<f32>()); }
+        // Synthesis-war: dump raw dequantised spectra for offline
+        // spectral-domain comparison against a reference forward MDCT.
+        if let Some(dir) = std::env::var_os("AC4_DUMP_SPEC") {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SPEC_N: AtomicU32 = AtomicU32::new(0);
+            let k = SPEC_N.fetch_add(1, Ordering::Relaxed);
+            if k < 256 {
+                let p = std::path::Path::new(&dir).join(format!("spec{k:03}_ch{ch}_n{n}.f32"));
+                let bytes: Vec<u8> = scaled.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(p, bytes);
+            }
+        }
         // The §5.5.3 full-block grid partial blocks are centred in:
         // the frame length when this block subdivides it evenly,
         // otherwise the block is its own grid (defensive — permitted
@@ -979,6 +996,7 @@ impl Ac4Decoder {
                 self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
             }
             let state = &mut self.aspx_ext_state[*slot];
+            if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH aspx-phase1-A"); }
             let qres = Self::aspx_extend_to_qmf(
                 pcm_in,
                 &trailer.frequency_tables,
@@ -1092,6 +1110,7 @@ impl Ac4Decoder {
                 self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
             }
             let state = &mut self.aspx_ext_state[input.ch_index];
+            if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH aspx-phase1-B"); }
             phase1[i].2 = Self::aspx_extend_to_qmf(
                 input.pcm_in,
                 tables,
@@ -1581,8 +1600,11 @@ impl Ac4Decoder {
                 three.scaled_spec_per_channel[2].as_ref(),
                 three.info.as_ref(),
             ) {
-                let mut sp = vec![i0.clone(), i1.clone(), i2.clone()];
-                Self::apply_three_channel_matrix(&mut sp, info, n3 as u32);
+                if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH cfg1-3ch-matrix"); }
+            let mut sp = vec![i0.clone(), i1.clone(), i2.clone()];
+                if std::env::var_os("AC4_NO_SAP").is_none() {
+                    Self::apply_three_channel_matrix(&mut sp, info, n3 as u32);
+                }
                 matrixed = Some(sp);
             }
             for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {

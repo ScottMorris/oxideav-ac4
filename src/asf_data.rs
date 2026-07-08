@@ -593,6 +593,10 @@ pub fn inject_snf_noise(
     max_sfb: u32,
     rng_state: &mut u32,
 ) {
+    // Synthesis-war kill switch: no noise fill.
+    if std::env::var_os("AC4_NO_SNF").is_some() {
+        return;
+    }
     for sfb in 0..max_sfb as usize {
         let idx = match snf_data.get(sfb) {
             Some(&v) if v > 0 => v as u32,
