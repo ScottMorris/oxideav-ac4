@@ -2804,6 +2804,7 @@ fn decode_asf_long_mono_body(
         if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH snf-inject"); }
         asf_data::inject_snf_noise(&mut scaled, &snf_data, sfbo, max_sfb, &mut rng);
     }
+    dump_body_scaled(&scaled, tl, max_sfb);
     Some(scaled)
 }
 
@@ -3125,6 +3126,23 @@ fn decode_asf_mono_body_for_max_sfb(
 /// `sf_data(ASF)` body per channel from the shared `sf_info(ASF, 0, 0)`
 /// at the head of `three_channel_data` / `four_channel_data` /
 /// `five_channel_data`.
+
+/// Synthesis-war shared body-dump helper: parse-order sequence pairs
+/// 1:1 with the AC4_DUMP_SF body order regardless of which body
+/// decoder produced the spectrum.
+pub(crate) fn dump_body_scaled(scaled: &[f32], tl: u32, max_sfb: u32) {
+    if let Some(dir) = std::env::var_os("AC4_DUMP_BODY") {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static BODY_N: AtomicU32 = AtomicU32::new(0);
+        let k = BODY_N.fetch_add(1, Ordering::Relaxed);
+        if k < 512 {
+            let p = std::path::Path::new(&dir).join(format!("body{k:03}_tl{tl}_m{max_sfb}.f32"));
+            let bytes: Vec<u8> = scaled.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let _ = std::fs::write(p, bytes);
+        }
+    }
+}
+
 pub(crate) fn decode_asf_long_mono_body_with_max_sfb(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
@@ -3180,6 +3198,7 @@ pub(crate) fn decode_asf_long_mono_body_with_max_sfb_ext(
         );
     }
     let scaled = asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
+    dump_body_scaled(&scaled, tl, max_sfb);
     if std::env::var_os("AC4_TRACE_GAINS").is_some() {
         let gmax = sf_gain.iter().cloned().fold(0.0f32, f32::max);
         let smax = scaled.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
