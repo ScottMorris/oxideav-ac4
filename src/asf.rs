@@ -5306,6 +5306,55 @@ mod tests {
         eprintln!("5ch m-sweep done, {hits} hits");
     }
 
+    #[test]
+    #[ignore]
+    fn debug_scan_region_aspx() {
+        // Scan single aspx_data_{1,2}ch P-frame bodies inside the
+        // mystery region, exact-end at AC4_SCAN_TARGET. Config comes
+        // from AC4_SCAN_CFG_FILE (an I-frame dump); xover slots from
+        // AC4_SCAN_XOVERS.
+        use oxideav_core::bits::BitReader;
+        let path = std::env::var("AC4_SCAN_FILE").expect("AC4_SCAN_FILE");
+        let cfg_path = std::env::var("AC4_SCAN_CFG_FILE").expect("AC4_SCAN_CFG_FILE");
+        let target: u64 = std::env::var("AC4_SCAN_TARGET").expect("AC4_SCAN_TARGET").parse().unwrap();
+        let lo: usize = std::env::var("AC4_SCAN_LO").expect("AC4_SCAN_LO").parse().unwrap();
+        let xovers: Vec<u8> = std::env::var("AC4_SCAN_XOVERS").expect("AC4_SCAN_XOVERS")
+            .split(',').map(|v| v.parse().unwrap()).collect();
+        let data = std::fs::read(&path).expect("read");
+        let cdata = std::fs::read(&cfg_path).expect("read cfg");
+        let mut hr2 = BitReader::new(&cdata);
+        let _ = hr2.read_u32(15).unwrap();
+        let _ = hr2.read_bit().unwrap();
+        hr2.align_to_byte();
+        let coff = hr2.byte_position();
+        let mut cbr = BitReader::with_position(&cdata, coff);
+        let _mode = cbr.read_u32(2).unwrap();
+        let cfg = crate::aspx::parse_aspx_config(&mut cbr).unwrap();
+        let mut hits = 0;
+        for start in lo..target as usize {
+            for ch in [1u8, 2] {
+                for iframe in [false, true] {
+                    let mut br = BitReader::with_position(&data, 0);
+                    br.skip(start as u32).unwrap();
+                    let mut tools = SubstreamTools::default();
+                    for (i, &x) in xovers.iter().enumerate() {
+                        tools.aspx_xover_slots[i] = Some(x);
+                    }
+                    let r = if ch == 1 {
+                        parse_aspx_data_1ch_body(&mut br, &mut tools, &cfg, iframe, 2048)
+                    } else {
+                        parse_aspx_data_2ch_body(&mut br, &mut tools, &cfg, iframe, 2048)
+                    };
+                    if r.is_ok() && br.bit_position() == target {
+                        eprintln!("ASPX-HIT ch={ch} iframe={} start={start} end={target}", iframe as u8);
+                        hits += 1;
+                    }
+                }
+            }
+        }
+        eprintln!("region aspx scan done, {hits} hits");
+    }
+
     fn debug_parse_7x_front_at() {
         // Two-hypothesis P-frame front test: parse three_channel_data +
         // two_channel_data starting at AC4_SCAN_POS..AC4_SCAN_POS_HI and

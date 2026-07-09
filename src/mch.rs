@@ -2180,6 +2180,136 @@ impl SevenXCodecMode {
 /// All inner Huffman / parse misses are caught try-and-bail and surface
 /// `Ok(())` to the caller — the outer walker never returns `Err` once
 /// the leading 2-bit `7_X_codec_mode` has been consumed.
+
+/// Round 408: P-frame FRONT backchain. The pre-cc region is opaque
+/// (docs/ac4-bitstream-reality.md), but the front elements follow the
+/// standard grammar at positions recoverable from the resync-proven
+/// add-pair head: the last front element ends exactly at `gate`
+/// (= head - 2, the uniform 2-bit gate). Scan production-parser
+/// exact-end chains for each coding_config shape and OVERWRITE the
+/// garbage front state. Returns the recovered coding_config.
+fn resync_7x_front(
+    floor: BitReader<'_>,
+    gate: u64,
+    tools: &mut SubstreamTools,
+    frame_len_base: u32,
+    largest_tl: &mut Option<u32>,
+) -> Option<FiveXCodingConfig> {
+    let lo = floor.bit_position().saturating_sub(4) as usize;
+    if gate <= lo as u64 + 16 {
+        return None;
+    }
+    // Pass 1: last element = two_channel_data ending at gate (Cfg1 or
+    // Cfg0). Collect exact-end hits (empirically unique per frame).
+    let mut last2: Vec<(u64, TwoChannelData)> = Vec::new();
+    for start in lo..gate as usize {
+        let mut br = floor;
+        let d = start as i64 - br.bit_position() as i64;
+        if d < 0 || br.skip(d as u32).is_err() {
+            continue;
+        }
+        if let Ok(d2) = parse_two_channel_data(&mut br, frame_len_base) {
+            if br.bit_position() == gate {
+                last2.push((start as u64, d2));
+                if last2.len() > 6 {
+                    break; // degenerate frame; bail below on ambiguity
+                }
+            }
+        }
+    }
+    for (s2, d2) in &last2 {
+        // Cfg1: three_channel_data ends at the 2ch start.
+        for start in lo..*s2 as usize {
+            let mut br = floor;
+            let d = start as i64 - br.bit_position() as i64;
+            if d < 0 || br.skip(d as u32).is_err() {
+                continue;
+            }
+            if let Ok(d3) = parse_three_channel_data(&mut br, frame_len_base) {
+                if br.bit_position() == *s2 {
+                    if let Some(ti) = d3.transform_info.as_ref() {
+                        let tl = ti.transform_length_0;
+                        *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                    }
+                    if let Some(ti) = d2.transform_info.as_ref() {
+                        let tl = ti.transform_length_0;
+                        *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                    }
+                    tools.three_channel_data = Some(d3);
+                    tools.two_channel_data = vec![d2.clone()];
+                    if std::env::var_os("AC4_T").is_some() {
+                        eprintln!("FRONT-RESYNC cfg1: 3ch@{start} 2ch@{s2} gate@{gate}");
+                    }
+                    return Some(FiveXCodingConfig::Cfg1ThreeStereo);
+                }
+            }
+        }
+        // Cfg0: another two_channel_data ends at this one's start.
+        for start in lo..*s2 as usize {
+            let mut br = floor;
+            let d = start as i64 - br.bit_position() as i64;
+            if d < 0 || br.skip(d as u32).is_err() {
+                continue;
+            }
+            if let Ok(da) = parse_two_channel_data(&mut br, frame_len_base) {
+                if br.bit_position() == *s2 {
+                    for dd in [&da, d2] {
+                        if let Some(ti) = dd.transform_info.as_ref() {
+                            let tl = ti.transform_length_0;
+                            *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                        }
+                    }
+                    tools.two_channel_data = vec![da, d2.clone()];
+                    tools.three_channel_data = None;
+                    if std::env::var_os("AC4_T").is_some() {
+                        eprintln!("FRONT-RESYNC cfg0: 2ch@{start} 2ch@{s2} gate@{gate}");
+                    }
+                    return Some(FiveXCodingConfig::Cfg0Stereo2plusMono);
+                }
+            }
+        }
+    }
+    // Pass 2: single four/five_channel_data ending at gate (Cfg2/Cfg3).
+    for start in lo..gate as usize {
+        let mut br = floor;
+        let d = start as i64 - br.bit_position() as i64;
+        if d < 0 || br.skip(d as u32).is_err() {
+            continue;
+        }
+        if let Ok(d4) = parse_four_channel_data(&mut br, frame_len_base) {
+            if br.bit_position() == gate {
+                if let Some(ti) = d4.transform_info.as_ref() {
+                    let tl = ti.transform_length_0;
+                    *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                }
+                tools.four_channel_data = Some(d4);
+                if std::env::var_os("AC4_T").is_some() {
+                    eprintln!("FRONT-RESYNC cfg2: 4ch@{start} gate@{gate}");
+                }
+                return Some(FiveXCodingConfig::Cfg2FourMono);
+            }
+        }
+        let mut br = floor;
+        if br.skip(d as u32).is_err() {
+            continue;
+        }
+        if let Ok(d5) = parse_five_channel_data(&mut br, frame_len_base) {
+            if br.bit_position() == gate {
+                if let Some(ti) = d5.transform_info.as_ref() {
+                    let tl = ti.transform_length_0;
+                    *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                }
+                tools.five_channel_data = Some(d5);
+                if std::env::var_os("AC4_T").is_some() {
+                    eprintln!("FRONT-RESYNC cfg3: 5ch@{start} gate@{gate}");
+                }
+                return Some(FiveXCodingConfig::Cfg3Five);
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_7x_audio_data_outer(
     br: &mut BitReader<'_>,
     tools: &mut SubstreamTools,
@@ -2459,6 +2589,35 @@ pub fn parse_7x_audio_data_outer(
                     // were not parsed — clear the stale slots.
                     tools.seven_x_b_use_sap_add_ch = None;
                     tools.seven_x_add_chparam_info = None;
+                    // Round 408: FRONT backchain. The P-frame pre-cc
+                    // region is still unread (see riptide
+                    // docs/ac4-bitstream-reality.md), but the front
+                    // elements themselves follow the standard grammar
+                    // — proven by unique exact-end chains on frames
+                    // 1/2/5. Recover them from the proven head: the
+                    // front's last element ends at head-2 (uniform
+                    // 2-bit gate); chain backwards per coding_config
+                    // shape and OVERWRITE the garbage front parses.
+                    if std::env::var_os("AC4_NO_FRONT_RESYNC").is_none() {
+                        if let Some(cfg_found) = resync_7x_front(
+                            switch_floor,
+                            head.bit_position().saturating_sub(2),
+                            tools,
+                            frame_len_base,
+                            &mut largest_tl,
+                        ) {
+                            // Walk-flow gating (the cc0/2 trailing mono
+                            // AFTER the add pair) keeps the original
+                            // misread cfg: the trailer oracle validated
+                            // these frames WITHOUT a trailing mono, so
+                            // parsing one would eat trailer bits (meter
+                            // regression 199->171 proved it). The mono
+                            // for these frames presumably lives in the
+                            // opaque pre-cc region. The DECODER dispatch
+                            // reads the recovered cfg from tools.
+                            tools.seven_x_coding_config = Some(cfg_found);
+                        }
+                    }
                     if let Some((k0, k1)) = joint {
                         // Round 407p: consume the head fields, then the
                         // two bodies at the trailer-proven bounds.
