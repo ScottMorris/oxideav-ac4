@@ -149,6 +149,23 @@ struct StereoCpeChannelInput<'a> {
     tna_mode: Option<&'a [u8]>,
 }
 
+
+/// Synthesis-war corpus dump: AC4_DUMP_ROLE=<dir> writes committed
+/// (dispatch-level) dequantised spectra tagged frame/role — the mass
+/// law-regression corpus. Scan/resync parses never reach dispatch, so
+/// this is free of candidate noise. Frame index from DUMP_FRAME_IDX,
+/// bumped once per decoded frame.
+pub(crate) static DUMP_FRAME_IDX: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+pub(crate) fn dump_role_spec(role: &str, scaled: &[f32]) {
+    if let Some(dir) = std::env::var_os("AC4_DUMP_ROLE") {
+        let f = DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+        let p = std::path::Path::new(&dir).join(format!("f{f:05}_{role}.f32"));
+        let bytes: Vec<u8> = scaled.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(p, bytes);
+    }
+}
+
 impl Ac4Decoder {
     pub fn new(params: &CodecParameters) -> Self {
         Self {
@@ -1615,6 +1632,9 @@ impl Ac4Decoder {
                 three.scaled_spec_per_channel[2].as_ref(),
                 three.info.as_ref(),
             ) {
+                dump_role_spec("c1_3ch0", i0);
+                dump_role_spec("c1_3ch1", i1);
+                dump_role_spec("c1_3ch2", i2);
                 if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH cfg1-3ch-matrix"); }
             let mut sp = vec![i0.clone(), i1.clone(), i2.clone()];
                 if std::env::var_os("AC4_NO_SAP").is_none() {
@@ -1649,6 +1669,8 @@ impl Ac4Decoder {
             .is_some()
             && tcd.scaled_spec_per_channel.len() >= 2;
         if tcd_ok {
+            if let Some(Some(t0)) = tcd.scaled_spec_per_channel.get(0) { dump_role_spec("c1_tcd0", t0); }
+            if let Some(Some(t1)) = tcd.scaled_spec_per_channel.get(1) { dump_role_spec("c1_tcd1", t1); }
             let n2 = samples;
             const TWO_SLOTS: [usize; 2] = [3, 4];
             for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
@@ -2090,6 +2112,7 @@ impl Decoder for Ac4Decoder {
         while self.ssf_walker_state.len() < channels as usize {
             self.ssf_walker_state.push(ssf::SsfChannelState::new());
         }
+        DUMP_FRAME_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.last_substream = substream_try.and_then(|sb| {
             let channels_u16 = channels;
             let b_iframe = info
@@ -3390,6 +3413,8 @@ impl Decoder for Ac4Decoder {
         // branch is gated on the SIMPLE/ASPX active-flag.
         if seven_x_simple_aspx_active {
             if let Some(add) = seven_x_additional_channel_data.as_ref() {
+                if let Some(Some(a0)) = add.scaled_spec_per_channel.get(0) { dump_role_spec("add0", a0); }
+                if let Some(Some(a1)) = add.scaled_spec_per_channel.get(1) { dump_role_spec("add1", a1); }
                 // Resolve partner spectra + slots based on the active
                 // 7_X coding_config. Per Table 183 row "3/4/0.x" (the
                 // standard 7.0/7.1 layout that our 7_X walker handles)
@@ -3473,6 +3498,7 @@ impl Decoder for Ac4Decoder {
                 .as_ref()
                 .and_then(|sub| sub.tools.lfe_mono_data.clone());
             if let Some(lfe) = lfe_mono.as_ref() {
+                if let Some(sc) = lfe.scaled_spec.as_ref() { dump_role_spec("lfe", sc); }
                 if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(lfe, lfe_slot, samples as usize) {
                     while pcm_per_channel.len() <= lfe_slot {
                         pcm_per_channel.push(None);
