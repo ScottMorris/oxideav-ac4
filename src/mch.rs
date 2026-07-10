@@ -2199,9 +2199,19 @@ fn resync_7x_front(
     if gate <= lo as u64 + 16 {
         return None;
     }
-    // Pass 1: last element = two_channel_data ending at gate (Cfg1 or
-    // Cfg0). Collect exact-end hits (empirically unique per frame).
-    let mut last2: Vec<(u64, TwoChannelData)> = Vec::new();
+    let head = gate + 2; // add-pair head (gate = head-2 by definition)
+    // Pass 1: last element = two_channel_data ending at gate (sap=0
+    // shape, Cfg1 or Cfg0) OR ending in the sap=1 window
+    // [gate-170..gate-16] where the tail must validate as
+    // [b_use_sap=1][chparam_info x2 over the aspx-core band count]
+    // running exactly to head-1. Collect validated hits.
+    let ms_bands: u32 = tools
+        .aspx_config
+        .as_ref()
+        .and_then(|c| aspx_core_band_count(c, 2048))
+        .unwrap_or(50);
+    type SapInfo = Option<[crate::mch::ChparamInfo; 2]>;
+    let mut last2: Vec<(u64, TwoChannelData, SapInfo)> = Vec::new();
     for start in lo..gate as usize {
         let mut br = floor;
         let d = start as i64 - br.bit_position() as i64;
@@ -2209,15 +2219,32 @@ fn resync_7x_front(
             continue;
         }
         if let Ok(d2) = parse_two_channel_data(&mut br, frame_len_base) {
-            if br.bit_position() == gate {
-                last2.push((start as u64, d2));
-                if last2.len() > 6 {
-                    break; // degenerate frame; bail below on ambiguity
+            let e = br.bit_position();
+            if e == gate {
+                last2.push((start as u64, d2, None));
+            } else if e + 16 <= gate && e + 170 >= gate {
+                // sap=1 candidate: gap must parse as '1' + 2 chparams
+                // ending exactly at head-1.
+                if matches!(br.read_bit(), Ok(true)) {
+                    if let (Ok(cp0), Ok(cp1)) = (
+                        parse_chparam_info(&mut br, &[ms_bands]),
+                        parse_chparam_info(&mut br, &[ms_bands]),
+                    ) {
+                        if br.bit_position() == head - 1 {
+                            if std::env::var_os("AC4_T").is_some() {
+                                eprintln!("FRONT sap1-cand: 2ch@{start}..{e} cps->{}", head - 1);
+                            }
+                            last2.push((start as u64, d2, Some([cp0, cp1])));
+                        }
+                    }
                 }
+            }
+            if last2.len() > 6 {
+                break; // degenerate frame; bail below on ambiguity
             }
         }
     }
-    for (s2, d2) in &last2 {
+    for (s2, d2, sap) in &last2 {
         // Cfg1: three_channel_data ends at the 2ch start.
         for start in lo..*s2 as usize {
             let mut br = floor;
@@ -2237,6 +2264,10 @@ fn resync_7x_front(
                     }
                     tools.three_channel_data = Some(d3);
                     tools.two_channel_data = vec![d2.clone()];
+                    if let Some(cps) = sap {
+                        tools.seven_x_b_use_sap_add_ch = Some(true);
+                        tools.seven_x_add_chparam_info = Some(cps.clone());
+                    }
                     if std::env::var_os("AC4_T").is_some() {
                         eprintln!("FRONT-RESYNC cfg1: 3ch@{start} 2ch@{s2} gate@{gate}");
                     }
@@ -2261,6 +2292,10 @@ fn resync_7x_front(
                     }
                     tools.two_channel_data = vec![da, d2.clone()];
                     tools.three_channel_data = None;
+                    if let Some(cps) = sap {
+                        tools.seven_x_b_use_sap_add_ch = Some(true);
+                        tools.seven_x_add_chparam_info = Some(cps.clone());
+                    }
                     if std::env::var_os("AC4_T").is_some() {
                         eprintln!("FRONT-RESYNC cfg0: 2ch@{start} 2ch@{s2} gate@{gate}");
                     }
