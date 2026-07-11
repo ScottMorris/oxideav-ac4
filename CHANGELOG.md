@@ -7,432 +7,194 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **IMDCT's inner complex transform now uses a real FFT (`rustfft`)
-  instead of a direct-form O(N²) sum.** `mdct::imdct`'s "Step 3" was a
-  literal double loop recomputing `sin`/`cos` from scratch on every
-  iteration — for a 2048-sample long-frame window that's roughly 1M
-  trig-heavy iterations *per channel, per frame*; across 8 channels and
-  a multi-thousand-frame track, tens of billions of transcendental
-  calls for a single full-track decode. The surrounding pre/post-
-  rotation steps were already correct and untouched; only the middle
-  "complex IFFT of length half_n" is now a real FFT, cached per-size in
-  a thread-local (`rustfft`'s own planning cost is nontrivial and this
-  function runs thousands of times per track at a handful of fixed
-  sizes). All 844 tests still pass — the swap is numerically
-  equivalent, not just faster. A full-track real-content decode that
-  previously hadn't finished after 46+ minutes now completes in
-  3-6 minutes.
-
-  This is flagged as a deliberate, temporary departure from every
-  other `oxideav-*` codec crate's zero-external-dependency convention
-  (checked directly: `oxideav-mp3`, `oxideav-speex`, `oxideav-h265`,
-  `oxideav-flac` all depend on nothing but sibling `oxideav-*` crates)
-  — a hand-rolled mixed-radix FFT would match that convention but is
-  real DSP work; `rustfft` (itself pure Rust, no unsafe/C deps) gets
-  real playback speed now, with the tradeoff left as an open question
-  for upstream. The encoder's forward `mdct_naive` (`encoder_mdct.rs`)
-  is a different, non-FFT-shaped direct cosine-basis sum and is out of
-  scope here — the encoder isn't on a hot path the way real-content
-  decode is.
-
-### Fixed
-
-- **`decode_asf_grouped_body_windows` rejected the legitimate case of a
-  short-frame body whose windows all collapse into a single group.**
-  Real content can have `num_windows > 1` (genuinely short-frame,
-  `b_long_frame == false`) with `num_window_groups == 1` — every
-  `scale_factor_grouping` bit set to "continue", so all windows share
-  one group's side info (`num_win_in_group[0] == num_windows`, up to
-  8 in observed real content). The function's entry guard was
-  `if psy.num_window_groups <= 1 { return None; }`, treating this as
-  "not actually grouped" and bailing before ever attempting the
-  widened decode — even though the widening/ungrouping machinery
-  underneath handles `num_window_groups == 1` correctly (it's not a
-  degenerate case for that code, only for the guard). Every consumer
-  of this channel's data then saw it as "no data at all" for the
-  whole frame, since neither the long-frame path (`b_long_frame` is
-  false) nor the grouped path (blocked by this guard) would run.
-
-  Fixed by gating on `psy.num_windows <= 1` instead — the actual
-  "nothing to ungroup" condition — rather than the group count.
-  Verified against real content: slot-0 (L) nonzero-PCM rate rose from
-  69.5% to **73.2%**, and main-soundstage activity (any of slots 0..4)
-  rose to **95.4%** of all 1571 real frames tested.
-
-- **5_X SIMPLE/ASPX `Cfg0`/`Cfg1` dispatch used a combined guard
-  across two independent sub-structures, silently discarding a
-  perfectly good half whenever the other half didn't match `samples`.**
-  `Cfg1ThreeStereo`'s body is `three_channel_data + two_channel_data` —
-  two separate `sf_info(ASF, 0, 0)` elements, each with its own
-  independent transform info. Real content can legitimately pair a
-  grouped/short-frame half with a long-frame half (confirmed against
-  real content: frame 1 of the test file has `three_channel_data` at
-  a grouped `tl=128` while its trailing `two_channel_data` is
-  long-frame at `tl=2048`). `dispatch_5x_cfg1_simple_aspx` gated
-  `three` and `tcd` with a *single* combined check — if `three`'s
-  transform length didn't match `samples`, the function returned
-  before ever looking at `tcd`, discarding `tcd`'s independently
-  correct long-frame data too (and vice versa). Same bug, same fix,
-  in `dispatch_5x_cfg0_simple_aspx`'s `tcd_a`/`tcd_b` pair.
-
-  Fixed by gating each half independently — each renders its own
-  slots when its own transform length matches `samples`, regardless of
-  the other half's state. (`Cfg2FourMono`'s `four_channel_data` +
-  `cfg2_back_mono` pair was already correct — `back_mono`'s IMDCT
-  helper already gates independently via its own `Option`-returning
-  contract; `Cfg3Five` has no sub-structure split to have this bug.)
-
-  Verified against real content: slot-0 (L) nonzero-PCM rate rose from
-  60.2% to **69.5%**, and main-soundstage activity (any of slots 0..4)
-  rose to **92.9%** of all 1571 real frames tested.
-
-- **Grouped/short-frame `sf_data(ASF)` decode never handled multi-window
-  groups, and never IMDCT'd the result** — the two biggest remaining
-  real-content gaps, fixed together.
-
-  First, a genuine bitstream-correctness bug: real content overwhelmingly
-  uses actual scale-factor *grouping* (multiple physical transform
-  windows sharing one group's side info — `num_windows=8,
-  num_window_groups=4` shows up constantly), not the degenerate
-  "every window is its own group" case. Per §4.3.6.2.6 Pseudocode 4, a
-  group with `num_win_in_group[g]` windows carries
-  `num_win_in_group[g]` times as much `asf_section_data()` /
-  `asf_spectral_data()` payload as a single-window group
-  (`sect_sfb_offset[g][sfb] = group_offset + sfb_offset[sfb] *
-  num_win_in_group[g]`). `mch.rs`'s grouped-body decoder didn't widen
-  anything — it treated every group as exactly one window wide, *and*
-  called the single-group `asf_scalefac_data`/`asf_snf_data` parsers
-  inside its own per-group loop, re-reading the shared
-  `reference_scale_factor`(8)/`b_snf_data_exists`(1) header fields once
-  per group instead of once for the whole body (Tables 41/42 read
-  these once, then loop). Any real group wider than one window
-  desynced the bitreader from that point on.
-
-  Fixed by deriving `num_win_in_group[g]` (§4.3.6.2.6 Pseudocode 3/4,
-  now exposed from `asf::derive_per_group_with_max_sfb`), widening the
-  `sfb_offset` table passed to the Huffman decode by that factor per
-  group, and routing through the existing `_grouped` wrapper functions
-  (which already read the shared header fields correctly). The
-  widened, band-major/window-minor per-group spectrum is then
-  de-interleaved back into individual per-window spectra via the
-  dedicated §5.1.5 "spectral ungrouping tool" (Pseudocode 25) — new
-  `mch::decode_asf_grouped_body_windows`, replacing the old
-  `decode_asf_grouped_mono_body_with_max_sfb`.
-
-  Second, decoder.rs never IMDCT'd any of this even when it *was*
-  correctly decoded: every main-channel dispatch function
-  (`dispatch_5x_cfg0/1/2/3_simple_aspx`) guards on
-  `transform_length_0 == samples` and only ever exercised the
-  single-long-frame-spectrum path — short/grouped bodies always
-  no-op'd there regardless of how correctly they parsed. Added a
-  generic `imdct_grouped_channel_f32` (mirrors `run_ssf_channel`'s
-  per-block accumulation: IMDCT each window in turn, sharing the
-  channel's overlap-add state, concatenating into the full frame) and
-  wired it as a fallback in all four `Cfg0`/`Cfg1`/`Cfg2`/`Cfg3`
-  branches, using each config's existing Table 180 channel-to-slot
-  mapping.
-
-  `TwoChannelData`/`ThreeChannelData`/`FourChannelData`/
-  `FiveChannelData`/`MonoLfeData` each gained a parallel
-  `scaled_spec_windows(_per_channel)` field for the grouped case,
-  leaving the existing long-frame-only `scaled_spec(_per_channel)`
-  field's contract unchanged (still `None` for grouped bodies — it was
-  never correct for them anyway, and every consumer already gated on
-  `b_long_frame`).
-
-  Verified against real content: slot-0 (L) nonzero-PCM rate rose from
-  31.2% to **60.2%**, and main-soundstage (any of slots 0..4) activity
-  rose to **88.5%** of all 1571 real frames tested — up from a
-  situation where 100% of short/grouped-frame bodies were silent
-  regardless of `coding_config`. The remaining ~11.5% silent frames no
-  longer cluster on any single `coding_config` or on grouped-vs-long-frame
-  — consistent with a mix of genuine quiet passages and smaller,
-  not-yet-isolated residual edge cases rather than one dominant bug.
-
-- **7_X SIMPLE/ASPX main-channel (slots 0..4) dispatch only wired
-  `Cfg3Five`** — `Cfg0Stereo2plusMono`/`Cfg1ThreeStereo`/`Cfg2FourMono`
-  were parsed correctly (real, non-silent spectral data landed in
-  `tools.two_channel_data`/`three_channel_data`/`four_channel_data`)
-  but never converted to PCM: `receive_frame()`'s round-91 dispatch
-  gate matched only `Cfg3Five`, so the other three configs' L/R/C/Ls/Rs
-  core came out as pure digital silence every time, with only the LFE
-  channel (decoded independently of this gate) making the frame look
-  "audible" at the whole-frame level. Confirmed against real content:
-  100% of `Cfg0`/`Cfg1`/`Cfg2` frames had a silent slot 0 before this
-  fix, for every real Tidal frame tested.
-
-  Fixed by routing all three configs through the existing
-  `dispatch_5x_cfg0/1/2_simple_aspx` helpers — the same functions
-  already used by the real 5_X path — passing `None` for the ASPX
-  trailer slots (the 7_X walker's own trailer plumbing is a separate,
-  not-yet-wired concern, matching the existing `Cfg3Five` branch's
-  simplification). Verified: slot-0 (L) nonzero-PCM rate on real
-  content rose from 11.2% to 31.2% of all frames.
-
-  This surfaced a second, deeper, and larger gap: **every** main-channel
-  dispatch function (`dispatch_5x_cfg0/1/2/3_simple_aspx`, all four
-  configs) guards on `transform_length_0 == samples` and silently
-  no-ops otherwise — none of them handle short-frame or grouped-window
-  transforms. Checked against real content: **100% of the 816 (of
-  1571) real frames whose main-channel body used a short/grouped
-  transform were silent**, and **0%** of the 490 successfully-decoded
-  frames were anything but a full 2048-sample long-frame transform.
-  This — not anything specific to Cfg0/1/2 — is now the single largest
-  remaining blocker to full real-content decode, affecting roughly half
-  of all real frames regardless of coding_config. Not yet fixed;
-  tracked as the next real-PCM blocker.
-
-- **`ac4_substream_info_chan()` / `ac4_substream_info_ajoc()` dropped
-  `substream_index`** (§6.2.1.8/.9) — on `b_substreams_present` frames,
-  each substream descriptor carries an explicit index into
-  `substream_index_table()`'s size list telling the decoder *which*
-  physical substream actually holds its audio. The parser read this
-  field (`si`/`substream_index`) correctly but threw it away, and
-  `decoder.rs`'s `receive_frame()` unconditionally grabbed
-  `substream_sizes[0]` instead. For every real Tidal AC-4 frame tested
-  this session, the true audio substream was index **1**, not 0 — the
-  end-to-end decoder was feeding the wrong physical substream (a small,
-  10-byte companion substream) to the channel-coded walker, which
-  happened to parse *without erroring* (there just wasn't much to
-  parse) but produced silent, 1-plane-shaped garbage output disguised
-  as a valid decode. This was invisible at the TOC level, since
-  `parse_ac4_toc`'s own `channels`/`channel_mode`/`channel_coded`
-  fields never depended on which physical substream carried the audio
-  — only `decoder.rs`'s byte-slicing of `raw` did.
-
-  Fixed by threading `substream_index` through `SubstreamInfoChan` →
-  `SubstreamInfoAjoc` → `SubstreamGroupSummary` → the new
-  `Ac4FrameInfo::substream_index`, and rewriting `receive_frame()`'s
-  substream-selection to skip forward by the summed sizes of every
-  substream ahead of that index rather than always taking substream 0.
-  Verified against real content: `decode_real_pcm` now produces
-  genuinely non-silent PCM (`nonzero_ch0=true`, real sample magnitudes)
-  for I-frames that parse cleanly, versus 100% silent output for every
-  frame before the fix.
-
-- **`mono_data(b_lfe=1)` read a phantom `asf_transform_info()`** — a
-  second, distinct bug that surfaced once real substream bytes were
-  actually being decoded, failing roughly half of all real I-frames
-  with `asf_psy_info_lfe: transform_length not permitted for LFE`.
-  `sf_info_lfe()` (§4.2.7.2 Table 35) sets `b_long_frame = 1`
-  *implicitly* — "transform length = frame_length" — and reads **no
-  bits** for it, unlike the regular `sf_info()` → `asf_transform_info()`
-  path used by every other channel. `parse_mono_data`'s LFE branch was
-  calling the full `asf_transform_info()` reader anyway (justified by a
-  comment claiming "the LFE channel is always coded with the ASF
-  frontend", which is true but irrelevant — it doesn't mean
-  `asf_transform_info()` the *bitstream element* is present), stealing
-  real bits belonging to `max_sfb[0]`/`sf_data()` that follow. The
-  resulting misalignment was data-dependent — whatever `b_long_frame`
-  bit happened to get stolen from the following field — which is
-  exactly why it failed on about half of real frames and not the
-  other half.
-
-  Fixed by constructing the LFE `AsfTransformInfo` synthetically
-  (`b_long_frame: true`, transform length resolved from
-  `frame_len_base` via the existing `resolve_transf_length` helper)
-  with zero bits consumed, matching Table 35 exactly. Updated the five
-  test fixtures that encoded the old (wrong) leading `b_long_frame` bit
-  for LFE `mono_data()`. Combined with the `substream_index` fix above,
-  real content now parses substream bodies with **0 errors across all
-  1571 frames** of a real Tidal file (previously ~50% failed), and
-  `decode_real_pcm` produces genuinely non-silent PCM for **1312 of
-  1571 frames (83.5%)** — the remaining silent frames are plausibly
-  real quiet/silent passages rather than decode failures, not yet
-  spot-checked against a reference decode.
-
-- **`huffman::ext_decode` panicked instead of erroring on a runaway
-  unary prefix** — codebook-11's extension-code unary length prefix
-  (Pseudocode 20) has no upper bound in the reader, so bit-misalignment
-  anywhere upstream in a substream walk (a separate, not yet
-  root-caused bug — hit on 1 of 1571 real frames after the two fixes
-  above) could turn into a long run of 1-bits and a `read_u32(n_ext+4)`
-  call with `n_ext+4 > 32`, which the underlying `BitReader` treats as
-  a hard panic rather than a `Result::Err`. A single malformed/
-  misaligned substream shouldn't be able to crash the whole decode
-  pipeline. Capped `n_ext` at 27 (real content never approaches this)
-  and return `Error::invalid` past that point, consistent with every
-  other try-and-bail parser in this codebase.
-
-- **`emdf_reserved()` bitstream bug** (§4.2.3.12, Table 80) — the
-  long-standing implementation read a nonexistent `b_more_bits` flag
-  followed by a `variable_bits(5)`-encoded skip count. The real syntax
-  (the table is headed `emdf_protection()`, apparently a naming
-  artifact, but it's the only definition given for what `emdf_info()`
-  calls `emdf_reserved()`) is two 2-bit skip-byte-length codes
-  (primary/secondary), each contributing `1 << (2*(code-1))` bytes of
-  reserved data when nonzero (max 32 bytes combined) — nothing like the
-  old reading. This was hit on **every real AC-4 frame** tested against
-  this session's real Tidal downloads and silently corrupted alignment
-  for everything parsed afterward, producing wrong/inconsistent
-  channel counts, sample rates, and substream sizes frame-to-frame (or
-  outright parse failures) despite passing the crate's own synthetic
-  test suite — the test fixtures and the real encoder path
-  (`encoder_ims.rs`) both wrote the same wrong 1-bit form, so reader
-  and writer agreed with each other while disagreeing with the actual
-  spec and with every real encoder's output.
-
-  Fixed in `toc::parse_emdf_reserved`, with matching fixes to the two
-  test-fixture builders (`decoder::build_minimal_toc`,
-  `decoder::build_mono_toc`) and the two real encoder call sites
-  (`encoder_ims::write_presentation_v0`, `write_presentation_v1_info`)
-  that all encoded the old wrong form. 3 new regression tests pin the
-  correct 4-bit-minimum consumption and both non-trivial skip-byte
-  codes. Verified against two complete real Tidal AC-4 files end to
-  end: 1571/1571 and 1806/1806 frames now parse successfully with
-  fully consistent `sample_rate`/`channels` across every frame, versus
-  scattered failures and frame-to-frame nonsense before the fix.
-
 ### Other
 
-- ac4 round 394 — **`audio_data_ajoc()` end-to-end** (§6.2.3.4), the
-  top-level per-frame walk for an A-JOC object-coded substream — the
-  last piece tying together every module landed in rounds 390-393:
-  * New `ajoc::parse_ajoc`/`parse_ajoc_data` (§6.2.5.1/.3): decodes
-    every present object's per-data-point Huffman parameters via
-    `ajoc_huff_data`, recovers absolute quantised values with
-    `differential_decode_dry`/`_wet` (one running `_prev` row per
-    channel/decorrelator, carried across the object's data points), and
-    dequantizes with `dequantize_dry`/`_wet` — real, tested (2 new
-    tests: a single-object round-trip, and an absent-object stays
-    zeroed check).
-  * New `toc::parse_audio_data_ajoc`: `var_channel_element` for the
-    downmix signals, `oamd_timing_data` + `oamd_dyndata_single` for the
-    downmix side, the OAMD-extension skip (using `ajoc_bed_info`'s own
-    `bits_read` to compute the exact remainder, mirroring how
-    `oamd_common_data`'s skip already worked), `ajoc()` +
-    `ajoc_dmx_de_data()` (already existing), then `oamd_timing_data` +
-    `oamd_dyndata_single` again for the upmix side. Handles the
-    A-JOC-bed-can't-carry-an-LFE quirk (`ac4_substream_info_ajoc`'s own
-    `b_lfe` flag becomes an extra leading signal ahead of
-    `bed_dyn_obj_assignment`'s descriptors, on both the downmix and
-    upmix sides).
-  * One comprehensive integration test
-    (`audio_data_ajoc_minimal_one_signal_each_side`) drives the entire
-    chain — `var_channel_element` → `oamd_timing_data` →
-    `oamd_dyndata_single` (with real 3D position) → `ajoc` (with a real
-    Huffman codeword) → `ajoc_dmx_de_data` → `oamd_timing_data` →
-    `oamd_dyndata_single` again — through one hand-built bitstream and
-    checks results end to end. Getting this bit-exact required
-    empirically measuring `parse_mono_data`'s actual consumption (its
-    inner `sf_data` body is try-and-bail / data-dependent, so it can't
-    just be padded and skipped when something real needs to follow it
-    at a known offset — a throwaway diagnostic test pinned it at
-    exactly 8 bits for an all-zero long-frame body).
-  841 lib tests passing overall.
-
-  **Still not wired up:** nothing in `decoder.rs` calls
-  `parse_audio_data_ajoc` yet — `parse_substream_group_info()` still
-  returns `Error::unsupported` the moment it sees `b_channel_coded ==
-  false`. Two narrow gaps remain by design: the `b_static_dmx` path
-  (`audio_data_chan(5.0/5.1)`) and non-timed frames (`b_dmx_timing`/
-  `b_umx_timing == 0`, which need a sticky `num_obj_info_blocks` this
-  path doesn't thread yet) both return `Error::unsupported` rather than
-  guessing.
-
-- ac4 round 393 — **OAMD dynamic per-object metadata** (`oamd_dyndata_single`,
-  §6.2.8.3, plus its `object_info_block`/`object_basic_info`/
-  `object_render_info` tree, §6.2.8.5-.7), in a new `oamd.rs` module:
-  * `parse_oamd_timing_data` (§6.2.8.2).
-  * `object_basic_info()` (gain/priority) and `object_render_info()`
-    (real 3D `pos3D_X/Y/Z` position, both absolute and
-    delta-against-previous-block forms, plus the zone/otherprops fields
-    consumed for bit-accuracy though not surfaced — they're renderer
-    tuning hints, not needed for a basic per-object position+gain
-    render).
-  * `object_info_block()`'s full active/reuse/partial-reuse dispatch,
-    threading the previous block's absolute position through for
-    delta-coded blocks.
-  * `oamd_dyndata_single()` itself, including the `b_alternative`
-    alternate-presentation branch (gain/position overrides per data
-    point).
-  9 new tests, 836 lib tests passing overall.
-
-  **Scope note** (documented at the top of `oamd.rs`): two rare, deeply
-  nested optional sub-elements return `Error::unsupported` rather than
-  being guessed at, since — unlike `oamd_common_data`'s
-  `bed_render_info()`/`headphone()`, which can be skipped as one opaque
-  declared-length block — the spec computes their skip length *from*
-  how many bits the (unimplemented) function itself would consume:
-  `add_per_object_md()` (`object_info_block`'s `b_add_table_data`
-  branch) and `ext_prec_alt_pos()` (`oamd_dyndata_single`'s
-  `b_alternative` additional-data branch).
-
-  Also flagged as a best-effort reading pending real-content
-  validation: `diff_pos3D_{X,Y,Z}`'s exact signed encoding isn't
-  spelled out in the syntax table bit-width column (just "3" bits);
-  treated as an offset-binary delta (range -4..=3) added to the
-  previous absolute position, matching this spec family's usual
-  small-delta convention elsewhere.
-
-
-- ac4 round 390 — **A-JOC Huffman decode + object-substream descriptor
-  parsing**, closing two of the gaps flagged in "Not yet supported":
-  1. **`AJOC_HCB_*` Huffman tables** (ETSI TS 103 190-2 Annex A.1.1,
-     Tables A.1-A.12) — transcribed verbatim from the Part 2
-     accompaniment ZIP's `ts_103190_tables_part2.c` (`ts_10319002v010301p0.zip`,
-     published alongside the spec PDF) into
-     `src/ajoc_huffman_tables.rs`. All 12 tables verified prefix-free
-     and round-tripped through `huff_decode` in
-     `all_ajoc_tables_decode_shortest_entry`.
-  2. **`ajoc_huff_data()`** (§6.2.5.5 / §6.3.6.5) — `get_ajoc_hcb()`
-     resolves the right one of the 12 tables from
-     `(data_type, quant_mode, hcb_type)`, with `cb_off` derived from the
-     crate's existing `AjocQuantMode::nquant`/`zero_index` rather than
-     hand-copied constants (`F0` tables are absolute, `cb_off = 0`; `DF`
-     tables share `F0`'s width, `cb_off = zero_index`; `DT` tables are
-     `2*nquant-1` wide, `cb_off = nquant-1`). Feeds directly into the
-     already-existing `differential_decode_dry`/`differential_decode_wet`
-     — verified end-to-end in
-     `ajoc_huff_data_feeds_differential_decode_end_to_end`.
-  3. **Object-coded substream descriptors** (§6.2.1.9/.10/.11) —
-     `parse_substream_info_ajoc()` (`ac4_substream_info_ajoc`) and
-     `parse_bed_dyn_obj_assignment()` (`bed_dyn_obj_assignment`, covering
-     the ISF / `bed_chan_assign_code` / non-standard-flags / per-signal
-     forms, plus the `b_dyn_objects_only` all-dynamic case) added to
-     `toc.rs`, alongside `parse_oamd_common_data()` (§6.2.8.1) — its
-     optional `bed_render_info()`/`headphone()` extension is skipped as
-     one opaque `add_data_bytes`-long block rather than field-parsed,
-     since we don't need those rendering hints and the block's length is
-     self-declared.
-
-  Still open at the time: `audio_data_ajoc()` / `var_channel_element()`
-  (the actual per-frame object audio-data walk) and
-  `oamd_dyndata_single()` (object position/gain metadata) weren't wired
-  up yet, so a real object-coded frame still wouldn't decode end-to-end
-  — `parse_substream_group_info()` still returned `Error::unsupported`
-  for `b_channel_coded == false`.
-
-- ac4 round 391 — **`var_channel_element()`** (§6.2.4.4), the A-JOC
-  downmix signals' spectral frontend — **complete for I-frames**,
-  including the A-SPX bandwidth-extension trailer: reuses the existing
-  `parse_mono_data`/`parse_two_channel_data`/`parse_three_channel_data`
-  primitives from `mch.rs` for the mono/pair/odd-tail dispatch
-  (`n_dmx_signals` even → all pairs; odd + `n_dmx_signals == 1` → a
-  single `mono_data(0)`; odd otherwise → `n_pairs - 1` leading pairs
-  then a `var_coding_config`-selected two-plus-mono or three-channel
-  tail), the `aspx_config`/`companding_control` gates when
-  `var_codec_mode == ASPX`, and — initially assumed missing, but found
-  on closer reading of `asf.rs` rather than only `decoder.rs` — the
-  trailing `aspx_data_2ch()`/`aspx_data_1ch()` elements themselves via
-  the crate's own production parsers `asf::parse_aspx_data_2ch_body` /
-  `asf::parse_aspx_data_1ch_body` (the same functions
-  `walk_ac4_substream_sticky` calls for the channel-coded path), fed a
-  fresh `SubstreamTools` per call since the trailer loop always runs
-  `n_pairs` times regardless of parity (independent of how the core
-  data grouped channels). Two new tests build a real trailer with the
-  crate's own minimal encoder helpers (`encoder_acpl3::write_aspx_data_2ch_minimal`
-  / `_1ch_minimal`, widened to `pub(crate)`) and decode it back through
-  the same parser, for both the even-pairs and odd-pair-plus-single
-  shapes — 8 tests total. **Known limitation:** non-I-frames don't read
-  `aspx_config()` at all (spec-correct — it's I-frame-only) and this
-  path doesn't yet thread a sticky config across frames the way the
-  channel-coded path's `StickyConfig` does, so that case returns
-  `Error::unsupported` rather than guessing. `audio_data_ajoc()` and
-  `oamd_dyndata_single()` are still open.
-
+- ac4 round 411 — **presentation/OAMD substream surfaces + stereo-dmx
+  coefficients + A-JOC LFE/metadata decode + CRC + ndot polarity fix**
+  (ETSI TS 103 190-1/-2). Eight landings:
+  1. **`stereo_dmx_coeff()`** (new `dmx_coeff` module): the element
+     invoked from `bed_render_info()` has no dedicated syntax box in
+     the TS — the staged clean-room trace identifies its field layout
+     as the factored-out `custom_dmx_data()` `b_stereo_dmx_coeff`
+     block (TS 103 190-2 §6.2.9.2). Parse + exact writer (LFE
+     sub-block gated on the invoking context's LFE presence) plus the
+     TS 103 190-1 §4.3.12.2 code → gain maps: Tables 149/149a
+     (quarter-power-of-two linear steps, validated against the
+     documented columns), `Lfe_mg = 5,5 − code` dB, the
+     `(15 − code)/2` dB loudness corrections, and the Table 150
+     preferred-method resolution. `bed_render_info()` /
+     `oamd_common_data()` now parse it instead of raising a bounded
+     `unsupported` (the r406 gap), with the A-JOC TOC descriptor
+     threading its `b_lfe` as the bed context.
+  2. **§6.2.9 presentation data** (new `pres_data` module):
+     `loud_corr()` (full gate ladder — obj/immersive-out flags,
+     loro/ltrt corrections, the 5_X/5_X_2/7_X/7_X_4/7_X_2/5_X_4
+     output-config corrections, core corrections, object 9_X_4),
+     `custom_dmx_data()` (bs_ch_config decision tree over
+     pres_ch_mode 11..14 × top-channel-pairs × 4-back, up to four
+     `cdmx_parameters()` rows, inline stereo-dmx block) and all six
+     `tool_*()` elements — exact writer inverses + round-trips over
+     every bs/out config combination.
+  3. **`ac4_presentation_substream()`** (§6.2.2.3): alternative
+     presentations (names, targets, per-substream activation +
+     alt_data_set_index escapes), additional-data envelope, dialnorm +
+     `further_loudness_info(1, 1)`, the `drc_metadata_size` envelope
+     around `drc_frame(b_pres_ndot)` with trailing-bit reconciliation
+     and cross-frame `drc_config`, substream-group gains (`b_keep`),
+     the associated-audio scale block, `custom_dmx_data()` +
+     `loud_corr()` tail, closing `byte_align`.
+  4. **`oamd_substream()`** (§6.2.2.4) + `oamd_substream_info()`
+     (§6.2.1.13) surfaced on `Ac4FrameInfo` (`b_oamd_ndot` + substream
+     index) — closes the README's standalone-OAMD gap.
+  5. **ndot polarity fix** — §6.3.2.11.2 defines ndot as "no
+     dependency over time": true = independently decodable = I-frame.
+     The v2 TOC read `b_pres_ndot`/`b_audio_ndot` as the *inverse* of
+     `b_iframe` and the IMS/A-JOC writers emitted the matching
+     inverted bits, so self round-trips passed while every v2 frame
+     signalled the opposite frame type on the wire. Both sides
+     flipped; fixture tests updated to spec polarity.
+  6. **A-JOC LFE decode path**: the LFE `mono_data(1)` body (long-frame
+     ASF, Table 21 `sf_info_lfe`) is IMDCT'd on a dedicated overlap
+     slot and emitted on the leading LFE output channel (previously
+     silent). Write side gains the exact duals
+     (`write_mono_data_lfe_simple` with the Table 106 `n_msfbl_bits`
+     width, LFE-aware `write_var_channel_element_simple_lfe` /
+     `write_audio_data_ajoc_simple` / `encode_ajoc_raw_frame`); a
+     decoder-level test pins non-silent LFE + object energy over a
+     3-frame packet-to-PCM run.
+  7. **`sus_ver = 1` metadata on the A-JOC route** (§6.2.2.2): the
+     route now parses the post-audio `metadata(…, 1)` element past the
+     audio_size envelope, carrying `de_config()` across frames.
+     Channel-mode binding per the staged §6.2.7.2 ruling: an object
+     substream signals no channel mode, so no channel-gated
+     `basic_metadata` field opens (MONO walk) and the stereo-dmx block
+     is absent by definition. The substream writer emits the matching
+     minimal metadata tail so encoded substreams are complete per
+     §6.2.2.2 — closes the r406 "decoder route skips it" note.
+  8. **0xAC41 CRC verification** (Annex G.4.2): `find_sync_frame`
+     verifies `crc_word` over `frame_size` + `raw_ac4_frame` and the
+     decoder rejects corrupt sync frames; `wrap_sync_frame` emits both
+     framing forms (incl. the 0xFFFF escape).
+  Suite grows 1253 → 1284 tests, all green.
+- ac4 round 406 — **A-JOC object substream wired end-to-end: OAMD layer
+  + object TOC descriptors + `audio_data_ajoc()` body + frame-decoder
+  route** (ETSI TS 103 190-2). Five milestones close the README's
+  "immersive / OAMD substream wiring" gap for A-JOC:
+  1. **OAMD element layer** (§6.2.8 + §6.3.9, new `oamd` module):
+     bit-exact parsers **and** exact writer inverses for
+     `oamd_timing_data()` (Tables 125-129 sample-offset /
+     ramp-duration prefix codes), `object_info_block()` /
+     `object_basic_info()` (Tables 134-136 gain + priority codes) /
+     `object_render_info()` (room-anchored §6.3.9.8.4 absolute +
+     differential positions, zone masks, width / screen / distance /
+     divergence property groups), `add_per_object_md()` +
+     `ext_prec_pos()` (Tables 146m-o, incl. the size-announced
+     `add_table_data` envelope reconciliation),
+     `oamd_dyndata_single()` (per-object block grids + the
+     `b_alternative` data-set tail with common-data / ISF point
+     folding and the `ext_prec_alt_pos()` additional-data envelope),
+     `oamd_dyndata_multi()` (A-JOC-coded object skipping), and
+     `oamd_common_data()` (screen-size ratio, `trim()` §6.2.8.9 with
+     all nine trim configs, `bed_render_info()` §6.2.8.8 with the
+     four `tool_t{b,f}_to_f_s[_b]()` routing elements, inside the
+     byte-envelope with filler reconciliation). 22 round-trip unit
+     tests pin every branch incl. the I-/P-frame reuse ladders. One
+     published gap surfaced precisely: `stereo_dmx_coeff()` (called
+     from `bed_render_info()`) has **no syntax box anywhere in the
+     TS** — hitting `b_stereo_dmx_coeff == 1` raises a bounded
+     `unsupported` error instead of a guessed layout.
+  2. **v2 TOC object descriptors** (§6.2.1.9-11):
+     `parse_substream_info_ajoc` (`b_static_dmx`, dmx + umx
+     `bed_dyn_obj_assignment`, inline `oamd_common_data`, upmix-count
+     escape), `bed_dyn_obj_assignment` with all five
+     position-signalling forms + Table 83/84/85/86 static counts and
+     the §6.3.2.8.0 static-before-dynamic object typing,
+     `parse_substream_info_obj` (Table 82 `n_objects`, bed / ISF /
+     reserved start forms), and the §6.2.1.6 non-channel-coded
+     substream-group loop replacing the historical `Unsupported`
+     bail; descriptors surface on `Ac4FrameInfo` (`ajoc_substreams` /
+     `obj_substreams`).
+  3. **Substream body** (§6.2.3.4 / §6.2.4.4, new `ajoc_substream`
+     module): `parse_var_channel_element` (SIMPLE + A-SPX modes, LFE
+     `mono_data(1)`, `two_channel_data` pairs, all three odd-count
+     tails, per-pair `aspx_data_2ch` + odd `aspx_data_1ch` with
+     sticky-config P-frame support) and `parse_audio_data_ajoc`
+     (static-downmix 5_X delegation and the dynamic form:
+     `dmx_active_signals_mask`, core/full OAMD timing + dyndata,
+     `ajoc_bed_info` OAMD-extension envelope, `decode_ajoc`
+     Huffman-to-dequantized-matrices, `ajoc_dmx_de_data`), plus
+     SIMPLE write-side inverses; the written body parses back with
+     bit-exact dequantized dry matrices.
+  4. **Bitstream → object-PCM decode chain** (§4.8.3.13 + §5.7):
+     `AjocSubstreamDecoder` carries the cross-frame state quartet
+     (differential reference, interpolator + decorrelator
+     reconstruction state, per-channel IMDCT overlap tails,
+     per-object QMF synthesis banks) and drives audio_size envelope →
+     body parse → IMDCT → QMF analysis → Table 49 `ajoc_reconstruct`
+     → per-object QMF synthesis. An end-to-end test decodes four
+     encoded frames and pins the settled output against a reference
+     selector chain to < 0,5 % of peak (exercising the Table-48
+     one-extra-increment plateau convergence).
+  5. **Frame-decoder route + full-frame encoder**: `Ac4Decoder`
+     detects a v2 TOC carrying `ac4_substream_info_ajoc` and decodes
+     the object substream to interleaved PCM via the persistent
+     chain; `encode_ajoc_raw_frame` emits the matching complete
+     `raw_ac4_frame` (v2 TOC + SIMPLE A-JOC substream). A
+     decoder-level test drives three frames packet-to-PCM and pins
+     per-object signal energy.
+  6. **`sus_ver = 1` metadata element layer** (§6.2.7):
+     `parse/write_metadata_v2` with `basic_metadata(…, 1)` (no
+     dialnorm, `substream_loudness_bits` +
+     `b_further_substream_loudness_info` pair, no `sus_ver = 0`
+     stereo-dmx block), `further_loudness_info(1, b_presentation_ldn)`
+     (headerless `b_loudcorr_dialgate` form, `prgmbndy` gating, the
+     `rtll_comp` tail), the `extended_metadata` leading-`b_dialog`
+     form, and the drc-frame-free tools envelope — all with exact
+     writer inverses and round-trip tests. (The decoder route still
+     skips post-audio metadata: the spec does not state which
+     `channel_mode` binds `basic_metadata`'s layout gates for an
+     object substream — left as a docs question rather than guessed.)
+- ac4 round 392 — **A-JOC Huffman layer + full `ajoc()` decode/encode,
+  and the complete A-JCC subsystem** (ETSI TS 103 190-2). Seven
+  milestones:
+  1. **A-JOC codebooks + §6.2.5.5 `ajoc_huff_data()`**
+     (`ajoc_huffman` / `ajoc_hcb_tables`): the twelve Annex A.1.1
+     `AJOC_HCB_<DRY|WET>_<COARSE|FINE>_<F0|DF|DT>` `_LEN`/`_CW` arrays
+     transcribed from the ETSI Part 2 electronic-attachment table file
+     (verified complete prefix codes: Kraft sum == 1, pairwise
+     prefix-freedom, Annex metadata match), the §6.3.6.5.2 Table 104
+     `get_ajoc_hcb()` selection, `huff_decode_diff()` (Part 1
+     §4.3.10.8.3) and the exact `write_ajoc_huff_data` inverse. Closes
+     the crate's long-standing A-JOC Huffman docs gap.
+  2. **§6.2.5.1/§6.2.5.3 `ajoc()` / `ajoc_data()`** (`ajoc_data`):
+     payload parse with sparse gating + `b_dfonly` constraint,
+     `decode_ajoc()` through Table 43 differential decode (cross-frame
+     `AjocDiffState`) and §5.7.3.3 dequantization into
+     `AjocDequantMatrices` feeding `ajoc_reconstruct`; exact writers;
+     bitstream→QMF-objects end-to-end test.
+  3. **A-JOC parameter encoder** (`encoder_ajoc`): Table 44-47 inverse
+     quantizers, per-row DIFF_FREQ vs DIFF_TIME selection by real
+     codeword bit cost, GOP-chained emission with encoder/decoder
+     prev-state lockstep (exact-on-grid over I/P/P/P, measured P-frame
+     row-bit savings).
+  4. **A-JCC codebooks + §6.2.6 bitstream layer** (`ajcc` /
+     `ajcc_hcb_tables`): Annex A.1.2 Tables A.13-A.24 arrays, Table 116
+     `get_ajcc_hcb()` (ALPHA/BETA → Part 1 A-CPL books),
+     `ajcc_huff_data` / `ajcc_framing_data` / `ajced` / `ajcc_data` for
+     both layouts with exact writer inverses; §5.6.3.2 Table 29
+     differential decode + Table 30/31 dry/wet dequantizers + the
+     Part 1 Tables 202-205 ibeta-coupled alpha/beta path.
+  5. **A-JCC full decoding mode** (`ajcc_synth`): §5.6.3.3 Table 32
+     smooth/steep interpolation (Table 33 tails), Table 36 core-mode
+     crossfade, Tables 37/38 modules and the Table 35
+     `ajcc_full_decode()` driver (D0/D1/D2 instance assignment,
+     transient ducking, √2 output gains).
+  6. **A-JCC core decoding mode**: Tables 40/41 `ajcc_module_3/4` and
+     the Table 39 `ajcc_core_decode()` 7-channel driver.
+  7. **Bridge + end-to-end**: `AjccOwnedParams` decode→synthesis bridge
+     and a 2-frame I/P GOP test through the whole chain (bitstream →
+     Huffman → Table 29 → dequant → interpolate → reconstruct) with
+     bit-flat P-frame output verification.
 - ac4 round 389 — **inter-frame (P-frame, `b_iframe = 0`) support
   end-to-end** (ETSI TS 103 190-1 §4.2.6.x Tables 25/33, §4.2.12.3/4
   Tables 51/52, §5.7.6.3.4 Pseudocodes 80/81, §4.2.13.7 Table 65 /

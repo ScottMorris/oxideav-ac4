@@ -93,6 +93,11 @@ pub struct Ac4Decoder {
     /// §4.2.6.x. Harvested from every I-frame, seeded into every
     /// non-I-frame walk.
     sticky: asf::StickyConfig,
+    /// A-JOC object-substream decode state (TS 103 190-2 §5.7),
+    /// allocated on the first v2 frame whose TOC carries an
+    /// `ac4_substream_info_ajoc()` descriptor. Keyed by
+    /// `(num_dmx, num_umx)`; a geometry change reallocates.
+    ajoc_dec: Option<(usize, usize, crate::ajoc_substream::AjocSubstreamDecoder)>,
 }
 
 /// Phase-1 result of [`Ac4Decoder::aspx_extend_to_qmf`]:
@@ -185,14 +190,22 @@ impl Ac4Decoder {
             ssf_synth_state: Vec::new(),
             ssf_walker_state: Vec::new(),
             sticky: asf::StickyConfig::default(),
+            ajoc_dec: None,
         }
     }
 
-    fn extract_raw_frame<'a>(&self, pkt: &'a Packet) -> (&'a [u8], bool) {
+    fn extract_raw_frame<'a>(&self, pkt: &'a Packet) -> Result<(&'a [u8], bool)> {
         if let Some(f) = sync::find_sync_frame(&pkt.data) {
-            (f.payload, true)
+            // Annex G.4.2: verify the 0xAC41 crc_word over frame_size +
+            // raw_ac4_frame; a mismatch means the frame is corrupt.
+            if f.crc_valid == Some(false) {
+                return Err(Error::invalid(
+                    "ac4 decoder: sync-frame CRC mismatch (0xAC41)",
+                ));
+            }
+            Ok((f.payload, true))
         } else {
-            (pkt.data.as_slice(), false)
+            Ok((pkt.data.as_slice(), false))
         }
     }
 
@@ -2052,6 +2065,80 @@ impl Ac4Decoder {
             }
         }
     }
+
+    /// Decode a v2 frame whose first substream group carries an A-JOC
+    /// object substream (TS 103 190-2 §6.2.3.4): run the
+    /// [`crate::ajoc_substream::AjocSubstreamDecoder`] chain and emit
+    /// the reconstructed objects as interleaved S16 output channels
+    /// (decoded LFE slot first when signalled).
+    fn receive_frame_ajoc(
+        &mut self,
+        raw: &[u8],
+        info: toc::Ac4FrameInfo,
+        pts: Option<i64>,
+    ) -> Result<Frame> {
+        let desc = info.ajoc_substreams[0].clone();
+        let params = crate::ajoc_substream::AjocBodyParams::from_substream_info(&desc);
+        let num_dmx = params.n_fullband_dmx_signals as usize;
+        let num_umx = params.n_fullband_upmix_signals as usize;
+        // Substream 0 starts at toc_size + payload_base.
+        let start = (info.toc_size + info.payload_base) as usize;
+        if start >= raw.len() {
+            return Err(Error::invalid("ac4: A-JOC frame without substream bytes"));
+        }
+        let end = info
+            .substream_sizes
+            .first()
+            .map(|&sz| start.saturating_add(sz as usize).min(raw.len()))
+            .unwrap_or(raw.len());
+        let substream = &raw[start..end];
+        let matches = matches!(
+            &self.ajoc_dec,
+            Some((d, u, _)) if *d == num_dmx && *u == num_umx
+        );
+        if !matches {
+            self.ajoc_dec = Some((
+                num_dmx,
+                num_umx,
+                crate::ajoc_substream::AjocSubstreamDecoder::new(num_dmx, num_umx),
+            ));
+        }
+        let dec = &mut self.ajoc_dec.as_mut().expect("ajoc decoder ensured").2;
+        let (objects, lfe, _body, _metadata) = dec.decode_substream_pcm(
+            substream,
+            &params,
+            desc.b_iframe(),
+            false,
+            info.frame_length,
+        )?;
+        let samples = info.frame_length;
+        // Output layout mirrors the upmix signal set: decoded LFE slot
+        // first when signalled, then the fullband objects.
+        let channels_out = desc.n_umx_signals() as usize;
+        let lfe_slots = usize::from(desc.b_lfe);
+        let mut buf = vec![0u8; samples as usize * channels_out * 2];
+        let write_channel = |buf: &mut [u8], c: usize, pcm: &[f32]| {
+            for (i, &v) in pcm.iter().take(samples as usize).enumerate() {
+                let s = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                let le = s.to_le_bytes();
+                let off = (i * channels_out + c) * 2;
+                buf[off] = le[0];
+                buf[off + 1] = le[1];
+            }
+        };
+        if let (true, Some(lfe_pcm)) = (desc.b_lfe, lfe.as_ref()) {
+            write_channel(&mut buf, 0, lfe_pcm);
+        }
+        for (o, pcm) in objects.iter().enumerate() {
+            write_channel(&mut buf, o + lfe_slots, pcm);
+        }
+        self.last_info = Some(info);
+        Ok(Frame::Audio(AudioFrame {
+            samples,
+            pts,
+            data: vec![buf],
+        }))
+    }
 }
 
 impl Decoder for Ac4Decoder {
@@ -2086,9 +2173,17 @@ impl Decoder for Ac4Decoder {
                 data: vec![Vec::new()],
             }));
         }
-        let (raw, _had_sync) = self.extract_raw_frame(&pkt);
+        let (raw, _had_sync) = self.extract_raw_frame(&pkt)?;
         let info = toc::parse_ac4_toc(raw)
             .map_err(|e| Error::invalid(format!("ac4 decoder: TOC parse failed: {e}")))?;
+        // A-JOC object substream (TS 103 190-2 §6.2.3.4): route to the
+        // dedicated object decode chain and emit the reconstructed
+        // objects as output channels.
+        if !info.ajoc_substreams.is_empty() {
+            let raw_owned = raw.to_vec();
+            let pts = pkt.pts;
+            return self.receive_frame_ajoc(&raw_owned, info, pts);
+        }
         // Resolve shape with fallbacks to the container hint when the
         // TOC carried a reserved / escape value.
         let channels = if info.channels == 0 {
@@ -4358,6 +4453,28 @@ mod tests {
         assert_eq!(af.samples, 1_920);
     }
 
+    #[test]
+    fn decoder_verifies_ac41_crc() {
+        let raw = build_minimal_toc();
+        // Valid 0xAC41 framing decodes.
+        let wrapped = crate::sync::wrap_sync_frame(&raw, true);
+        let params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&params);
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), wrapped.clone());
+        dec.send_packet(&pkt).unwrap();
+        let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+            panic!("expected audio");
+        };
+        assert_eq!(af.samples, 1_920);
+        // Corrupting a payload byte trips the Annex G.4.2 check.
+        let mut bad = wrapped;
+        bad[6] ^= 0x40;
+        let pkt = Packet::new(0, TimeBase::new(1, 48_000), bad);
+        dec.send_packet(&pkt).unwrap();
+        let err = dec.receive_frame().unwrap_err();
+        assert!(format!("{err}").contains("CRC"), "unexpected error: {err}");
+    }
+
     /// Round-31: end-to-end SSF synthesis test. Builds a synthetic
     /// SsfData via the public API (LONG_STRIDE I-frame, num_bands=12,
     /// predictor disabled), runs the §5.2.3-5.2.7 synth, and verifies
@@ -6546,5 +6663,233 @@ mod tests {
         // Each PCM matches the input length.
         assert_eq!(out[0].1.len(), n);
         assert_eq!(out[1].1.len(), n);
+    }
+
+    /// Frame-level A-JOC end-to-end: `encode_ajoc_raw_frame` emits
+    /// a complete v2 `raw_ac4_frame` (TOC with the
+    /// `ac4_substream_info_ajoc` descriptor plus a SIMPLE A-JOC
+    /// substream); `Ac4Decoder` routes it through the object decode
+    /// chain and produces non-silent PCM on every reconstructed
+    /// object channel.
+    #[test]
+    fn decoder_routes_ajoc_object_frames_end_to_end() {
+        use crate::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
+        use crate::ajoc_substream::{encode_ajoc_raw_frame, AjocBodyParams};
+        use crate::encoder_ajoc::AjocQuantMatrices;
+        use crate::oamd::ObjType;
+
+        let num_dmx = 2usize;
+        let num_umx = 3usize;
+        let num_decorr = 1usize;
+        let params = AjocBodyParams {
+            b_lfe: false,
+            b_static_dmx: false,
+            n_fullband_dmx_signals: num_dmx as u32,
+            n_fullband_upmix_signals: num_umx as u32,
+            obj_type_dmx: vec![ObjType::Dyn; num_dmx],
+            obj_type_umx: vec![ObjType::Dyn; num_umx],
+        };
+        let ctrl = AjocCtrlInfo {
+            decorr_enable: vec![true; num_decorr],
+            object_present: vec![true; num_umx],
+            data_point_info: AjocDataPointInfo {
+                num_dpoints: 1,
+                start_pos: vec![0],
+                ramp_len: vec![16],
+            },
+            num_bands_code: vec![7; num_umx],
+            num_bands: vec![1; num_umx],
+            quant_select: vec![AjocQuantMode::Fine; num_umx],
+            sparse_select: vec![false; num_umx],
+            mix_mtx_dry_present: vec![vec![true; num_dmx]; num_umx],
+            mix_mtx_wet_present: vec![vec![true; num_decorr]; num_umx],
+        };
+        let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|o| {
+                vec![(0..num_dmx)
+                    .map(|ch| vec![if ch == o % num_dmx { 1.0 } else { 0.0 }])
+                    .collect()]
+            })
+            .collect();
+        let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|_| vec![vec![vec![0.0]; num_decorr]])
+            .collect();
+        let qmats = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
+
+        // Two tone spectra (1920-sample long frame, max_sfb = 20).
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let end = sfbo[20] as usize;
+        let mk = |bin: usize| {
+            let mut v = vec![0.0f32; end];
+            v[bin] = 40.0;
+            v
+        };
+        let s0 = mk(24);
+        let s1 = mk(60);
+        let spectra: Vec<&[f32]> = vec![&s0, &s1];
+
+        let mut enc_state = crate::ajoc_data::new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let dec_params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&dec_params);
+        let mut last_energy = vec![0.0f64; num_umx];
+        for seq in 0..3u32 {
+            let frame = encode_ajoc_raw_frame(
+                seq,
+                &params,
+                &spectra,
+                None,
+                20,
+                num_decorr as u32,
+                &ctrl,
+                &qmats,
+                true,
+                &mut enc_state,
+            )
+            .unwrap();
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                panic!("expected an audio frame");
+            };
+            assert_eq!(af.samples, 1920);
+            let buf = &af.data[0];
+            assert_eq!(buf.len(), 1920 * num_umx * 2);
+            // Per-object energy from the interleaved S16 buffer.
+            for (o, slot) in last_energy.iter_mut().enumerate() {
+                let mut e = 0.0f64;
+                for i in 0..1920usize {
+                    let off = (i * num_umx + o) * 2;
+                    let s = i16::from_le_bytes([buf[off], buf[off + 1]]) as f64;
+                    e += s * s;
+                }
+                *slot = e;
+            }
+        }
+        // Every reconstructed object carries signal once the ramps
+        // settle; objects 0 and 2 share downmix channel 0 (selector
+        // matrix) so their settled energies match closely.
+        for (o, &e) in last_energy.iter().enumerate() {
+            assert!(e > 1e4, "object {o} is silent: energy {e}");
+        }
+        let ratio = last_energy[0] / last_energy[2];
+        assert!(
+            (0.9..=1.1).contains(&ratio),
+            "objects 0/2 share a source; energy ratio {ratio}"
+        );
+    }
+
+    /// A-JOC frame with `b_lfe = 1`: the LFE `mono_data(1)` body is
+    /// decoded to PCM and emitted on the leading LFE output slot (it
+    /// bypasses the spatial reconstruction), while the reconstructed
+    /// objects still land on the trailing slots.
+    #[test]
+    fn decoder_ajoc_lfe_slot_carries_decoded_pcm() {
+        use crate::ajoc::{AjocCtrlInfo, AjocDataPointInfo, AjocQuantMode};
+        use crate::ajoc_substream::{encode_ajoc_raw_frame, AjocBodyParams};
+        use crate::encoder_ajoc::AjocQuantMatrices;
+        use crate::oamd::ObjType;
+
+        let num_dmx = 2usize;
+        let num_umx = 2usize;
+        let num_decorr = 1usize;
+        // LFE-first object typing (LFE occupies slot 0 of both sets).
+        let params = AjocBodyParams {
+            b_lfe: true,
+            b_static_dmx: false,
+            n_fullband_dmx_signals: num_dmx as u32,
+            n_fullband_upmix_signals: num_umx as u32,
+            obj_type_dmx: vec![ObjType::Dyn; num_dmx + 1],
+            obj_type_umx: vec![ObjType::Dyn; num_umx + 1],
+        };
+        let ctrl = AjocCtrlInfo {
+            decorr_enable: vec![true; num_decorr],
+            object_present: vec![true; num_umx],
+            data_point_info: AjocDataPointInfo {
+                num_dpoints: 1,
+                start_pos: vec![0],
+                ramp_len: vec![16],
+            },
+            num_bands_code: vec![7; num_umx],
+            num_bands: vec![1; num_umx],
+            quant_select: vec![AjocQuantMode::Fine; num_umx],
+            sparse_select: vec![false; num_umx],
+            mix_mtx_dry_present: vec![vec![true; num_dmx]; num_umx],
+            mix_mtx_wet_present: vec![vec![true; num_decorr]; num_umx],
+        };
+        let dry: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|o| {
+                vec![(0..num_dmx)
+                    .map(|ch| vec![if ch == o { 1.0 } else { 0.0 }])
+                    .collect()]
+            })
+            .collect();
+        let wet: Vec<Vec<Vec<Vec<f64>>>> = (0..num_umx)
+            .map(|_| vec![vec![vec![0.0]; num_decorr]])
+            .collect();
+        let qmats = AjocQuantMatrices::from_real(&dry, &wet, &ctrl);
+
+        let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
+        let end = sfbo[20] as usize;
+        let mk = |bin: usize| {
+            let mut v = vec![0.0f32; end];
+            v[bin] = 40.0;
+            v
+        };
+        let s0 = mk(24);
+        let s1 = mk(60);
+        let spectra: Vec<&[f32]> = vec![&s0, &s1];
+        // LFE spectrum: energy in the lowest bins (max_sfb_lfe = 4).
+        let lfe_end = sfbo[4] as usize;
+        let mut lfe_spec = vec![0.0f32; lfe_end];
+        lfe_spec[1] = 60.0;
+        lfe_spec[3] = 30.0;
+
+        let mut enc_state = crate::ajoc_data::new_ajoc_diff_state(num_umx, num_dmx, 7);
+        let dec_params = CodecParameters::audio(CodecId::new("ac4"));
+        let mut dec = Ac4Decoder::new(&dec_params);
+        let channels_out = num_umx + 1;
+        let mut last_energy = vec![0.0f64; channels_out];
+        for seq in 0..3u32 {
+            let frame = encode_ajoc_raw_frame(
+                seq,
+                &params,
+                &spectra,
+                Some((&lfe_spec, 4)),
+                20,
+                num_decorr as u32,
+                &ctrl,
+                &qmats,
+                true,
+                &mut enc_state,
+            )
+            .unwrap();
+            let pkt = Packet::new(0, TimeBase::new(1, 48_000), frame);
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Audio(af) = dec.receive_frame().unwrap() else {
+                panic!("expected an audio frame");
+            };
+            assert_eq!(af.samples, 1920);
+            let buf = &af.data[0];
+            assert_eq!(buf.len(), 1920 * channels_out * 2);
+            for (c, slot) in last_energy.iter_mut().enumerate() {
+                let mut e = 0.0f64;
+                for i in 0..1920usize {
+                    let off = (i * channels_out + c) * 2;
+                    let s = i16::from_le_bytes([buf[off], buf[off + 1]]) as f64;
+                    e += s * s;
+                }
+                *slot = e;
+            }
+        }
+        // Slot 0 is the decoded LFE, no longer silent.
+        assert!(
+            last_energy[0] > 1e4,
+            "LFE slot is silent: energy {}",
+            last_energy[0]
+        );
+        // The reconstructed objects still carry their signal.
+        for (o, &e) in last_energy.iter().enumerate().skip(1) {
+            assert!(e > 1e4, "object slot {o} is silent: energy {e}");
+        }
     }
 }
