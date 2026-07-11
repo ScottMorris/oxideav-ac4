@@ -3580,11 +3580,16 @@ impl Decoder for Ac4Decoder {
                 std::env::var_os("AC4_DUMP_PCMF32").map(|_| {
                     Vec::with_capacity(samples as usize * channels as usize)
                 });
-            // Channel fallback: if only channel 0 was decoded for a
-            // multi-channel stream (e.g. a stereo frame whose CPE body
-            // didn't parse), duplicate it across the remaining slots so
-            // the output is audible rather than one-sided.
-            let fallback = pcm_per_channel[0].clone();
+            // Channel fallback: duplicate ch0 into empty slots ONLY for
+            // mono/stereo streams (a stereo frame whose CPE body didn't
+            // parse). For multichannel it sabotages front-muting and
+            // pollutes every silent slot with ch0's content (round 410c
+            // scorecard: 'muted' fronts showed 699/699 active).
+            let fallback = if channels <= 2 {
+                pcm_per_channel[0].clone()
+            } else {
+                None
+            };
             let out_gain = {
                 use std::sync::OnceLock;
                 static G: OnceLock<f32> = OnceLock::new();
