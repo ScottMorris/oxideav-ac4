@@ -1672,10 +1672,33 @@ impl Ac4Decoder {
             if let Some(Some(t0)) = tcd.scaled_spec_per_channel.get(0) { dump_role_spec("c1_tcd0", t0); }
             if let Some(Some(t1)) = tcd.scaled_spec_per_channel.get(1) { dump_role_spec("c1_tcd1", t1); }
             let n2 = samples;
+            // §5.3.3.2: bmsp=1 pairs need the per-band 2x2 unmix
+            // (Round 409 — was skipped; pair rode in prediction domain).
+            let mut unmixed: Option<[Vec<f32>; 2]> = None;
+            if tcd.b_enable_mdct_stereo_proc {
+                if let (Some(Some(t0)), Some(Some(t1)), Some(cp), Some(ti)) = (
+                    tcd.scaled_spec_per_channel.get(0),
+                    tcd.scaled_spec_per_channel.get(1),
+                    tcd.chparam.as_ref(),
+                    tcd.transform_info.as_ref(),
+                ) {
+                    let mut u0 = t0.clone();
+                    let mut u1 = t1.clone();
+                    Self::apply_two_channel_matrix(&mut u0, &mut u1, cp, ti.transform_length_0);
+                    unmixed = Some([u0, u1]);
+                }
+            }
             const TWO_SLOTS: [usize; 2] = [3, 4];
             for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
-                let Some(scaled) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
-                    continue;
+                let owned;
+                let scaled: &Vec<f32> = if let Some(u) = unmixed.as_ref() {
+                    &u[ch_in]
+                } else {
+                    let Some(sc) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
+                        continue;
+                    };
+                    owned = sc;
+                    owned
                 };
                 let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
                 entries.push((
@@ -1707,105 +1730,100 @@ impl Ac4Decoder {
     /// Per-band a/b/c/d come from Pseudocode 59 (sap_mode 0 identity;
     /// 2 or 1-with-ms_used the M/S butterfly; 3 = full SAP, applied
     /// as identity until alpha gains are wired).
-    fn apply_three_channel_matrix(
-        specs: &mut [Vec<f32>],
-        info: &crate::mch::ThreeChannelInfo,
+
+    /// §5.3.3.2 EXACT: per-band 2x2 unmix for a two_channel_data pair
+    /// coded with b_enable_mdct_stereo_proc == 1. O = [[a,b],[c,d]] * I
+    /// with quads from Pseudocode 59 (extract_sap_abcd).
+    fn apply_two_channel_matrix(
+        s0: &mut [f32],
+        s1: &mut [f32],
+        cp: &asf::ChparamInfo,
         transform_length: u32,
     ) {
-        if specs.len() < 3 {
-            return;
-        }
-        const MATSEL: [(usize, usize, bool); 12] = [
-            (0, 1, true),
-            (1, 0, true),
-            (0, 2, true),
-            (1, 2, false),
-            (0, 2, false),
-            (2, 1, false),
-            (1, 0, false),
-            (0, 1, false),
-            (2, 0, false),
-            (2, 1, true),
-            (2, 0, true),
-            (1, 2, true),
-        ];
-        let ms = info.chel_matsel as usize;
-        if std::env::var_os("AC4_TRACE_BODIES").is_some() {
-            eprintln!(
-                "MTX3 matsel={} saps=({},{})",
-                ms, info.chparam[0].sap_mode, info.chparam[1].sap_mode
-            );
-        }
-        if ms >= 12 {
-            return;
-        }
-        let (p, q, var_a) = MATSEL[ms];
-        let u = 3 - p - q;
         let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
             return;
         };
-        let n = specs.iter().map(|v| v.len()).min().unwrap_or(0);
-        let params = |cp: &crate::asf::ChparamInfo, sfb: usize| -> (f32, f32, f32, f32) {
-            match cp.sap_mode {
-                2 => (1.0, 1.0, 1.0, -1.0),
-                1 => {
-                    let used = cp
-                        .ms_used
-                        .first()
-                        .and_then(|row| row.get(sfb))
-                        .copied()
-                        .unwrap_or(false);
-                    if used {
-                        (1.0, 1.0, 1.0, -1.0)
-                    } else {
-                        (1.0, 0.0, 0.0, 1.0)
-                    }
-                }
-                _ => (1.0, 0.0, 0.0, 1.0),
-            }
-        };
-        for sfb in 0..sfbo.len().saturating_sub(1) {
+        let num_sfb = (sfbo.len() - 1) as u32;
+        let qv = asf::extract_sap_abcd(cp, &[num_sfb]);
+        let n = s0.len().min(s1.len());
+        for sfb in 0..num_sfb as usize {
             let lo = sfbo[sfb] as usize;
             let hi = (sfbo[sfb + 1] as usize).min(n);
             if lo >= hi {
                 break;
             }
-            let (a0, b0, c0, d0) = params(&info.chparam[0], sfb);
-            let (a1, b1, c1, d1) = params(&info.chparam[1], sfb);
+            let (a, b, c, d) = qv.abcd[0].get(sfb).copied().unwrap_or((1.0, 0.0, 0.0, 1.0));
             for k in lo..hi {
-                let ip = specs[p][k];
-                let iq = specs[q][k];
-                let iu = specs[u][k];
-                let t_hi = a0 * ip + b0 * iq;
-                let t_lo = c0 * ip + d0 * iq;
-                let (op, oq, ou);
-                if var_a {
-                    op = a1 * t_hi + b1 * iu;
-                    ou = c1 * t_hi + d1 * iu;
-                    oq = t_lo;
-                } else {
-                    op = t_hi;
-                    ou = a1 * iu + b1 * t_lo;
-                    oq = c1 * iu + d1 * t_lo;
-                }
-                specs[p][k] = op;
-                specs[q][k] = oq;
-                specs[u][k] = ou;
+                let i0 = s0[k];
+                let i1 = s1[k];
+                s0[k] = a * i0 + b * i1;
+                s1[k] = c * i0 + d * i1;
             }
         }
     }
 
-    /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 3`
-    /// dispatch. The body is a single `five_channel_data`; channel
-    /// mapping is the identity:
-    ///
-    /// ```text
-    ///     five_channel_data[0..5] -> [0, 1, 2, 3, 4] (L, R, C, Ls, Rs)
-    /// ```
-    ///
-    /// No-op on transform-length / sample-count mismatch, or when a
-    /// per-channel scaled spectrum is absent.
-    #[allow(clippy::too_many_arguments)]
+    fn apply_three_channel_matrix(
+        specs: &mut [Vec<f32>],
+        info: &crate::mch::ThreeChannelInfo,
+        transform_length: u32,
+    ) {
+        // §5.3.3.3 EXACT: extract per-band (a,b,c,d) quads from the two
+        // chparam_info elements via Pseudocode 59 (extract_sap_abcd),
+        // compose the Table-178 3x3 for chel_matsel, apply per sfb.
+        // (Round 409: replaces the approximate butterfly LUT that
+        // amplified one output ~2^15 past its body and zeroed the
+        // siblings — the frame-0 python proof in riptide docs.)
+        if specs.len() < 3 {
+            return;
+        }
+        let ms = info.chel_matsel as usize;
+        if ms >= 12 {
+            return;
+        }
+        let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+            return;
+        };
+        let num_sfb = (sfbo.len() - 1) as u32;
+        let q0v = asf::extract_sap_abcd(&info.chparam[0], &[num_sfb]);
+        let q1v = asf::extract_sap_abcd(&info.chparam[1], &[num_sfb]);
+        let n = specs.iter().map(|v| v.len()).min().unwrap_or(0);
+        if std::env::var_os("AC4_SYNTH_TRACE").is_some() {
+            eprintln!("MTX3-exact matsel={ms}");
+        }
+        for sfb in 0..num_sfb as usize {
+            let lo = sfbo[sfb] as usize;
+            let hi = (sfbo[sfb + 1] as usize).min(n);
+            if lo >= hi {
+                break;
+            }
+            let (a0, b0, c0, d0) = q0v.abcd[0].get(sfb).copied().unwrap_or((1.0, 0.0, 0.0, 1.0));
+            let (a1, b1, c1, d1) = q1v.abcd[0].get(sfb).copied().unwrap_or((1.0, 0.0, 0.0, 1.0));
+            // Table 178, transcribed: rows of M per chel_matsel.
+            let m3: [[f32; 3]; 3] = match ms {
+                0 => [[a0*a1, b0*a1, b1], [c0, d0, 0.0], [a0*c1, b0*c1, d1]],
+                1 => [[d0, c0, 0.0], [b0*a1, a0*a1, b1], [b0*c1, a0*c1, d1]],
+                2 => [[a0*a1, b1, b0*a1], [a0*c1, d1, b0*c1], [c0, 0.0, d0]],
+                3 => [[a1, c0*b1, d0*b1], [0.0, a0, b0], [c1, c0*d1, d0*d1]],
+                4 => [[a0, 0.0, b0], [c0*b1, a1, d0*b1], [c0*d1, c1, d0*d1]],
+                5 => [[a1, d0*b1, c0*b1], [c1, d0*d1, c0*d1], [0.0, b0, a0]],
+                6 => [[d0*d1, c0*d1, c1], [b0, a0, 0.0], [d0*b1, c0*b1, a1]],
+                7 => [[a0, b0, 0.0], [c0*d1, d0*d1, c1], [c0*b1, d0*b1, a1]],
+                8 => [[d0*d1, c1, c0*d1], [d0*b1, a1, c0*b1], [b0, 0.0, a0]],
+                9 => [[d1, b0*c1, a0*c1], [0.0, d0, c0], [b1, b0*a1, a0*a1]],
+                10 => [[d0, 0.0, c0], [b0*c1, d1, a0*c1], [b0*a1, b1, a0*a1]],
+                _ => [[d1, a0*c1, b0*c1], [b1, a0*a1, b0*a1], [0.0, c0, d0]],
+            };
+            for k in lo..hi {
+                let i0 = specs[0][k];
+                let i1 = specs[1][k];
+                let i2 = specs[2][k];
+                specs[0][k] = m3[0][0] * i0 + m3[0][1] * i1 + m3[0][2] * i2;
+                specs[1][k] = m3[1][0] * i0 + m3[1][1] * i1 + m3[1][2] * i2;
+                specs[2][k] = m3[2][0] * i0 + m3[2][1] * i1 + m3[2][2] * i2;
+            }
+        }
+    }
+
     fn dispatch_5x_cfg3_simple_aspx(
         &mut self,
         five: &crate::mch::FiveChannelData,
