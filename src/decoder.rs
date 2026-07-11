@@ -1788,7 +1788,26 @@ impl Ac4Decoder {
         let q1v = asf::extract_sap_abcd(&info.chparam[1], &[num_sfb]);
         let n = specs.iter().map(|v| v.len()).min().unwrap_or(0);
         if std::env::var_os("AC4_SYNTH_TRACE").is_some() {
-            eprintln!("MTX3-exact matsel={ms}");
+            let fmt = |q: &asf::SapCoeffs| -> String {
+                q.abcd[0]
+                    .iter()
+                    .take(20)
+                    .map(|&(a, b, _c, d)| {
+                        if (a, b, d) == (1.0, 0.0, 1.0) { 'I' }
+                        else if (a, b, d) == (1.0, 1.0, -1.0) { 'M' }
+                        else { 'A' }
+                    })
+                    .collect()
+            };
+            eprintln!(
+                "MTX3-exact matsel={ms} sap=({},{}) ms_used_len=({},{}) q0[{}] q1[{}]",
+                info.chparam[0].sap_mode,
+                info.chparam[1].sap_mode,
+                info.chparam[0].ms_used.first().map(|r| r.len()).unwrap_or(0),
+                info.chparam[1].ms_used.first().map(|r| r.len()).unwrap_or(0),
+                fmt(&q0v),
+                fmt(&q1v)
+            );
         }
         for sfb in 0..num_sfb as usize {
             let lo = sfbo[sfb] as usize;
@@ -1814,9 +1833,28 @@ impl Ac4Decoder {
                 _ => [[d1, a0*c1, b0*c1], [b1, a0*a1, b0*a1], [0.0, c0, d0]],
             };
             for k in lo..hi {
-                let i0 = specs[0][k];
-                let i1 = specs[1][k];
-                let i2 = specs[2][k];
+                // AC4_MTX_ORDER=abc maps matrix inputs (I0,I1,I2) to
+                // parsed bodies (B_a,B_b,B_c). Frame-0 forensics: the
+                // clean body belongs at I1 (center passthrough) and
+                // the hot mid/side pair at I0/I2 — bitstream order is
+                // one rotation off the Table-178 input order.
+                use std::sync::OnceLock;
+                static ORD: OnceLock<[usize; 3]> = OnceLock::new();
+                let ord = *ORD.get_or_init(|| {
+                    std::env::var("AC4_MTX_ORDER")
+                        .ok()
+                        .and_then(|v| {
+                            let b: Vec<usize> = v
+                                .chars()
+                                .filter_map(|c| c.to_digit(10).map(|d| d as usize))
+                                .collect();
+                            (b.len() == 3 && b.iter().all(|&x| x < 3)).then(|| [b[0], b[1], b[2]])
+                        })
+                        .unwrap_or([0, 1, 2])
+                });
+                let i0 = specs[ord[0]][k];
+                let i1 = specs[ord[1]][k];
+                let i2 = specs[ord[2]][k];
                 specs[0][k] = m3[0][0] * i0 + m3[0][1] * i1 + m3[0][2] * i2;
                 specs[1][k] = m3[1][0] * i0 + m3[1][1] * i1 + m3[1][2] * i2;
                 specs[2][k] = m3[2][0] * i0 + m3[2][1] * i1 + m3[2][2] * i2;
