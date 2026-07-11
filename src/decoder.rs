@@ -645,7 +645,7 @@ impl Ac4Decoder {
         ch: usize,
         data: &crate::ssf::SsfData,
         frame_samples: usize,
-    ) -> Vec<i16> {
+    ) -> Vec<f32> {
         // Drive the synth.
         let state_idx = ch.min(self.ssf_synth_state.len().saturating_sub(1));
         let mut spec_concat: Vec<f32> = Vec::new();
@@ -693,7 +693,7 @@ impl Ac4Decoder {
         } else if pcm_out.len() < frame_samples {
             pcm_out.resize(frame_samples, 0.0);
         }
-        Self::pcm_f32_to_i16(&pcm_out)
+        pcm_out
     }
 
     /// IMDCT a sequence of already-ungrouped per-window spectra
@@ -733,7 +733,7 @@ impl Ac4Decoder {
         slot: usize,
         windows: Option<&[crate::mch::WindowSpectrum]>,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let Some(windows) = windows else {
             return;
@@ -745,7 +745,7 @@ impl Ac4Decoder {
         while pcm_per_channel.len() <= slot {
             pcm_per_channel.push(None);
         }
-        pcm_per_channel[slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
+        pcm_per_channel[slot] = Some(pcm_f.clone());
     }
 
     /// IMDCT a `MonoLfeData` payload's `scaled_spec` to PCM `f32` using
@@ -818,7 +818,7 @@ impl Ac4Decoder {
         centre_pcm: Option<&[f32]>,
         ls_pcm: Option<&[f32]>,
         rs_pcm: Option<&[f32]>,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let n = samples;
         // run_acpl_5x_pair_pcm requires every PCM input to be a multiple
@@ -883,11 +883,11 @@ impl Ac4Decoder {
             while pcm_per_channel.len() < 5 {
                 pcm_per_channel.push(None);
             }
-            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
-            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
-            pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
-            pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
-            pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
+            pcm_per_channel[0] = Some(out.left.clone());
+            pcm_per_channel[1] = Some(out.right.clone());
+            pcm_per_channel[2] = Some(out.centre.clone());
+            pcm_per_channel[3] = Some(out.left_surround.clone());
+            pcm_per_channel[4] = Some(out.right_surround.clone());
         }
     }
 
@@ -1229,7 +1229,7 @@ impl Ac4Decoder {
         aspx_cfg: Option<aspx::AspxConfig>,
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
-        pcm_per_channel: &mut [Option<Vec<i16>>],
+        pcm_per_channel: &mut [Option<Vec<f32>>],
     ) {
         let synced = Self::five_x_synced_mode(companding);
         if let (Some(mode), Some(cfg)) = (synced, aspx_cfg) {
@@ -1258,10 +1258,10 @@ impl Ac4Decoder {
             let extended =
                 self.extend_5x_channels_with_sync_companding(&sync_entries, num_ts_in_ats, mode);
             for (slot, pcm) in extended {
-                pcm_per_channel[slot] = Some(Self::pcm_f32_to_i16(&pcm));
+                pcm_per_channel[slot] = Some(pcm.clone());
             }
             for (slot, pcm) in passthrough {
-                pcm_per_channel[slot] = Some(Self::pcm_f32_to_i16(pcm));
+                pcm_per_channel[slot] = Some(pcm.to_vec());
             }
             return;
         }
@@ -1285,9 +1285,9 @@ impl Ac4Decoder {
                         compand_mode,
                         None,
                     );
-                    Self::pcm_f32_to_i16(&extended)
+                    extended
                 }
-                _ => Self::pcm_f32_to_i16(&pcm_f),
+                _ => pcm_f,
             };
             pcm_per_channel[slot] = Some(pcm_i16);
         }
@@ -1330,7 +1330,7 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let Some(ti) = four.transform_info.as_ref() else {
             return;
@@ -1425,7 +1425,7 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         // `tcd_a`/`tcd_b` are gated *independently* — real content can
         // legitimately pair a grouped/short-frame half with a
@@ -1549,7 +1549,7 @@ impl Ac4Decoder {
         aspx_cfg: Option<aspx::AspxConfig>,
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
-    ) -> Vec<i16> {
+    ) -> Vec<f32> {
         let trailer_pair = Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre);
         match (aspx_cfg, trailer_pair) {
             (Some(cfg), Some((trailer, is_secondary))) => {
@@ -1571,9 +1571,9 @@ impl Ac4Decoder {
                     // ASPX_ACPL_1, so sb0 stays at aspx_xover_band.
                     None,
                 );
-                Self::pcm_f32_to_i16(&extended)
+                extended
             }
-            _ => Self::pcm_f32_to_i16(&pcm_f),
+            _ => pcm_f,
         }
     }
 
@@ -1607,7 +1607,7 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         while pcm_per_channel.len() < 5 {
             pcm_per_channel.push(None);
@@ -1872,7 +1872,7 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let Some(ti) = five.transform_info.as_ref() else {
             return;
@@ -1950,7 +1950,7 @@ impl Ac4Decoder {
         partner_slots: [usize; 2],
         chparam: Option<&[asf::ChparamInfo; 2]>,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let Some(ti) = add.transform_info.as_ref() else {
             return;
@@ -2000,7 +2000,7 @@ impl Ac4Decoder {
                     Some(s) => s,
                     None => {
                         // SFB table missing — fall through to identity.
-                        let pcm = self.imdct_channel(pair_out_slots[ch_in], scaled_add, n);
+                        let pcm = self.imdct_channel_f32(pair_out_slots[ch_in], scaled_add, n);
                         pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm);
                         continue;
                     }
@@ -2035,15 +2035,15 @@ impl Ac4Decoder {
                     out_high[unmixed_lo..unmixed_hi]
                         .copy_from_slice(&partner[unmixed_lo..unmixed_hi]);
                 }
-                let pcm_high = self.imdct_channel(partner_slots[ch_in], &out_high, n);
+                let pcm_high = self.imdct_channel_f32(partner_slots[ch_in], &out_high, n);
                 pcm_per_channel[partner_slots[ch_in]] = Some(pcm_high);
-                let pcm_low = self.imdct_channel(pair_out_slots[ch_in], &out_low, n);
+                let pcm_low = self.imdct_channel_f32(pair_out_slots[ch_in], &out_low, n);
                 pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm_low);
             } else {
                 // Identity passthrough — only render the additional pair
                 // (slots 5/6). Partner slots untouched (their independent
                 // 5_X-core IMDCT runs separately).
-                let pcm = self.imdct_channel(pair_out_slots[ch_in], scaled_add, n);
+                let pcm = self.imdct_channel_f32(pair_out_slots[ch_in], scaled_add, n);
                 pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm);
             }
         }
@@ -2193,7 +2193,7 @@ impl Decoder for Ac4Decoder {
         // stays silent. We detach the per-channel inputs from
         // `last_substream` up front so the IMDCT step can mutate
         // `self.ola` without a borrow conflict.
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![None; channels as usize];
         // Detach the inputs + the ASPX tables once so we can run IMDCT
         // (which mutates overlap state) and the ASPX extension without
         // a borrow conflict on self.
@@ -2731,8 +2731,8 @@ impl Decoder for Ac4Decoder {
                         pcm_per_channel.push(None);
                     }
                 }
-                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&ext_pri));
-                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&ext_sec));
+                pcm_per_channel[0] = Some(ext_pri.clone());
+                pcm_per_channel[1] = Some(ext_sec.clone());
             }
         }
         if !use_stereo_cpe_synced {
@@ -2792,19 +2792,19 @@ impl Decoder for Ac4Decoder {
                                     )
                                 };
                                 if let Some((left, right)) = acpl1_result {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
-                                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
+                                    pcm_per_channel[0] = Some(left.clone());
+                                    pcm_per_channel[1] = Some(right.clone());
                                 } else {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                                    pcm_per_channel[0] = Some(extended.clone());
                                 }
                             } else {
-                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                                pcm_per_channel[0] = Some(extended.clone());
                             }
                         } else {
-                            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                            pcm_per_channel[0] = Some(extended.clone());
                         }
                     } else {
-                        pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
+                        pcm_per_channel[0] = Some(self.imdct_channel_f32(0, &scaled, n));
                     }
                 }
             }
@@ -2830,9 +2830,9 @@ impl Decoder for Ac4Decoder {
                                 compand_mode_sec,
                                 compand_sb0_override,
                             );
-                            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
+                            pcm_per_channel[1] = Some(extended.clone());
                         } else {
-                            pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                            pcm_per_channel[1] = Some(self.imdct_channel_f32(1, &scaled, n));
                         }
                     }
                 }
@@ -2905,11 +2905,11 @@ impl Decoder for Ac4Decoder {
                     while pcm_per_channel.len() < 5 {
                         pcm_per_channel.push(None);
                     }
-                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
-                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
-                    pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
-                    pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
-                    pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
+                    pcm_per_channel[0] = Some(out.left.clone());
+                    pcm_per_channel[1] = Some(out.right.clone());
+                    pcm_per_channel[2] = Some(out.centre.clone());
+                    pcm_per_channel[3] = Some(out.left_surround.clone());
+                    pcm_per_channel[4] = Some(out.right_surround.clone());
                 }
             }
         }
@@ -3052,8 +3052,8 @@ impl Decoder for Ac4Decoder {
                         while pcm_per_channel.len() < 2 {
                             pcm_per_channel.push(None);
                         }
-                        pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&l_pcm));
-                        pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&r_pcm));
+                        pcm_per_channel[0] = Some(l_pcm.clone());
+                        pcm_per_channel[1] = Some(r_pcm.clone());
                         let ls_pcm = self.imdct_channel_f32(3, ls_spec, n);
                         let rs_pcm = self.imdct_channel_f32(4, rs_spec, n);
                         (Some(ls_pcm), Some(rs_pcm))
@@ -3559,7 +3559,7 @@ impl Decoder for Ac4Decoder {
                     while pcm_per_channel.len() <= lfe_slot {
                         pcm_per_channel.push(None);
                     }
-                    pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
+                    pcm_per_channel[lfe_slot] = Some(pcm_f.clone());
                 }
             }
         }
@@ -3568,25 +3568,56 @@ impl Decoder for Ac4Decoder {
         let any_decoded = pcm_per_channel.iter().any(|p| p.is_some());
         let data = if any_decoded {
             let mut buf = vec![0u8; byte_count];
+            // Round 410: pcm_per_channel carries f32 end-to-end; the
+            // ONLY i16 conversion (with the output gain) happens here.
+            // AC4_DUMP_PCMF32=<file> tees the interleaved f32 samples
+            // (pre-gain, pre-clip) for lossless QA / offline mastering.
+            let mut f32buf: Option<Vec<f32>> =
+                std::env::var_os("AC4_DUMP_PCMF32").map(|_| {
+                    Vec::with_capacity(samples as usize * channels as usize)
+                });
             // Channel fallback: if only channel 0 was decoded for a
             // multi-channel stream (e.g. a stereo frame whose CPE body
             // didn't parse), duplicate it across the remaining slots so
             // the output is audible rather than one-sided.
             let fallback = pcm_per_channel[0].clone();
+            let out_gain = {
+                use std::sync::OnceLock;
+                static G: OnceLock<f32> = OnceLock::new();
+                *G.get_or_init(|| {
+                    std::env::var("AC4_OUT_GAIN_LOG2")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .map(|k| 2.0_f32.powf(k))
+                        .unwrap_or(1.0)
+                })
+            };
             for i in 0..samples as usize {
                 for c in 0..channels as usize {
-                    let sample = pcm_per_channel
+                    let sample_f = pcm_per_channel
                         .get(c)
                         .and_then(|p| p.as_ref())
                         .or(fallback.as_ref())
                         .and_then(|p| p.get(i).copied())
-                        .unwrap_or(0);
+                        .unwrap_or(0.0);
+                    if let Some(fb) = f32buf.as_mut() {
+                        fb.push(sample_f);
+                    }
+                    let sample =
+                        (sample_f * out_gain * 32767.0).clamp(-32768.0, 32767.0) as i16;
                     let le = sample.to_le_bytes();
                     let off = (i * channels as usize + c) * 2;
                     if off + 1 < buf.len() {
                         buf[off] = le[0];
                         buf[off + 1] = le[1];
                     }
+                }
+            }
+            if let (Some(fb), Some(path)) = (f32buf, std::env::var_os("AC4_DUMP_PCMF32")) {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let bytes: Vec<u8> = fb.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = f.write_all(&bytes);
                 }
             }
             vec![buf]
@@ -4421,13 +4452,13 @@ mod tests {
         let n = 1_920usize;
         // Carrier PCM: low-amp alternating ±2000 to drive the QMF
         // analysis bank with finite energy.
-        let carrier_l: Vec<i16> = (0..n)
+        let carrier_l: Vec<f32> = (0..n)
             .map(|i| if i & 1 == 0 { 2_000_i16 } else { -2_000_i16 })
             .collect();
-        let carrier_r: Vec<i16> = (0..n)
+        let carrier_r: Vec<f32> = (0..n)
             .map(|i| if i & 1 == 0 { -1_500_i16 } else { 1_500_i16 })
             .collect();
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(3, 1, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(-2, 2, cfg.num_param_bands);
@@ -4481,13 +4512,13 @@ mod tests {
         let params = CodecParameters::audio(CodecId::new("ac4"));
         let mut dec = Ac4Decoder::new(&params);
         let n = 1_920usize;
-        let carrier_l: Vec<i16> = (0..n)
+        let carrier_l: Vec<f32> = (0..n)
             .map(|i| if i % 4 < 2 { 1_500_i16 } else { -1_500_i16 })
             .collect();
-        let carrier_r: Vec<i16> = (0..n)
+        let carrier_r: Vec<f32> = (0..n)
             .map(|i| if i % 4 < 2 { -1_200_i16 } else { 1_200_i16 })
             .collect();
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(2, 1, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(-3, 2, cfg.num_param_bands);
@@ -4522,9 +4553,9 @@ mod tests {
         let params = CodecParameters::audio(CodecId::new("ac4"));
         let mut dec = Ac4Decoder::new(&params);
         let n = 1_920usize;
-        let carrier_l: Vec<i16> = (0..n).map(|i| (i % 200) as i16 * 30).collect();
-        let carrier_r: Vec<i16> = (0..n).map(|i| ((i + 50) % 200) as i16 * 30).collect();
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let carrier_l: Vec<f32> = (0..n).map(|i| (i % 200) as i16 * 30).collect();
+        let carrier_r: Vec<f32> = (0..n).map(|i| ((i + 50) % 200) as i16 * 30).collect();
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(2, 1, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(-3, 2, cfg.num_param_bands);
@@ -4672,7 +4703,7 @@ mod tests {
         let n = 1_920usize;
         let carrier_l: Vec<i16> = vec![0; n];
         let carrier_r: Vec<i16> = vec![0; n];
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(0, 0, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(0, 0, cfg.num_param_bands);
