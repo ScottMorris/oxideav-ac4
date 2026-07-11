@@ -429,7 +429,7 @@ pub fn pick_best_codebook_for_band_with_q_target(
 ///
 /// Returns a vector of `(start_sfb, end_sfb_exclusive, cb)` tuples
 /// describing the optimal section layout.
-pub fn dp_optimise_sections(cost_band_cb: &[[u32; 12]], max_sections: u32) -> Vec<(u32, u32, u8)> {
+pub fn dp_optimise_sections(transform_length: u32, cost_band_cb: &[[u32; 12]], max_sections: u32) -> Vec<(u32, u32, u8)> {
     let n = cost_band_cb.len();
     if n == 0 {
         return Vec::new();
@@ -490,7 +490,7 @@ pub fn dp_optimise_sections(cost_band_cb: &[[u32; 12]], max_sections: u32) -> Ve
     for i in 0..n {
         for start in 0..=i {
             let len = (i - start + 1) as u32;
-            let overhead = section_overhead_bits(len) as u64;
+            let overhead = section_overhead_bits(transform_length, len) as u64;
             let (prior_cost, prior_sections) = if start == 0 {
                 (0u64, 0u32)
             } else {
@@ -531,15 +531,22 @@ pub fn dp_optimise_sections(cost_band_cb: &[[u32; 12]], max_sections: u32) -> Ve
     sections
 }
 
-/// Per-section header overhead in bits for the long-frame
-/// (`n_sect_bits = 3`, `sect_esc_val = 7`) case. For a section of length
-/// `len ≥ 1`, emits a 4-bit `sect_cb` then `floor((len-1)/7) + 1` 3-bit
-/// length-increment fields.
+/// Transform length implied by an Annex B `sfb_offset` table — the
+/// tables end exactly at the transform length, so the last entry is it.
 #[inline]
-pub fn section_overhead_bits(len: u32) -> u32 {
+pub fn tl_of_sfbo(sfbo: &[u16]) -> u32 {
+    sfbo.last().copied().unwrap_or(0) as u32
+}
+
+/// Per-section header overhead in bits: a 4-bit `sect_cb` then
+/// `floor((len-1)/esc) + 1` length-increment fields, with the field
+/// width per Table 39 ([`crate::asf_data::sect_len_bits`]).
+#[inline]
+pub fn section_overhead_bits(transform_length: u32, len: u32) -> u32 {
+    let (n_sect_bits, esc) = crate::asf_data::sect_len_bits(transform_length);
     let base = len.saturating_sub(1);
-    let k = base / 7;
-    4 + 3 * (k + 1)
+    let k = base / esc;
+    4 + n_sect_bits * (k + 1)
 }
 
 /// Build the per-band per-codebook bit-cost table consumed by
@@ -804,15 +811,18 @@ pub fn write_spectral_data_single_section(
 
 /// Write the section-data syntax element for the supplied
 /// [`AsfSections`]. Each section emits a 4-bit `sect_cb` followed by a
-/// length-increment chain (`n_sect_bits = 3`, `esc = 7` for long frame).
-pub fn write_section_data(bw: &mut BitWriter, sections: &AsfSections) {
+/// length-increment chain whose field width follows Table 39 via
+/// [`crate::asf_data::sect_len_bits`] (3 bits below 768-sample
+/// transforms, 5 bits at 768 and above — long frames included).
+pub fn write_section_data(bw: &mut BitWriter, transform_length: u32, sections: &AsfSections) {
+    let (n_sect_bits, esc) = crate::asf_data::sect_len_bits(transform_length);
     for i in 0..sections.num_sec_lsf as usize {
         let cb = sections.sect_cb[i];
         let start = sections.sect_start[i] as u32;
         let end = sections.sect_end[i] as u32;
         let len = end - start;
         bw.write_u32(cb as u32, 4);
-        write_sect_len_incr(bw, len, 3, 7);
+        write_sect_len_incr(bw, len, n_sect_bits, esc);
     }
 }
 
@@ -1088,7 +1098,7 @@ pub fn build_mono_simple_asf_body_from_pcm_spectrum(
 
     // DP optimisation: globally cheapest section layout.
     let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-    let dp_sections = dp_optimise_sections(&cost_table, 16);
+    let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
     let sections = build_sections_from_dp(&dp_sections, max_sfb);
 
     // SNF emission for zero-quant bands.
@@ -1116,7 +1126,7 @@ pub fn build_mono_simple_asf_body_from_pcm_spectrum(
         crate::tables::n_msfb_bits_48(transform_length).expect("encoder: bad tl");
     bw.write_u32(max_sfb, n_msfb_bits);
 
-    write_section_data(&mut bw, &sections);
+    write_section_data(&mut bw, tl_of_sfbo(sfbo), &sections);
     write_spectral_data_sections(&mut bw, &qspec, sfbo, &sections);
     write_scalefac_data(
         &mut bw,
@@ -1208,7 +1218,7 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
             natural_q_per_band.push(q);
         }
         let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
         let sections = build_sections_from_dp(&dp_sections, max_sfb);
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             coeffs,
@@ -1254,7 +1264,7 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
                                         // this split-MDCT path)
 
     // --- Left channel sf_data(ASF) ---
-    write_section_data(&mut bw, &sections_l);
+    write_section_data(&mut bw, tl_of_sfbo(sfbo), &sections_l);
     write_spectral_data_sections(&mut bw, &qspec_l, sfbo, &sections_l);
     write_scalefac_data(&mut bw, &sf_l, &sections_l.sfb_cb, &mqi_l, max_sfb);
     write_snf_data(
@@ -1266,7 +1276,7 @@ pub fn build_stereo_simple_asf_split_body_from_pcm_spectra(
     );
 
     // --- Right channel sf_data(ASF) ---
-    write_section_data(&mut bw, &sections_r);
+    write_section_data(&mut bw, tl_of_sfbo(sfbo), &sections_r);
     write_spectral_data_sections(&mut bw, &qspec_r, sfbo, &sections_r);
     write_scalefac_data(&mut bw, &sf_r, &sections_r.sfb_cb, &mqi_r, max_sfb);
     write_snf_data(
@@ -1601,7 +1611,7 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
         }
         cost_table_joint.push(row);
     }
-    let dp_sections = dp_optimise_sections(&cost_table_joint, 16);
+    let dp_sections = dp_optimise_sections(transform_length, &cost_table_joint, 16);
     let sections = build_sections_from_dp(&dp_sections, max_sfb);
 
     // 4. SNF over zero-quant bands — measured from M (which carries the
@@ -1641,7 +1651,7 @@ pub fn build_stereo_simple_asf_joint_body_from_pcm_spectra(
 
     // Shared sf_data: section_data → primary spectral → secondary
     // spectral → scalefac → ms_used[] → snf.
-    write_section_data(&mut bw, &sections);
+    write_section_data(&mut bw, tl_of_sfbo(sfbo), &sections);
     write_spectral_data_sections(&mut bw, &q_pri, sfbo, &sections);
     write_spectral_data_sections(&mut bw, &q_sec, sfbo, &sections);
     write_scalefac_data(
@@ -1763,7 +1773,7 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
             natural_q_per_band.push(q);
         }
         let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
         let sections = build_sections_from_dp(&dp_sections, max_sfb);
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             coeffs,
@@ -1821,7 +1831,7 @@ pub fn build_5_0_simple_asf_body_from_pcm_spectra(
     // 5x sf_data(ASF) bodies — one per output channel in L/R/C/Ls/Rs order.
     for analysis in &analyses {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -1909,7 +1919,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
             natural_q_per_band.push(q);
         }
         let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
         let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             coeffs,
@@ -1963,7 +1973,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
     // LFE sf_data(ASF): section + spectral + scalefac + snf.
     {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = &lfe_analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2003,7 +2013,7 @@ pub fn build_5_1_simple_asf_body_from_pcm_spectra(
     // 5x sf_data(ASF) bodies — one per non-LFE output channel.
     for analysis in &analyses {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2100,7 +2110,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
             natural_q_per_band.push(q);
         }
         let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
         let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             coeffs,
@@ -2165,7 +2175,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     // 5x sf_data(ASF) bodies — one per L/R/C/Ls/Rs SCE.
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2202,7 +2212,7 @@ pub fn build_7_0_simple_asf_body_from_pcm_spectra(
     // 2x sf_data(ASF) bodies — one per Lb/Rb.
     for analysis in &analyses_add {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2321,7 +2331,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
             natural_q_per_band.push(q);
         }
         let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
         let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             coeffs,
@@ -2375,7 +2385,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
     }
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2401,7 +2411,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx(
     bw.write_u32(0, 2); // chparam_info(): identity SAP
     for analysis in &analyses_add {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2577,7 +2587,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
             natural_q_per_band.push(q);
         }
         let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
         let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             coeffs,
@@ -2631,7 +2641,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
     }
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2657,7 +2667,7 @@ pub fn build_7_0_aspx_asf_body_from_pcm_spectra_real_aspx_tna(
     bw.write_u32(0, 2); // chparam_info(): identity SAP
     for analysis in &analyses_add {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2822,7 +2832,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
             natural_q_per_band.push(q);
         }
         let cost_table = build_band_codebook_cost_table(&natural_q_per_band);
-        let dp_sections = dp_optimise_sections(&cost_table, 16);
+        let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
         let sections = build_sections_from_dp(&dp_sections, max_sfb_use);
         let snf = compute_snf_dpcm_for_zero_quant_bands(
             coeffs,
@@ -2880,7 +2890,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     bw.write_u32(max_sfb_lfe_clamped, n_msfbl_bits);
     {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = &lfe_analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2918,7 +2928,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // 5x sf_data(ASF) bodies — one per L/R/C/Ls/Rs SCE.
     for analysis in &analyses_five {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -2955,7 +2965,7 @@ pub fn build_7_1_simple_asf_body_from_pcm_spectra(
     // 2x sf_data(ASF) bodies — one per Lb/Rb.
     for analysis in &analyses_add {
         let (qspec, sf_per_band, max_quant_idx, sections, snf) = analysis;
-        write_section_data(&mut bw, sections);
+        write_section_data(&mut bw, tl_of_sfbo(sfbo), sections);
         write_spectral_data_sections(&mut bw, qspec, sfbo, sections);
         write_scalefac_data(
             &mut bw,
@@ -3018,17 +3028,17 @@ pub fn measure_greedy_vs_dp_bits(
         let cb = greedy.sect_cb[s] as usize;
         let start = greedy.sect_start[s] as u32;
         let end = greedy.sect_end[s] as u32;
-        greedy_bits += section_overhead_bits(end - start) as u64;
+        greedy_bits += section_overhead_bits(transform_length, end - start) as u64;
         for b in start..end {
             let c = cost_table[b as usize][cb];
             greedy_bits += if c == u32::MAX { 0 } else { c as u64 };
         }
     }
 
-    let dp_sections = dp_optimise_sections(&cost_table, 16);
+    let dp_sections = dp_optimise_sections(transform_length, &cost_table, 16);
     let mut dp_bits: u64 = 0;
     for &(start, end, cb) in &dp_sections {
-        dp_bits += section_overhead_bits(end - start) as u64;
+        dp_bits += section_overhead_bits(transform_length, end - start) as u64;
         for b in start..end {
             let c = cost_table[b as usize][cb as usize];
             dp_bits += if c == u32::MAX { 0 } else { c as u64 };
@@ -3290,17 +3300,17 @@ mod tests {
     fn section_overhead_bits_long_frame() {
         // L = 1..=7 → k = 0 → overhead = 4 + 3 = 7.
         for len in 1..=7u32 {
-            assert_eq!(section_overhead_bits(len), 7, "len={len}");
+            assert_eq!(section_overhead_bits(256, len), 7, "len={len}");
         }
         // L = 8..=14 → k = 1 → overhead = 4 + 6 = 10.
         for len in 8..=14u32 {
-            assert_eq!(section_overhead_bits(len), 10, "len={len}");
+            assert_eq!(section_overhead_bits(256, len), 10, "len={len}");
         }
         // L = 15..=21 → k = 2 → overhead = 4 + 9 = 13.
-        assert_eq!(section_overhead_bits(15), 13);
-        assert_eq!(section_overhead_bits(21), 13);
+        assert_eq!(section_overhead_bits(256, 15), 13);
+        assert_eq!(section_overhead_bits(256, 21), 13);
         // L = 22 → k = 3 → overhead = 16.
-        assert_eq!(section_overhead_bits(22), 16);
+        assert_eq!(section_overhead_bits(256, 22), 16);
     }
 
     /// `dp_optimise_sections` collapses uniform-cost bands into ONE section.
@@ -3310,7 +3320,7 @@ mod tests {
         let mut row = [u32::MAX; 12];
         row[5] = 6;
         let table = vec![row; 5];
-        let sections = dp_optimise_sections(&table, 16);
+        let sections = dp_optimise_sections(256, &table, 16);
         // Optimal: one section [0..5] with cb=5: cost = 5*6 + overhead(5) = 30 + 7 = 37.
         // Two sections would cost more: 2 * (5*3 + overhead) > 37.
         assert_eq!(sections.len(), 1);
@@ -3331,7 +3341,7 @@ mod tests {
         t[1][11] = 50;
         t[2][11] = 50;
         t[3][11] = 50;
-        let sections = dp_optimise_sections(&t, 16);
+        let sections = dp_optimise_sections(256, &t, 16);
         assert_eq!(sections.len(), 2);
         assert_eq!(sections[0], (0, 2, 1));
         assert_eq!(sections[1], (2, 4, 11));
@@ -3349,7 +3359,7 @@ mod tests {
         for r in &mut t {
             r[5] = 10;
         }
-        let sections = dp_optimise_sections(&t, 1);
+        let sections = dp_optimise_sections(256, &t, 1);
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0], (0, 5, 5));
     }
@@ -3470,7 +3480,7 @@ mod tests {
                 row[1] = 8;
             }
         }
-        let dp_sections = dp_optimise_sections(&t, 16);
+        let dp_sections = dp_optimise_sections(256, &t, 16);
         // Compute greedy bits assuming greedy picks the per-band minimum
         // codebook. For odd bands: only cb=11 feasible. For even bands:
         // cb=1 is cheaper. So greedy = [1, 11, 1, 11, 1, 11] → 6 sections,
@@ -3478,7 +3488,7 @@ mod tests {
         let greedy_total: u64 = 6 * 7 + 8 * 3 + 12 * 3;
         let mut dp_total: u64 = 0;
         for &(s, e, cb) in &dp_sections {
-            dp_total += section_overhead_bits(e - s) as u64;
+            dp_total += section_overhead_bits(256, e - s) as u64;
             for b in s..e {
                 let c = t[b as usize][cb as usize];
                 dp_total += if c == u32::MAX { 0 } else { c as u64 };

@@ -119,6 +119,15 @@ pub fn ext_decode(br: &mut BitReader<'_>) -> Result<u32> {
             break;
         }
         n_ext += 1;
+        // A real unary prefix here never runs this long; anything past
+        // 27 would ask `read_u32` for more than 32 bits and panic.
+        // Bit-misalignment upstream (a different bug elsewhere in the
+        // substream walk) can otherwise turn into a garbage-length run
+        // of 1-bits — treat that as a decode error for this substream
+        // rather than crashing the whole pipeline.
+        if n_ext > 27 {
+            return Err(Error::invalid("ac4: ext_decode: runaway unary prefix"));
+        }
     }
     let bits = n_ext + 4;
     let ext_val = br.read_u32(bits)?;

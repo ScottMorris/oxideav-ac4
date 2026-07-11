@@ -51,11 +51,13 @@
 //! parse the outer shells and leave the per-channel slot `None`.
 
 use oxideav_core::bits::BitReader;
-use oxideav_core::Result;
+use oxideav_core::{Error, Result};
 
+use crate::aspx::{parse_aspx_config, parse_companding_control, AspxConfig, CompandingControl};
 use crate::asf::{
     decode_asf_long_lfe_body_with_max_sfb_lfe, decode_asf_long_mono_body_with_max_sfb,
-    parse_asf_psy_info, parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info,
+    parse_aspx_data_1ch_body, parse_aspx_data_2ch_body, parse_asf_psy_info,
+    parse_asf_psy_info_lfe, parse_asf_transform_info, parse_chparam_info, resolve_transf_length,
     AsfPsyInfo, AsfTransformInfo, ChparamInfo, SubstreamTools,
 };
 use crate::tables;
@@ -143,6 +145,12 @@ pub struct MonoLfeData {
     /// is reserved for a future round), for SSF-frontend mono channels,
     /// or for any short / grouped / Huffman-error case.
     pub scaled_spec: Option<Vec<f32>>,
+    /// Per-window de-grouped spectra (§5.1.5 ungrouping already
+    /// applied) for the non-LFE, ASF-frontend, short/grouped
+    /// (`num_window_groups > 1`) case — see [`WindowSpectrum`]. `None`
+    /// whenever `scaled_spec` would be populated instead (long-frame),
+    /// or for LFE / SSF-frontend / Huffman-error cases.
+    pub scaled_spec_windows: Option<Vec<WindowSpectrum>>,
 }
 
 /// Parsed `three_channel_info()` per Table 30: 4-bit `chel_matsel` +
@@ -189,13 +197,30 @@ pub struct FiveChannelInfo {
 /// (short frame, grouped, or Huffman error).
 #[derive(Debug, Clone, Default)]
 pub struct TwoChannelData {
+    /// `b_enable_mdct_stereo_proc` (Table 26, first bit). When set the
+    /// two channels share one `sf_info` + a `chparam_info`; when clear
+    /// each channel carries its *own* `sf_info` and there is no
+    /// chparam. (Round 404: this selector bit was previously never
+    /// read — the parser hardcoded the shared-sf_info branch, desyncing
+    /// every `two_channel_data` in every frame by at least one bit.)
+    pub b_enable_mdct_stereo_proc: bool,
     pub transform_info: Option<AsfTransformInfo>,
     pub psy_info: Option<AsfPsyInfo>,
+    /// Channel 1's own `sf_info` for the `b_enable_mdct_stereo_proc == 0`
+    /// branch (`None` when the shared branch is taken).
+    pub transform_info_1: Option<AsfTransformInfo>,
+    pub psy_info_1: Option<AsfPsyInfo>,
     pub chparam: Option<ChparamInfo>,
     /// Per-channel scaled MDCT spectra. Length = 2 once the body has
     /// been walked. Each entry's `Vec<f32>` is `sfb_offset[max_sfb]`
-    /// long.
+    /// long. Only populated for the long-frame, single-window-group
+    /// case — see `scaled_spec_windows_per_channel` for grouped bodies.
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra (§5.1.5 ungrouping
+    /// applied) for the short/grouped (`num_window_groups > 1`) case.
+    /// `None` per channel whenever `scaled_spec_per_channel` would be
+    /// populated instead.
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 /// Parsed `three_channel_data()` outer shell + per-channel sf_data
@@ -212,6 +237,8 @@ pub struct ThreeChannelData {
     pub info: Option<ThreeChannelInfo>,
     /// Per-channel scaled MDCT spectra (length 3). See [`TwoChannelData`].
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra. See [`TwoChannelData`].
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 /// Parsed `four_channel_data()` outer shell + per-channel sf_data
@@ -224,6 +251,8 @@ pub struct FourChannelData {
     pub info: Option<FourChannelInfo>,
     /// Per-channel scaled MDCT spectra (length 4). See [`TwoChannelData`].
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra. See [`TwoChannelData`].
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 /// Parsed `five_channel_data()` outer shell + per-channel sf_data
@@ -236,6 +265,8 @@ pub struct FiveChannelData {
     pub info: Option<FiveChannelInfo>,
     /// Per-channel scaled MDCT spectra (length 5). See [`TwoChannelData`].
     pub scaled_spec_per_channel: Vec<Option<Vec<f32>>>,
+    /// Per-channel, per-window de-grouped spectra. See [`TwoChannelData`].
+    pub scaled_spec_windows_per_channel: Vec<Option<Vec<WindowSpectrum>>>,
 }
 
 // =====================================================================
@@ -270,9 +301,25 @@ pub fn parse_mono_data(
         // Non-LFE: leading 1-bit spec_frontend selector.
         out.spec_frontend_bit = br.read_u32(1)? as u8;
     }
-    // Both LFE and non-LFE invoke the ASF transform-info shell — the
-    // LFE channel is always coded with the ASF frontend per Table 21.
-    let ti = parse_asf_transform_info(br, frame_len_base)?;
+    // `sf_info_lfe()` (Table 35) sets `b_long_frame = 1` implicitly —
+    // "transform length = frame_length" — and reads *no* bits for it,
+    // unlike the regular `sf_info()` -> `asf_transform_info()` path.
+    // Calling `parse_asf_transform_info` for the LFE branch (as this
+    // used to) steals real bits belonging to `max_sfb[0]`/`sf_data()`
+    // that follow, misaligning the rest of the LFE parse in a
+    // data-dependent way (whatever the stolen `b_long_frame` bit
+    // happens to be).
+    let ti = if b_lfe {
+        let tl = resolve_transf_length(frame_len_base, true, 0);
+        AsfTransformInfo {
+            b_long_frame: true,
+            transf_length: [0, 0],
+            transform_length_0: tl,
+            transform_length_1: tl,
+        }
+    } else {
+        parse_asf_transform_info(br, frame_len_base)?
+    };
     out.transform_info = Some(ti);
     // `sf_info(ASF, 0, 0)` for non-LFE; `sf_info_lfe()` for LFE.
     // r20: dispatch to the dedicated `parse_asf_psy_info_lfe()` that
@@ -306,13 +353,10 @@ pub fn parse_mono_data(
                 out.scaled_spec = Some(scaled);
             }
         } else if psy.num_window_groups > 0 {
-            if let Some(scaled) = decode_asf_grouped_mono_body_with_max_sfb(
-                br,
-                &ti,
-                psy.max_sfb_0,
-                psy.num_window_groups,
-            ) {
-                out.scaled_spec = Some(scaled);
+            if let Some(windows) =
+                decode_asf_grouped_body_windows(br, &ti, &psy, psy.max_sfb_0)
+            {
+                out.scaled_spec_windows = Some(windows);
             }
         }
     } else if b_lfe {
@@ -339,16 +383,857 @@ pub fn parse_two_channel_data(
     br: &mut BitReader<'_>,
     frame_len_base: u32,
 ) -> Result<TwoChannelData> {
+    // Table 26: `b_enable_mdct_stereo_proc` selects between a shared
+    // sf_info + chparam_info (joint MDCT stereo processing) and two
+    // fully independent per-channel sf_infos.
+    let b_msp = br.read_bit()?;
+    // AC4_TRACE_BODIES=1: per-element diagnostic used by the round-40x
+    // conformance work (see riptide docs/ac4-decoder-accuracy-plan.md).
+    let _trace = std::env::var_os("AC4_TRACE_BODIES").is_some();
+    let _p_in = br.bit_position();
+    if _trace {
+        eprintln!("2CH b_msp={} in@{}", b_msp as u8, _p_in - 1);
+    }
+    if b_msp {
+        let ti = parse_asf_transform_info(br, frame_len_base)?;
+        let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
+        // Round 406e: Table 47 says the ms_used loop runs per window
+        // group, but the trailer-validated Kraftwerk walk proves this
+        // encoder reads exactly ONE group's worth (m=6 with ng=2 →
+        // 6 ms bits). Keep the single-group read; psy.max_sfb_per_group()
+        // exists for when counter-evidence shows up.
+        let chparam = parse_chparam_info(br, &[psy.max_sfb_0])?;
+        let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+        if _trace {
+            eprintln!(
+                "2CH shared long={} m={} ng={} out@{}",
+                ti.b_long_frame, psy.max_sfb_0, psy.num_window_groups, br.bit_position()
+            );
+        }
+        Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: true,
+            transform_info: Some(ti),
+            psy_info: Some(psy),
+            transform_info_1: None,
+            psy_info_1: None,
+            chparam: Some(chparam),
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        })
+    } else {
+        // Independent channels: each has its own sf_info, and each
+        // sf_data body is decoded against its own transform/psy pair.
+        let ti0 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy0 = parse_asf_psy_info(br, &ti0, frame_len_base, false, false)?;
+        let ti1 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy1 = parse_asf_psy_info(br, &ti1, frame_len_base, false, false)?;
+        let (mut scaled, mut scaled_windows) = decode_mch_sf_data_channels(br, &ti0, &psy0, 1);
+        let (s1, w1) = decode_mch_sf_data_channels(br, &ti1, &psy1, 1);
+        scaled.extend(s1);
+        scaled_windows.extend(w1);
+        if _trace {
+            eprintln!(
+                "2CH separate long=({},{}) m=({},{}) out@{}",
+                ti0.b_long_frame, ti1.b_long_frame, psy0.max_sfb_0, psy1.max_sfb_0,
+                br.bit_position()
+            );
+        }
+        Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: false,
+            transform_info: Some(ti0),
+            psy_info: Some(psy0),
+            transform_info_1: Some(ti1),
+            psy_info_1: Some(psy1),
+            chparam: None,
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        })
+    }
+}
+
+/// Number of scale factor bands lying strictly below the A-SPX start
+/// subband (`sba`) for the given transform length — i.e. the count of
+/// sfbs whose END line is < `sba * (tl / 64)`.
+///
+/// Round 406: on real 7_X ASPX content the additional-channel
+/// `two_channel_data`'s `chparam_info` ms_used loop runs over THIS
+/// count, not `get_max_sfb` as Table 47 reads — proven by exact-end
+/// backchaining on two independent tracks (ms bits = 50 with
+/// max_sfb = 54 on one and max_sfb = 44 on the other; both
+/// aspx start_freq=7/HighRes ⇒ sba=40 ⇒ line 1280 ⇒ 50 bands).
+pub(crate) fn aspx_core_band_count(cfg: &crate::aspx::AspxConfig, tl: u32) -> Option<u32> {
+    let (_master, _n, sba, _sbz) = crate::aspx::derive_master_sbg_table(cfg);
+    let sb_width = tl / 64;
+    let line = sba * sb_width;
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    let num_sfb = crate::tables::num_sfb_48(tl)?;
+    let mut n = 0u32;
+    for sfb in 0..num_sfb as usize {
+        if (sfbo[sfb + 1] as u32) < line {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    Some(n)
+}
+
+/// Trial-parse helper for [`parse_two_channel_data_additional`]: given
+/// a reader positioned at body0's first section bit, find body0's
+/// scalefac/SNF band bound by validating each candidate tail length
+/// against a full parse of body1. Returns the winning bound
+/// (`k + 1` bands for `k` scalefac codewords read).
+pub(crate) fn discover_add_pair_body0_bound(
+    br0: BitReader<'_>,
+    ti: &AsfTransformInfo,
+    max_sfb_1: u32,
+) -> Option<u32> {
+    use crate::asf_data;
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    let num_sfb = crate::tables::num_sfb_48(tl)?;
+    for m0 in 1..=num_sfb {
+        // Full deterministic body0 parse under the candidate bound.
+        let mut tr = br0;
+        let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut tr, tl_idx, tl, m0, true)
+        else {
+            continue;
+        };
+        if sections.sect_cb.iter().any(|&cb| cb > 11) {
+            continue;
+        }
+        let Ok((_q, mqi)) = asf_data::parse_asf_spectral_data(&mut tr, &sections, sfbo, m0)
+        else {
+            continue;
+        };
+        if asf_data::parse_asf_scalefac_data(&mut tr, &sections, &mqi, m0, tl).is_err() {
+            continue;
+        }
+        if asf_data::parse_asf_snf_data(&mut tr, &sections, &mqi, m0, tl).is_err() {
+            continue;
+        }
+        // Oracle: body1 must parse cleanly from here with legal
+        // codebooks and sections closing exactly at max_sfb_1 — a few
+        // hundred chained Huffman codewords make a false accept
+        // essentially impossible.
+        let mut vr = tr;
+        let Ok(s1) = asf_data::parse_asf_section_data_ext(&mut vr, tl_idx, tl, max_sfb_1, true)
+        else {
+            continue;
+        };
+        if s1.sect_cb.iter().any(|&cb| cb > 11) {
+            continue;
+        }
+        if s1.sect_end.last().map(|&e| e as u32) != Some(max_sfb_1) {
+            continue;
+        }
+        if asf_data::parse_asf_spectral_data(&mut vr, &s1, sfbo, max_sfb_1).is_err() {
+            continue;
+        }
+        return Some(m0);
+    }
+    None
+}
+
+/// Rebuild a cached section list's `sfb_cb` for a different scalefac
+/// bound (the 407m/407p caches share section parses across bounds;
+/// `sfb_cb` is sized to the bound it was first built with).
+fn refit_sfb_cb(mut secs: crate::asf_data::AsfSections, k: u32) -> crate::asf_data::AsfSections {
+    let mut cb = vec![0u8; k as usize];
+    for i in 0..secs.sect_cb.len() {
+        let c = secs.sect_cb[i];
+        let a = secs.sect_start[i] as usize;
+        let b = (secs.sect_end[i] as usize).min(k as usize);
+        for x in cb.iter_mut().take(b).skip(a) {
+            *x = c;
+        }
+    }
+    secs.sfb_cb = cb;
+    secs
+}
+
+/// Round-407p: joint body-bound search for the sub05 class — add
+/// pairs where BOTH bodies span past their scalefac bounds and
+/// body1's bound differs from the transmitted max_sfb, so the
+/// body1-closes-at-msfb discovery oracle can never accept the truth.
+/// Parses the (bmsp=1, long, sap 0/1/2) head shape, then sweeps
+/// (k0, k1) with section/spectral caching; every terminal position
+/// within trailer distance of the wall is a candidate for the
+/// caller's trailer oracle. Returns candidate (k0, k1, end) triples.
+fn resync_joint_bound_candidates(
+    head: BitReader<'_>,
+    cfg: &crate::aspx::AspxConfig,
+    frame_len_base: u32,
+    wall: u64,
+) -> Vec<(u32, u32, u64)> {
+    use crate::asf_data;
+    let mut out = Vec::new();
+    let mut hr = head;
+    let Ok(bmsp) = hr.read_bit() else { return out };
+    if !bmsp {
+        return out;
+    }
+    let Ok(blong) = hr.read_bit() else { return out };
+    if !blong {
+        return out;
+    }
+    let Ok(_msfb) = hr.read_u32(6) else { return out };
+    let Ok(sap) = hr.read_u32(2) else { return out };
+    if sap == 3 {
+        return out;
+    }
+    if sap == 1 {
+        let ms = aspx_core_band_count(cfg, frame_len_base).unwrap_or(50);
+        if hr.skip(ms).is_err() {
+            return out;
+        }
+    }
+    let ti = AsfTransformInfo {
+        b_long_frame: true,
+        transf_length: [0, 0],
+        transform_length_0: frame_len_base,
+        transform_length_1: frame_len_base,
+    };
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else {
+        return out;
+    };
+    let Some(num_sfb) = crate::tables::num_sfb_48(tl) else {
+        return out;
+    };
+    // body0 sweep with section/spectral cache
+    let mut c0: Option<(Vec<u16>, asf_data::AsfSections, Vec<u32>, BitReader)> = None;
+    for k0 in 1..=num_sfb {
+        let mut b0 = hr;
+        let Ok(s0) = asf_data::parse_asf_section_data_ext(&mut b0, tl_idx, tl, k0, true) else {
+            continue;
+        };
+        if s0.sect_cb.iter().any(|&cb| cb > 11) {
+            continue;
+        }
+        let g0: Vec<u16> = s0
+            .sect_end
+            .iter()
+            .copied()
+            .chain(s0.sect_cb.iter().map(|&c| c as u16))
+            .collect();
+        let (secs0, mqi0, mut r0) = match c0.as_ref() {
+            Some((g, cs, cm, cr)) if *g == g0 => (refit_sfb_cb(cs.clone(), k0), cm.clone(), *cr),
+            _ => {
+                let Ok((_q, m)) = asf_data::parse_asf_spectral_data(&mut b0, &s0, sfbo, k0)
+                else {
+                    continue;
+                };
+                c0 = Some((g0, s0.clone(), m.clone(), b0));
+                (s0, m, b0)
+            }
+        };
+        if asf_data::parse_asf_scalefac_data(&mut r0, &secs0, &mqi0, k0, tl).is_err() {
+            continue;
+        }
+        if asf_data::parse_asf_snf_data(&mut r0, &secs0, &mqi0, k0, tl).is_err() {
+            continue;
+        }
+        // body1 sweep from r0
+        let mut c1: Option<(Vec<u16>, asf_data::AsfSections, Vec<u32>, BitReader)> = None;
+        for k1 in 1..=num_sfb {
+            let mut b1 = r0;
+            let Ok(s1) = asf_data::parse_asf_section_data_ext(&mut b1, tl_idx, tl, k1, true)
+            else {
+                continue;
+            };
+            if s1.sect_cb.iter().any(|&cb| cb > 11) {
+                continue;
+            }
+            let g1: Vec<u16> = s1
+                .sect_end
+                .iter()
+                .copied()
+                .chain(s1.sect_cb.iter().map(|&c| c as u16))
+                .collect();
+            let (secs1, mqi1, mut r1) = match c1.as_ref() {
+                Some((g, cs, cm, cr)) if *g == g1 => (refit_sfb_cb(cs.clone(), k1), cm.clone(), *cr),
+                _ => {
+                    let Ok((_q, m)) = asf_data::parse_asf_spectral_data(&mut b1, &s1, sfbo, k1)
+                    else {
+                        continue;
+                    };
+                    c1 = Some((g1, s1.clone(), m.clone(), b1));
+                    (s1, m, b1)
+                }
+            };
+            if asf_data::parse_asf_scalefac_data(&mut r1, &secs1, &mqi1, k1, tl).is_err() {
+                continue;
+            }
+            if asf_data::parse_asf_snf_data(&mut r1, &secs1, &mqi1, k1, tl).is_err() {
+                continue;
+            }
+            let end = r1.bit_position();
+            if end < wall && wall - end <= 1200 {
+                out.push((k0, k1, end));
+            }
+        }
+    }
+    out
+}
+
+/// Round-407j: locate the I-frame trailer block's 1ch+final pair by
+/// hard constraints and return (1ch_start, slot2, slot3). See the
+/// call site for rationale.
+fn scan_iframe_tail_slots(
+    floor_br: BitReader<'_>,
+    wall: u64,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    frame_len_base: u32,
+) -> Option<(u64, u8, u8)> {
+    let floor = floor_br.bit_position();
+    let hi = wall.saturating_sub(40);
+    let mut e = floor;
+    let mut fits: Vec<(u64, u8, u8)> = Vec::new();
+    while e < hi {
+        let mut hr = floor_br;
+        if hr.skip((e - floor) as u32).is_err() {
+            break;
+        }
+        let probe = hr;
+        // Round 407r: sweep the 1ch/final F0 modes too (the mixed-F0
+        // phenomenon applies to any trailer with dir-0 envelopes) and
+        // collect ALL fits — later I-frames can produce ambiguous
+        // tail fits (frame 42 accepted a garbage s3=7); prefer the
+        // fit whose (s2, s3) matches the last-known-good vector.
+        for combo in 0u8..4 {
+            let mut vt = tools.clone();
+            vt.aspx_trailer_slot = 2;
+            let mut vr = probe;
+            crate::aspx::set_f0_raw_mode(combo & 1 == 1);
+            let r1 = crate::asf::parse_aspx_data_1ch_body(&mut vr, &mut vt, cfg, true, frame_len_base);
+            if r1.is_err() {
+                continue;
+            }
+            crate::aspx::set_f0_raw_mode((combo >> 1) & 1 == 1);
+            let r2 = crate::asf::parse_aspx_data_2ch_body(&mut vr, &mut vt, cfg, true, frame_len_base);
+            crate::aspx::set_f0_raw_mode(false);
+            if r2.is_err()
+                || vr.bit_position() > wall
+                || !(0..=8).contains(&(wall as i64 - vr.bit_position() as i64))
+            {
+                continue;
+            }
+            if let (Some(s2), Some(s3)) = (vt.aspx_xover_slots[2], vt.aspx_xover_slots[3]) {
+                fits.push((e, s2, s3));
+            }
+        }
+        crate::aspx::set_f0_raw_mode(false);
+        e += 1;
+    }
+    if fits.is_empty() {
+        return None;
+    }
+    if let Some(good) = tools.aspx_xover_slots_good {
+        if let (Some(g2), Some(g3)) = (good[2], good[3]) {
+            if let Some(&f) = fits.iter().find(|(_, s2, s3)| *s2 == g2 && *s3 == g3) {
+                return Some(f);
+            }
+        }
+    }
+    Some(fits[0])
+}
+
+/// Round-407d resync-by-signature: starting from `floor_br`, scan bit
+/// positions for the PROVEN additional-pair head signature
+/// ([bmsp=1][blong=1][msfb!=0][sap!=3], with sap=1 implying the
+/// aspx-core ms run), validate the FULL remaining chain on a copy
+/// (body0 via bound discovery, body1 at msfb, then the four ASPX
+/// trailers ending within 8 bits of the wall), and return a reader
+/// positioned at the winning head. This realigns the walk after front
+/// elements whose per-body grammar is still ambiguous, so the
+/// additional pair + trailers + sticky configs parse on every frame.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resync_7x_addpair<'a>(
+    floor_br: BitReader<'a>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Option<(BitReader<'a>, [Option<u8>; 8], Option<(u32, u32)>)> {
+    let wall = tools.wall_bits?;
+    // The additional pair + trailers never exceed ~9000 bits on real
+    // content — scanning earlier positions only burns time.
+    let mut floor_br = floor_br;
+    let floor0 = floor_br.bit_position();
+    let floor_min = wall.saturating_sub(9000);
+    if floor0 < floor_min {
+        let _ = floor_br.skip((floor_min - floor0) as u32);
+    }
+    let floor = floor_br.bit_position();
+    let hi = wall.saturating_sub(400);
+    let mut brute_budget: u32 = 16;
+    let dbg_want: Option<u64> = std::env::var("AC4_RESYNC_DEBUG")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    // Round 407n: candidate validation IS the production additional-
+    // pair parser (parse_two_channel_data_additional handles bmsp
+    // 0/1, sap 0-3, and long/grouped bodies alike), followed by the
+    // wall-distance gate and the trailer-chain oracle. This replaces
+    // the earlier hand-rolled long-only head patterns, extending
+    // resync to short/grouped additional pairs (the dominant failure
+    // class at 44.5% coverage).
+    // Two passes: the anchor-proven shape (bmsp=1 + long frame) wins
+    // outright; looser shapes (bmsp=0, grouped/short) only when no
+    // strict candidate exists anywhere — as first-class citizens they
+    // steal earlier false positions from proven heads (measured: a
+    // one-pass version cost 9pp of track-wide clean completion).
+    for strict in [true, false] {
+    let mut e = floor;
+    while e < hi {
+        let mut hr = floor_br;
+        if hr.skip((e - floor) as u32).is_err() {
+            return None;
+        }
+        let head = hr;
+        let dbg = dbg_want == Some(e);
+        let mut pr = hr;
+        let parsed = parse_two_channel_data_additional(&mut pr, frame_len_base, Some(cfg));
+        let Ok(_d) = parsed else {
+            // Round 407p (loose pass only): the sub05 class — both
+            // bodies span past their bounds and body1's bound differs
+            // from msfb — never parses under the production fn; sweep
+            // (k0, k1) jointly with the trailer chain as the oracle.
+            if !strict {
+                for (k0, k1, endj) in
+                    resync_joint_bound_candidates(hr, cfg, frame_len_base, wall)
+                {
+                    let mut jr = floor_br;
+                    if jr.skip((endj - floor) as u32).is_err() {
+                        break;
+                    }
+                    let mut jp = jr;
+                    if matches!(
+                        tools.seven_x_coding_config,
+                        Some(FiveXCodingConfig::Cfg0Stereo2plusMono)
+                            | Some(FiveXCodingConfig::Cfg2FourMono)
+                    ) && parse_mono_data(&mut jp, false, frame_len_base).is_err()
+                    {
+                        continue;
+                    }
+                    if let Some(slots) = validate_7x_trailers_slots_budgeted(
+                        jp,
+                        tools,
+                        cfg,
+                        b_iframe,
+                        frame_len_base,
+                        brute_budget > 0,
+                    ) {
+                        if std::env::var_os("AC4_T").is_some() {
+                            eprintln!(
+                                "RESYNC 7x add-pair(joint k0={k0} k1={k1}) @{}",
+                                head.bit_position()
+                            );
+                        }
+                        return Some((head, slots, Some((k0, k1))));
+                    }
+                }
+            }
+            if dbg {
+                eprintln!("RSDBG e={e}: add-pair parse REJECT");
+            }
+            e += 1;
+            continue;
+        };
+        if strict
+            && !(_d.b_enable_mdct_stereo_proc
+                && _d.transform_info.as_ref().map(|t| t.b_long_frame) == Some(true))
+        {
+            e += 1;
+            continue;
+        }
+        // coding_config 0/2 place a mono_data(0) between the additional
+        // pair and the trailers (Table 33) — the validation chain must
+        // include it or fakes pass the clone and break the real walk.
+        if matches!(
+            tools.seven_x_coding_config,
+            Some(FiveXCodingConfig::Cfg0Stereo2plusMono)
+                | Some(FiveXCodingConfig::Cfg2FourMono)
+        ) && parse_mono_data(&mut pr, false, frame_len_base).is_err()
+        {
+            if dbg {
+                eprintln!("RSDBG e={e}: cc0/2 mono REJECT");
+            }
+            e += 1;
+            continue;
+        }
+        let endp = pr.bit_position();
+        if endp >= wall || wall - endp > 1200 {
+            if dbg {
+                eprintln!("RSDBG e={e}: wall-distance REJECT (end {endp})");
+            }
+            e += 1;
+            continue;
+        }
+        let ok = validate_7x_trailers_slots_budgeted(
+            pr,
+            tools,
+            cfg,
+            b_iframe,
+            frame_len_base,
+            brute_budget > 0,
+        );
+        if dbg {
+            eprintln!(
+                "RSDBG e={e}: end {endp} trailers {:?} (harvested slots={:?})",
+                ok.as_ref().map(|s| &s[..4]),
+                &tools.aspx_xover_slots[..4]
+            );
+        }
+        match ok {
+            Some(slots) => {
+                if std::env::var_os("AC4_T").is_some() {
+                    eprintln!(
+                        "RESYNC 7x add-pair @{} (floor {floor}, end {endp})",
+                        head.bit_position()
+                    );
+                }
+                return Some((head, slots, None));
+            }
+            None => {
+                brute_budget = brute_budget.saturating_sub(1);
+            }
+        }
+        e += 1;
+    }
+    }
+    None
+}
+
+/// Validate the 7_X ASPX trailer block (2ch,2ch,1ch,2ch) on a COPY of
+/// the reader: must parse and end within 8 bits of the wall.
+pub(crate) fn validate_7x_trailers(
+    vr: BitReader<'_>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> bool {
+    validate_7x_trailers_slots(vr, tools, cfg, b_iframe, frame_len_base).is_some()
+}
+
+/// Like [`validate_7x_trailers`] but returns the slot vector that made
+/// the walk land on the wall. Tries the harvested sticky slots first;
+/// on failure (P-frames only) brute-forces the 8^4 vectors — round
+/// 407e proved the harvested I-frame slots can be internally wrong
+/// ([0,0,4,4] harvested where the cross-frame-proven vector is
+/// [0,0,0,4]; the I-frame trailer internals still need their own
+/// backchain) while the wall oracle over a whole trailer block is
+/// selective enough to recover the working vector per frame.
+pub(crate) fn validate_7x_trailers_slots(
+    vr: BitReader<'_>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+) -> Option<[Option<u8>; 8]> {
+    validate_7x_trailers_slots_budgeted(vr, tools, cfg, b_iframe, frame_len_base, true)
+}
+
+/// Budgeted variant: `allow_brute` gates the 8^4 vector search (4096
+/// trailer walks — too expensive to run per rejected resync
+/// candidate; the resync loop grants it to the first candidate that
+/// reaches trailer validation and uses cheap checks after).
+pub(crate) fn validate_7x_trailers_slots_budgeted(
+    vr: BitReader<'_>,
+    tools: &SubstreamTools,
+    cfg: &crate::aspx::AspxConfig,
+    b_iframe: bool,
+    frame_len_base: u32,
+    allow_brute: bool,
+) -> Option<[Option<u8>; 8]> {
+    let Some(wall) = tools.wall_bits else {
+        return Some(tools.aspx_xover_slots); // no wall info — accept
+    };
+    let attempt = |slots: [Option<u8>; 8], f0_combo: u8| -> bool {
+        let mut r2 = vr;
+        let mut tt = tools.clone();
+        tt.aspx_xover_slots = slots;
+        tt.aspx_trailer_slot = 0;
+        for (i, &chs) in [2u8, 2, 1, 2].iter().enumerate() {
+            crate::aspx::set_f0_raw_mode((f0_combo >> i) & 1 == 1);
+            let r = if chs == 1 {
+                crate::asf::parse_aspx_data_1ch_body(&mut r2, &mut tt, cfg, b_iframe, frame_len_base)
+            } else {
+                crate::asf::parse_aspx_data_2ch_body(&mut r2, &mut tt, cfg, b_iframe, frame_len_base)
+            };
+            if r.is_err() || r2.bit_position() > wall {
+                crate::aspx::set_f0_raw_mode(false);
+                return false;
+            }
+        }
+        crate::aspx::set_f0_raw_mode(false);
+        (0..=8).contains(&(wall as i64 - r2.bit_position() as i64))
+    };
+    // Round 407q: the mixed-F0 phenomenon is not I-frame-only —
+    // P-frame trailers with dir-0 (F0-coded) envelopes need the same
+    // per-trailer mode sweep. Huffman-only first (cheap, historic),
+    // then the 15 mixed combos.
+    for combo in 0u8..16 {
+        if attempt(tools.aspx_xover_slots, combo) {
+            return Some(tools.aspx_xover_slots);
+        }
+    }
+    if b_iframe {
+        // I-frames read their xovers from the bits — slots don't gate.
+        return None;
+    }
+    // Last-known-good vector (persisted across frames) — cheap second try.
+    if let Some(good) = tools.aspx_xover_slots_good {
+        if good != tools.aspx_xover_slots {
+            for combo in 0u8..16 {
+                if attempt(good, combo) {
+                    return Some(good);
+                }
+            }
+        }
+    }
+    // Round 407e postmortem: a free 8^4 vector search here OVERFITS —
+    // with 4096 slot choices, huffman soup at wrong positions
+    // validates against the wall and resync locks onto fake add-pairs
+    // (observed: frame 1 "resyncing" to 5551 with slots [5,3,0,0]
+    // when the proven head is 9409 with [0,0,0,4]). The vector must
+    // come from a TRUSTED source: the harvested I-frame slots (buggy
+    // today — see the I-frame trailer-internals open problem) or the
+    // cross-frame-proven cache. `_allow_brute` is kept for a future
+    // constrained search.
+    let _ = allow_brute;
+    None
+}
+
+/// Generalized round-407c body-bound discovery: parse ONE long-frame
+/// sf_data body under the untruncated-section grammar, discovering its
+/// scalefac/SNF band bound by trying candidates ascending and
+/// validating each against an oracle on the FOLLOWING bits:
+///   - `next_bodies > 0`: the next body must parse legally (sections
+///     with cb <= 11) under SOME bound of its own (checked shallowly
+///     with its section+spectral prefix, which is bound-independent);
+///   - `next_bodies == 0`: the following bits must look like the next
+///     element head (caller-provided check).
+///
+/// Returns (bound, end_bit_position) without consuming the reader.
+///
+/// Background: real content transmits scalefac/SNF for FEWER bands
+/// than the sections span, and the transmitted max_sfb explains only
+/// some bodies (add-pair body1) — proven by exact-end backchaining on
+/// frames 0/1 (3ch bodies with bounds 11/8/30 against max_sfb=6).
+pub(crate) fn discover_body_bound(
+    br0: BitReader<'_>,
+    ti: &AsfTransformInfo,
+    hint: u32,
+    oracle: impl Fn(BitReader<'_>) -> bool,
+) -> Option<(u32, u64)> {
+    use crate::asf_data;
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
+    let num_sfb = crate::tables::num_sfb_48(tl)?;
+    // Candidate order matters: the TRANSMITTED max_sfb (hint) is
+    // correct for validated elements (frame-0 3ch m=56, add-pair
+    // body1) — try it first so proven frames stay bit-exact; fall
+    // back to ascending discovery for the bodies whose bound the
+    // header demonstrably does not describe.
+    let hint = hint.min(num_sfb).max(1);
+    let candidates = std::iter::once(hint).chain((1..=num_sfb).filter(move |&k| k != hint));
+    // Round 407m perf: for a given start, the section list (and hence
+    // the spectral parse) is identical across every k that stops the
+    // section loop at the same boundary — for the common
+    // single-section bodies that's ALL k. Cache (sections, mqi,
+    // post-spectral reader) keyed by the section geometry so the
+    // 63-candidate sweep re-parses only the tiny scalefac/SNF tails.
+    let mut cache: Option<(Vec<u16>, asf_data::AsfSections, Vec<u32>, BitReader)> = None;
+    for k in candidates {
+        let mut tr = br0;
+        let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut tr, tl_idx, tl, k, true)
+        else {
+            continue;
+        };
+        // NOTE: cb 12-15 sentinel sections are real on some frames —
+        // no legality filter here (that's a scan-side discriminator).
+        let geom: Vec<u16> = sections
+            .sect_end
+            .iter()
+            .copied()
+            .chain(sections.sect_cb.iter().map(|&c| c as u16))
+            .collect();
+        let (secs, mqi, mut tr) = match cache.as_ref() {
+            Some((g, cs, cm, cr)) if *g == geom => (refit_sfb_cb(cs.clone(), k), cm.clone(), *cr),
+            _ => {
+                let Ok((_q, m)) = asf_data::parse_asf_spectral_data(&mut tr, &sections, sfbo, k)
+                else {
+                    continue;
+                };
+                cache = Some((geom, sections.clone(), m.clone(), tr));
+                (sections, m, tr)
+            }
+        };
+        if asf_data::parse_asf_scalefac_data(&mut tr, &secs, &mqi, k, tl).is_err() {
+            continue;
+        }
+        if asf_data::parse_asf_snf_data(&mut tr, &secs, &mqi, k, tl).is_err() {
+            continue;
+        }
+        if oracle(tr) {
+            return Some((k, tr.bit_position()));
+        }
+    }
+    None
+}
+
+/// Oracle helper: do the bits at `br` parse as a legal body prefix
+/// (untruncated sections, cb <= 11, spectral decodes)? Bound-agnostic:
+/// uses max_sfb = 1, whose section+spectral prefix equals any small
+/// bound's.
+pub(crate) fn legal_body_prefix(mut br: BitReader<'_>, ti: &AsfTransformInfo) -> bool {
+    use crate::asf_data;
+    let tl = ti.transform_length_0;
+    if crate::sfb_offset::sfb_offset_48(tl).is_none() {
+        return false;
+    }
+    let Ok(sections) = asf_data::parse_asf_section_data_ext(&mut br, ti.transf_length[0], tl, 1, true)
+    else {
+        return false;
+    };
+    if sections.sect_cb.iter().any(|&cb| cb > 11) {
+        return false;
+    }
+    // Round 407m perf: bounded probe — decode at most 8 spectral
+    // codewords of the first coded section instead of the whole body.
+    // Nearly as selective against garbage, and O(1) instead of
+    // O(body) at the thousands of positions the resync scan visits.
+    let Some(&cb) = sections.sect_cb.iter().find(|&&c| c != 0 && c <= 11) else {
+        return true; // all-zero/sentinel sections: nothing to probe
+    };
+    let Some(hcb) = crate::huffman::asf_hcb(cb as u32) else {
+        return false;
+    };
+    for _ in 0..8 {
+        if crate::huffman::huff_decode(&mut br, hcb.len, hcb.cw).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The additional-channel pair's FIRST body gates scalefac/SNF over
+/// this many bands, independent of the transmitted max_sfb (round 406,
+/// empirical — constant 2 across tracks; its single section and the
+/// spectral data span far wider, hence the untruncated section
+/// grammar). Semantics of the two bands' gains are still TBD; parsing
+/// length is exact.
+pub(crate) const ADD_PAIR_BODY0_SF_BOUND: u32 = 2;
+
+/// Table 26 `two_channel_data()` for the 7_X ADDITIONAL channel pair.
+///
+/// Identical to [`parse_two_channel_data`] except in the
+/// `b_enable_mdct_stereo_proc == 1` long-frame path, where the
+/// additional pair deviates from the plain Table 26/47 reading in two
+/// proven ways (riptide docs/ac4-decoder-accuracy-plan.md §7i):
+///   1. `chparam_info`'s ms_used loop runs over
+///      [`aspx_core_band_count`] bands (not `max_sfb`);
+///   2. body0 uses the untruncated section grammar with a scalefac/SNF
+///      bound of [`ADD_PAIR_BODY0_SF_BOUND`]; body1 uses `max_sfb`.
+/// Falls back to the plain parse when no aspx config is available
+/// (SIMPLE codec mode) or the frame is short/grouped.
+pub fn parse_two_channel_data_additional(
+    br: &mut BitReader<'_>,
+    frame_len_base: u32,
+    aspx_cfg: Option<&crate::aspx::AspxConfig>,
+) -> Result<TwoChannelData> {
+    let Some(cfg) = aspx_cfg else {
+        return parse_two_channel_data(br, frame_len_base);
+    };
+    let b_msp = br.read_bit()?;
+    let _trace = std::env::var_os("AC4_TRACE_BODIES").is_some();
+    if _trace {
+        eprintln!("2CH-ADD b_msp={} in@{}", b_msp as u8, br.bit_position() - 1);
+    }
+    if !b_msp {
+        // Independent-channel branch is byte-identical to the plain
+        // element; reuse its body handling.
+        let ti0 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy0 = parse_asf_psy_info(br, &ti0, frame_len_base, false, false)?;
+        let ti1 = parse_asf_transform_info(br, frame_len_base)?;
+        let psy1 = parse_asf_psy_info(br, &ti1, frame_len_base, false, false)?;
+        let (mut scaled, mut scaled_windows) = decode_mch_sf_data_channels(br, &ti0, &psy0, 1);
+        let (s1, w1) = decode_mch_sf_data_channels(br, &ti1, &psy1, 1);
+        scaled.extend(s1);
+        scaled_windows.extend(w1);
+        return Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: false,
+            transform_info: Some(ti0),
+            psy_info: Some(psy0),
+            transform_info_1: Some(ti1),
+            psy_info_1: Some(psy1),
+            chparam: None,
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        });
+    }
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let chparam = parse_chparam_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+    if !(ti.b_long_frame && psy.num_window_groups == 1) {
+        // Short/grouped additional pair: rule unverified — single-group
+        // count (see round-406e note above) and grouped body walker.
+        let chparam = parse_chparam_info(br, &[psy.max_sfb_0])?;
+        let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 2);
+        return Ok(TwoChannelData {
+            b_enable_mdct_stereo_proc: true,
+            transform_info: Some(ti),
+            psy_info: Some(psy),
+            transform_info_1: None,
+            psy_info_1: None,
+            chparam: Some(chparam),
+            scaled_spec_per_channel: scaled,
+            scaled_spec_windows_per_channel: scaled_windows,
+        });
+    }
+    let ms_bands = aspx_core_band_count(cfg, ti.transform_length_0).unwrap_or(psy.max_sfb_0);
+    let chparam = parse_chparam_info(br, &[ms_bands])?;
+    // Round 406d: body0's scalefac band count is NOT derivable from any
+    // known header field (observed 2 / 2 / 14 across three tracks with
+    // identical aspx configs). Discover it per frame: parse body0's
+    // section+spectral (deterministic), then try k = 0.. scalefac
+    // codewords; the first k whose implied body1 start yields a fully
+    // valid body1 parse (legal codebooks, sections closing exactly at
+    // max_sfb) wins — a few hundred chained Huffman codewords make a
+    // false accept essentially impossible.
+    let m0 = discover_add_pair_body0_bound(*br, &ti, psy.max_sfb_0)
+        .unwrap_or(ADD_PAIR_BODY0_SF_BOUND);
+    let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, m0, true);
+    let b1 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, psy.max_sfb_0, true);
+    if _trace {
+        eprintln!(
+            "2CH-ADD shared m={} ms_bands={} b0={} b1={} out@{}",
+            psy.max_sfb_0,
+            ms_bands,
+            b0.is_some(),
+            b1.is_some(),
+            br.bit_position()
+        );
+    }
+    if b0.is_none() || b1.is_none() {
+        return Err(oxideav_core::error::Error::invalid(
+            "ac4: additional two_channel_data body parse failed",
+        ));
+    }
     Ok(TwoChannelData {
+        b_enable_mdct_stereo_proc: true,
         transform_info: Some(ti),
         psy_info: Some(psy),
+        transform_info_1: None,
+        psy_info_1: None,
         chparam: Some(chparam),
-        scaled_spec_per_channel: scaled,
+        scaled_spec_per_channel: vec![b0, b1],
+        scaled_spec_windows_per_channel: vec![None, None],
     })
 }
 
@@ -409,14 +1294,39 @@ pub fn parse_three_channel_data(
 ) -> Result<ThreeChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_three_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 3);
+    let info = parse_three_channel_info(br, &[psy.max_sfb_0])?;
+    if std::env::var_os("AC4_TRACE_BODIES").is_some() {
+        eprintln!(
+            "3CH long={} tl=({},{}) m0={} m1={} ng={} grp={:?} matsel={} saps=({},{}) bodies@{}",
+            ti.b_long_frame,
+            ti.transf_length[0],
+            ti.transf_length[1],
+            psy.max_sfb_0,
+            psy.max_sfb_1,
+            psy.num_window_groups,
+            psy.scale_factor_grouping,
+            info.chel_matsel,
+            info.chparam[0].sap_mode,
+            info.chparam[1].sap_mode,
+            br.bit_position()
+        );
+    }
+    // Round 407c: a discovery-first walk was tried here and REVERTED —
+    // frame-0's 3ch bodies need the truncating grammar while frame-1's
+    // need untruncated sections with bounds (11,8,30) that nothing in
+    // the header describes (see the RE guide's open problems). The
+    // per-body grammar discriminator is still unknown; the legacy
+    // fixed-max_sfb walk keeps validated frames bit-exact.
+    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 3);
+    if std::env::var_os("AC4_TRACE_BODIES").is_some() {
+        eprintln!("3CH bodies out@{}", br.bit_position());
+    }
     Ok(ThreeChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
         scaled_spec_per_channel: scaled,
+        scaled_spec_windows_per_channel: scaled_windows,
     })
 }
 
@@ -427,14 +1337,14 @@ pub fn parse_four_channel_data(
 ) -> Result<FourChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_four_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 4);
+    let info = parse_four_channel_info(br, &[psy.max_sfb_0])?;
+    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 4);
     Ok(FourChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
         scaled_spec_per_channel: scaled,
+        scaled_spec_windows_per_channel: scaled_windows,
     })
 }
 
@@ -445,14 +1355,14 @@ pub fn parse_five_channel_data(
 ) -> Result<FiveChannelData> {
     let ti = parse_asf_transform_info(br, frame_len_base)?;
     let psy = parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
-    let max_sfb_g = psy.max_sfb_0;
-    let info = parse_five_channel_info(br, &[max_sfb_g])?;
-    let scaled = decode_mch_sf_data_channels(br, &ti, &psy, 5);
+    let info = parse_five_channel_info(br, &[psy.max_sfb_0])?;
+    let (scaled, scaled_windows) = decode_mch_sf_data_channels(br, &ti, &psy, 5);
     Ok(FiveChannelData {
         transform_info: Some(ti),
         psy_info: Some(psy),
         info: Some(info),
         scaled_spec_per_channel: scaled,
+        scaled_spec_windows_per_channel: scaled_windows,
     })
 }
 
@@ -487,12 +1397,56 @@ pub fn parse_five_channel_data(
 /// group; per-group `max_sfb` selection (Pseudocode 5
 /// `get_max_sfb(g)`) collapses to that single value for the
 /// non-side-channel multichannel path.
+/// A single physical window's decoded, de-grouped spectrum:
+/// `(transform_length, spectrum)`. `spectrum.len() ==
+/// sfb_offset_48(transform_length)[max_sfb]` — the same width a
+/// long-frame single-window channel would produce, ready for a
+/// straight per-window IMDCT.
+pub(crate) type WindowSpectrum = (u32, Vec<f32>);
+
+/// Round-407c discovery walk: decode `n_channels` long-frame bodies,
+/// discovering each body's scalefac/SNF bound via [`discover_body_bound`].
+/// Bodies 0..n-1 use "next body prefix parses" as the oracle; the last
+/// body uses `final_oracle` (next-element head check supplied by the
+/// element walker). Falls back to `None` per channel when discovery
+/// fails — the caller can then retry the legacy fixed-max_sfb path.
+pub(crate) fn decode_mch_sf_data_channels_discover(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+    n_channels: usize,
+    final_oracle: &dyn Fn(BitReader<'_>) -> bool,
+) -> Option<Vec<Option<Vec<f32>>>> {
+    if !(ti.b_long_frame && psy.num_window_groups == 1) {
+        return None;
+    }
+    let mut out: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_channels);
+    for ch in 0..n_channels {
+        let last = ch + 1 == n_channels;
+        let found = if last {
+            discover_body_bound(*br, ti, psy.max_sfb_0, |tr| final_oracle(tr))
+        } else {
+            discover_body_bound(*br, ti, psy.max_sfb_0, |tr| legal_body_prefix(tr, ti))
+        };
+        // Try the transmitted max_sfb as a first-class candidate too:
+        // when the plain bound also satisfies the oracle at the same
+        // or earlier position, prefer discovery's (ascending-k) pick.
+        let (bound, _end) = found?;
+        let body = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, ti, bound, true)?;
+        if std::env::var_os("AC4_TRACE_BODIES").is_some() {
+            eprintln!("DISC ch{ch} bound={bound} out@{}", br.bit_position());
+        }
+        out.push(Some(body));
+    }
+    Some(out)
+}
+
 pub(crate) fn decode_mch_sf_data_channels(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
     psy: &AsfPsyInfo,
     n_channels: usize,
-) -> Vec<Option<Vec<f32>>> {
+) -> (Vec<Option<Vec<f32>>>, Vec<Option<Vec<WindowSpectrum>>>) {
     let mut out = vec![None; n_channels];
     if ti.b_long_frame && psy.num_window_groups == 1 {
         // Long-frame, 1 window group — walk one body chain per channel.
@@ -502,65 +1456,172 @@ pub(crate) fn decode_mch_sf_data_channels(
                 None => break,
             }
         }
-        return out;
+        return (out, vec![None; n_channels]);
     }
     if psy.num_window_groups == 0 {
-        return out;
+        return (out, vec![None; n_channels]);
     }
-    // Short / grouped frame walker.
-    for slot in out.iter_mut() {
-        match decode_asf_grouped_mono_body_with_max_sfb(
-            br,
-            ti,
-            psy.max_sfb_0,
-            psy.num_window_groups,
-        ) {
+    // Short / grouped frame walker: per-channel, per-window spectra
+    // (widened Huffman decode + §5.1.5 ungrouping — see
+    // `decode_asf_grouped_body_windows`). The old flat, group-major
+    // `Vec<f32>` output stays `None` here — it was never correct for
+    // real grouped content (see that function's docs) and every
+    // consumer already gates on `ti.b_long_frame` before touching it.
+    let mut windows_out: Vec<Option<Vec<WindowSpectrum>>> = vec![None; n_channels];
+    for slot in windows_out.iter_mut() {
+        match decode_asf_grouped_body_windows(br, ti, psy, psy.max_sfb_0) {
             Some(v) => *slot = Some(v),
             None => break,
         }
     }
-    out
+    (out, windows_out)
 }
 
-/// Walk one `sf_data(ASF)` body for the grouped / short-frame case
-/// where `num_window_groups > 1`. Per spec §4.2.8 (Tables 39-42) and
-/// §5.4.4.4 the body fires `num_window_groups` independent
-/// `(section + spectral + scalefac + snf)` cycles back-to-back; the
-/// per-group spectrum is `sfb_offset[max_sfb]` long at the per-window
-/// transform length. The returned vector concatenates the
-/// `num_window_groups` per-group spectra (group-major).
+/// Decode one channel's grouped/short-frame `sf_data(ASF)` body —
+/// `num_window_groups > 1` — including the §5.1.5 Pseudocode 25
+/// spectral-ungrouping step, and return one `(transform_length,
+/// spectrum)` pair per **physical window** (not per group), in window
+/// order, ready for individual per-window IMDCT.
+///
+/// This replaces an earlier implementation that treated every group as
+/// exactly one window wide and re-read the shared
+/// `reference_scale_factor(8)` / `b_snf_data_exists(1)` header fields
+/// once *per group* instead of once for the whole body. Real content
+/// commonly packs more than one window into a single group (e.g.
+/// `num_windows=8, num_window_groups=4` shows up constantly) —
+/// §4.3.6.2.6 Pseudocode 4 requires widening each group's
+/// `asf_section_data()` / `asf_spectral_data()` payload by
+/// `num_win_in_group[g]` (`sect_sfb_offset[g][sfb] = group_offset +
+/// sfb_offset[sfb] * num_win_in_group[g]`), so decoding with the
+/// unwidened table desyncs the bitreader position the moment any real
+/// group has more than one window. Fixed by widening the `sfb_offset`
+/// table passed to the Huffman decode by `num_win_in_group[g]`, then
+/// applying §5.1.5 Pseudocode 25 to de-interleave each group's widened
+/// (band-major, window-minor) spectrum back into individual per-window
+/// spectra.
 ///
 /// Returns `None` on the first Huffman / bit-stream miss; partial
 /// per-group output is dropped because the bitreader position is
 /// indeterminate after a mid-body miss.
-fn decode_asf_grouped_mono_body_with_max_sfb(
+pub(crate) fn decode_asf_grouped_body_windows(
     br: &mut BitReader<'_>,
     ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
     max_sfb_in: u32,
-    num_window_groups: u32,
-) -> Option<Vec<f32>> {
-    let tl = ti.transform_length_0;
-    let tl_idx = ti.transf_length[0];
-    let max_sfb_cap = crate::tables::num_sfb_48(tl)?;
-    let max_sfb = max_sfb_in.min(max_sfb_cap);
-    if max_sfb == 0 {
+) -> Option<Vec<WindowSpectrum>> {
+    decode_asf_grouped_body_windows_ab(br, ti, psy, max_sfb_in, max_sfb_in)
+}
+
+/// [`decode_asf_grouped_body_windows`] with distinct first/second-half
+/// max_sfb values for `b_different_framing` bodies (get_max_sfb(g)
+/// returns max_sfb[1] for groups past the framing boundary —
+/// Pseudocode 5).
+pub(crate) fn decode_asf_grouped_body_windows_ab(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    psy: &AsfPsyInfo,
+    max_sfb_a: u32,
+    max_sfb_b: u32,
+) -> Option<Vec<WindowSpectrum>> {
+    // Real short-frame content can legitimately collapse ALL of its
+    // physical windows into a *single* group (`num_window_groups == 1`
+    // with `num_windows > 1` — every `scale_factor_grouping` bit set to
+    // "continue"), which still needs the widened-decode + ungrouping
+    // machinery below (`num_win_in_group[0] == num_windows` in that
+    // case). The only genuine "nothing to ungroup" case is a single
+    // physical window altogether.
+    if psy.num_windows <= 1 {
         return None;
     }
-    let sfbo = crate::sfb_offset::sfb_offset_48(tl)?;
-    let per_group_len = sfbo[max_sfb as usize] as usize;
-    let total_len = per_group_len.checked_mul(num_window_groups as usize)?;
-    let mut out = Vec::with_capacity(total_len);
-    for _g in 0..num_window_groups {
-        let sections = crate::asf_data::parse_asf_section_data(br, tl_idx, tl, max_sfb).ok()?;
-        let (qspec, mqi) =
-            crate::asf_data::parse_asf_spectral_data(br, &sections, sfbo, max_sfb).ok()?;
-        let sf_gain =
-            crate::asf_data::parse_asf_scalefac_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-        let _snf = crate::asf_data::parse_asf_snf_data(br, &sections, &mqi, max_sfb, tl).ok()?;
-        let scaled = crate::asf_data::dequantise_and_scale(&qspec, &sf_gain, sfbo, max_sfb);
-        out.extend_from_slice(&scaled);
+    let (tl_idx_per_g, tl_per_g, max_sfb_per_g, num_win_in_group_per_g) =
+        crate::asf::derive_per_group_with_max_sfb(ti, psy, max_sfb_a, max_sfb_b);
+    let n = tl_per_g.len();
+    let mut base_sfbo_per_g: Vec<&'static [u16]> = Vec::with_capacity(n);
+    let mut widened_sfbo_per_g: Vec<Vec<u16>> = Vec::with_capacity(n);
+    let mut max_sfb_capped: Vec<u32> = Vec::with_capacity(n);
+    for g in 0..n {
+        let tl = tl_per_g[g];
+        let cap = crate::tables::num_sfb_48(tl)?;
+        let m = max_sfb_per_g[g].min(cap);
+        if m == 0 {
+            return None;
+        }
+        let base = crate::sfb_offset::sfb_offset_48(tl)?;
+        let nwig = num_win_in_group_per_g[g].max(1);
+        let widened: Vec<u16> = base
+            .iter()
+            .map(|&x| x.saturating_mul(nwig as u16))
+            .collect();
+        max_sfb_capped.push(m);
+        base_sfbo_per_g.push(base);
+        widened_sfbo_per_g.push(widened);
     }
-    Some(out)
+    let widened_refs: Vec<&[u16]> = widened_sfbo_per_g.iter().map(|v| v.as_slice()).collect();
+
+    let sections = crate::asf_data::parse_asf_section_data_grouped(
+        br,
+        &tl_idx_per_g,
+        &tl_per_g,
+        &max_sfb_capped,
+    )
+    .ok()?;
+    let (qspec_per_g, mqi_per_g) = crate::asf_data::parse_asf_spectral_data_grouped(
+        br,
+        &sections,
+        &widened_refs,
+        &max_sfb_capped,
+    )
+    .ok()?;
+    let sf_gain_per_g = crate::asf_data::parse_asf_scalefac_data_grouped(
+        br,
+        &sections,
+        &mqi_per_g,
+        &max_sfb_capped,
+        &tl_per_g,
+    )
+    .ok()?;
+    let _snf = crate::asf_data::parse_asf_snf_data_grouped(
+        br,
+        &sections,
+        &mqi_per_g,
+        &max_sfb_capped,
+        &tl_per_g,
+    )
+    .ok()?;
+
+    // §5.1.5 Pseudocode 25: for each group, walk band-major then
+    // window-minor through the widened (dequantised + scaled) spectrum,
+    // de-interleaving it into `num_win_in_group[g]` per-window vectors
+    // each `base_sfbo[max_sfb]` long.
+    let mut windows: Vec<WindowSpectrum> = Vec::new();
+    for g in 0..n {
+        let widened_scaled = crate::asf_data::dequantise_and_scale(
+            &qspec_per_g[g],
+            &sf_gain_per_g[g],
+            widened_refs[g],
+            max_sfb_capped[g],
+        );
+        let win_width = base_sfbo_per_g[g][max_sfb_capped[g] as usize] as usize;
+        let nwig = num_win_in_group_per_g[g].max(1) as usize;
+        let mut k = 0usize;
+        let mut per_window: Vec<Vec<f32>> = vec![vec![0.0f32; win_width]; nwig];
+        for sfb in 0..max_sfb_capped[g] as usize {
+            let band_start = base_sfbo_per_g[g][sfb] as usize;
+            let band_end = base_sfbo_per_g[g][sfb + 1] as usize;
+            for pw in per_window.iter_mut() {
+                for l in band_start..band_end {
+                    if k < widened_scaled.len() && l < win_width {
+                        pw[l] = widened_scaled[k];
+                    }
+                    k += 1;
+                }
+            }
+        }
+        for pw in per_window {
+            windows.push((tl_per_g[g], pw));
+        }
+    }
+    Some(windows)
 }
 
 // =====================================================================
@@ -1002,6 +2063,7 @@ fn parse_aspx_acpl_1_2_inner_body(
     //    sticky state on P-frames (§4.2.6.6 Table 25 gates only the
     //    *configs* on b_iframe; the data elements are always present).
     let Some(aspx_cfg) = tools.aspx_config else {
+        if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL no-aspx-cfg @{}", br.bit_position()); }
         return Ok(());
     };
     // aspx_data_2ch() then aspx_data_1ch().
@@ -1118,6 +2180,219 @@ impl SevenXCodecMode {
 /// All inner Huffman / parse misses are caught try-and-bail and surface
 /// `Ok(())` to the caller — the outer walker never returns `Err` once
 /// the leading 2-bit `7_X_codec_mode` has been consumed.
+
+/// Round 408: P-frame FRONT backchain. The pre-cc region is opaque
+/// (docs/ac4-bitstream-reality.md), but the front elements follow the
+/// standard grammar at positions recoverable from the resync-proven
+/// add-pair head: the last front element ends exactly at `gate`
+/// (= head - 2, the uniform 2-bit gate). Scan production-parser
+/// exact-end chains for each coding_config shape and OVERWRITE the
+/// garbage front state. Returns the recovered coding_config.
+fn resync_7x_front(
+    floor: BitReader<'_>,
+    gate: u64,
+    tools: &mut SubstreamTools,
+    frame_len_base: u32,
+    largest_tl: &mut Option<u32>,
+) -> Option<FiveXCodingConfig> {
+    let lo = floor.bit_position().saturating_sub(4) as usize;
+    if gate <= lo as u64 + 16 {
+        return None;
+    }
+    let head = gate + 2; // add-pair head (gate = head-2 by definition)
+    // Pass 1: last element = two_channel_data ending at gate (sap=0
+    // shape, Cfg1 or Cfg0) OR ending in the sap=1 window
+    // [gate-170..gate-16] where the tail must validate as
+    // [b_use_sap=1][chparam_info x2 over the aspx-core band count]
+    // running exactly to head-1. Collect validated hits.
+    let ms_bands: u32 = tools
+        .aspx_config
+        .as_ref()
+        .and_then(|c| aspx_core_band_count(c, 2048))
+        .unwrap_or(50);
+    type SapInfo = Option<[crate::mch::ChparamInfo; 2]>;
+    let mut last2: Vec<(u64, TwoChannelData, SapInfo)> = Vec::new();
+    for start in lo..gate as usize {
+        let mut br = floor;
+        let d = start as i64 - br.bit_position() as i64;
+        if d < 0 || br.skip(d as u32).is_err() {
+            continue;
+        }
+        if let Ok(d2) = parse_two_channel_data(&mut br, frame_len_base) {
+            let e = br.bit_position();
+            if e == gate {
+                last2.push((start as u64, d2, None));
+            } else if e + 16 <= gate && e + 480 >= gate {
+                // sap=1 candidate: gap must parse as '1' + 2 chparams
+                // ending exactly at head-1.
+                if matches!(br.read_bit(), Ok(true)) {
+                    if let (Ok(cp0), Ok(cp1)) = (
+                        parse_chparam_info(&mut br, &[ms_bands]),
+                        parse_chparam_info(&mut br, &[ms_bands]),
+                    ) {
+                        if br.bit_position() == head - 1 {
+                            if std::env::var_os("AC4_T").is_some() {
+                                eprintln!("FRONT sap1-cand: 2ch@{start}..{e} cps->{}", head - 1);
+                            }
+                            last2.push((start as u64, d2, Some([cp0, cp1])));
+                        }
+                    }
+                }
+            }
+            if last2.len() > 6 {
+                break; // degenerate frame; bail below on ambiguity
+            }
+        }
+    }
+    if std::env::var_os("AC4_T").is_some() {
+        eprintln!("FRONT-CANDS n={} at gate {gate}", last2.len());
+    }
+    for (s2, d2, sap) in &last2 {
+        // Cfg1: three_channel_data ends at the 2ch start.
+        for start in lo..*s2 as usize {
+            let mut br = floor;
+            let d = start as i64 - br.bit_position() as i64;
+            if d < 0 || br.skip(d as u32).is_err() {
+                continue;
+            }
+            if let Ok(d3) = parse_three_channel_data(&mut br, frame_len_base) {
+                // Round 411: alias rejection. Real 3ch fronts on this
+                // content class carry m0 in the 40s-50s, legal matsel
+                // (<=11) and long single-group frames; bounded-Huffman
+                // aliases exact-ending on the gate read m0=0..24,
+                // matsel up to 15, ng up to 9 (220-frame survey) and
+                // fed garbage to the matrix on 14/17 recovered frames.
+                let sane3 = d3
+                    .psy_info
+                    .as_ref()
+                    .map(|p| p.max_sfb_0 >= 40 && p.num_window_groups == 1)
+                    .unwrap_or(false)
+                    && d3.info.as_ref().map(|i| i.chel_matsel <= 11).unwrap_or(false);
+                if sane3 && br.bit_position() == *s2 {
+                    if let Some(ti) = d3.transform_info.as_ref() {
+                        let tl = ti.transform_length_0;
+                        *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                    }
+                    if let Some(ti) = d2.transform_info.as_ref() {
+                        let tl = ti.transform_length_0;
+                        *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                    }
+                    tools.three_channel_data = Some(d3);
+                    tools.two_channel_data = vec![d2.clone()];
+                    if let Some(cps) = sap {
+                        tools.seven_x_b_use_sap_add_ch = Some(true);
+                        tools.seven_x_add_chparam_info = Some(cps.clone());
+                    }
+                    if std::env::var_os("AC4_T").is_some() {
+                        let (m0, ms, ng) = (
+                            tools.three_channel_data.as_ref().and_then(|d| d.psy_info.as_ref()).map(|p| p.max_sfb_0).unwrap_or(0),
+                            tools.three_channel_data.as_ref().and_then(|d| d.info.as_ref()).map(|i| i.chel_matsel).unwrap_or(99),
+                            tools.three_channel_data.as_ref().and_then(|d| d.psy_info.as_ref()).map(|p| p.num_window_groups).unwrap_or(0),
+                        );
+                        eprintln!("FRONT-RESYNC cfg1: 3ch@{start} 2ch@{s2} gate@{gate} m0={m0} matsel={ms} ng={ng}");
+                    }
+                    return Some(FiveXCodingConfig::Cfg1ThreeStereo);
+                }
+            }
+        }
+        // Cfg0: another two_channel_data ends at this one's start.
+        for start in lo..*s2 as usize {
+            let mut br = floor;
+            let d = start as i64 - br.bit_position() as i64;
+            if d < 0 || br.skip(d as u32).is_err() {
+                continue;
+            }
+            if let Ok(da) = parse_two_channel_data(&mut br, frame_len_base) {
+                if br.bit_position() == *s2 {
+                    for dd in [&da, d2] {
+                        if let Some(ti) = dd.transform_info.as_ref() {
+                            let tl = ti.transform_length_0;
+                            *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                        }
+                    }
+                    tools.two_channel_data = vec![da, d2.clone()];
+                    tools.three_channel_data = None;
+                    if let Some(cps) = sap {
+                        tools.seven_x_b_use_sap_add_ch = Some(true);
+                        tools.seven_x_add_chparam_info = Some(cps.clone());
+                    }
+                    if std::env::var_os("AC4_T").is_some() {
+                        eprintln!("FRONT-RESYNC cfg0: 2ch@{start} 2ch@{s2} gate@{gate}");
+                    }
+                    return Some(FiveXCodingConfig::Cfg0Stereo2plusMono);
+                }
+            }
+        }
+    }
+    // Pass 2: single four/five_channel_data ending at gate (Cfg2/Cfg3).
+    for start in lo..gate as usize {
+        let mut br = floor;
+        let d = start as i64 - br.bit_position() as i64;
+        if d < 0 || br.skip(d as u32).is_err() {
+            continue;
+        }
+        if let Ok(d4) = parse_four_channel_data(&mut br, frame_len_base) {
+            let e4 = br.bit_position();
+            let ok4 = e4 == gate
+                || (e4 + 16 <= gate && e4 + 480 >= gate && {
+                    let mut gb = br;
+                    matches!(gb.read_bit(), Ok(true))
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && gb.bit_position() == head - 1
+                });
+            let sane4 = d4
+                .psy_info
+                .as_ref()
+                .map(|p| p.max_sfb_0 >= 40 && p.num_window_groups == 1)
+                .unwrap_or(false);
+            if ok4 && sane4 {
+                if let Some(ti) = d4.transform_info.as_ref() {
+                    let tl = ti.transform_length_0;
+                    *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                }
+                tools.four_channel_data = Some(d4);
+                if std::env::var_os("AC4_T").is_some() {
+                    eprintln!("FRONT-RESYNC cfg2: 4ch@{start} gate@{gate}");
+                }
+                return Some(FiveXCodingConfig::Cfg2FourMono);
+            }
+        }
+        let mut br = floor;
+        if br.skip(d as u32).is_err() {
+            continue;
+        }
+        if let Ok(d5) = parse_five_channel_data(&mut br, frame_len_base) {
+            let e5 = br.bit_position();
+            let ok5 = e5 == gate
+                || (e5 + 16 <= gate && e5 + 480 >= gate && {
+                    let mut gb = br;
+                    matches!(gb.read_bit(), Ok(true))
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && gb.bit_position() == head - 1
+                });
+            let sane5 = d5
+                .psy_info
+                .as_ref()
+                .map(|p| p.max_sfb_0 >= 40 && p.num_window_groups == 1)
+                .unwrap_or(false);
+            if ok5 && sane5 {
+                if let Some(ti) = d5.transform_info.as_ref() {
+                    let tl = ti.transform_length_0;
+                    *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
+                }
+                tools.five_channel_data = Some(d5);
+                if std::env::var_os("AC4_T").is_some() {
+                    eprintln!("FRONT-RESYNC cfg3: 5ch@{start} gate@{gate}");
+                }
+                return Some(FiveXCodingConfig::Cfg3Five);
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_7x_audio_data_outer(
     br: &mut BitReader<'_>,
     tools: &mut SubstreamTools,
@@ -1125,6 +2400,11 @@ pub fn parse_7x_audio_data_outer(
     b_iframe: bool,
     frame_len_base: u32,
 ) -> Result<()> {
+    // AC4_PHASE_TIMING=1: coarse per-phase wall-clock breakdown of the
+    // 7_X walk (front / add-pair / resync / F0-combo / trailer-commit)
+    // for hunting the research-tax hot spots.
+    let _pt = std::env::var_os("AC4_PHASE_TIMING").is_some();
+    let _pt0 = std::time::Instant::now();
     // 7_X_codec_mode (2 bits — Table 98).
     let mode_bits = br.read_u32(2)?;
     let mode = SevenXCodecMode::from_u32(mode_bits);
@@ -1178,7 +2458,19 @@ pub fn parse_7x_audio_data_outer(
         2 => FiveXCodingConfig::Cfg2FourMono,
         _ => FiveXCodingConfig::Cfg3Five,
     };
+    if std::env::var_os("AC4_TRACE_7X").is_some() {
+        eprintln!(
+            "7X iframe={} mode={:?} lfe_end_cc_start={} cc={} ",
+            b_iframe as u8,
+            mode,
+            br.bit_position() - 2,
+            cc
+        );
+    }
     tools.seven_x_coding_config = Some(coding_cfg);
+    // Round 407d: remember where the channel-data switch starts — the
+    // resync scan floor when the front walk desyncs.
+    let switch_floor = *br;
 
     // Track the largest signalled transform length across the channel
     // data bodies — used downstream to derive `n_side_bits` per the
@@ -1278,44 +2570,200 @@ pub fn parse_7x_audio_data_outer(
         }
     }
     if !body_ok {
-        return Ok(());
+        if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL switch-body @{}", br.bit_position()); }
+        // Round 407d: don't give up — the resync fallback below can
+        // still recover the additional pair + trailers + sticky
+        // configs past the desynced front. Only bail here for modes
+        // without the trailer oracle.
+        if !matches!(mode, SevenXCodecMode::Aspx) {
+            return Ok(());
+        }
     }
 
+    let _pt_front = _pt0.elapsed();
+    let mut _pt_add = std::time::Duration::ZERO;
+    let mut _pt_resync = std::time::Duration::ZERO;
     // SIMPLE / ASPX additional-channel block: optional `chparam_info()×2`
     // gated on `b_use_sap_add_ch`, then a `two_channel_data()` carrying
     // the extra 2 channels (the front-extension or surround-back pair).
     if matches!(mode, SevenXCodecMode::Simple | SevenXCodecMode::Aspx) {
-        let b_use_sap_add_ch = match br.read_bit() {
-            Ok(b) => b,
-            Err(_) => return Ok(()),
-        };
-        tools.seven_x_b_use_sap_add_ch = Some(b_use_sap_add_ch);
-        if b_use_sap_add_ch {
-            // Two chparam_info() calls. Use the additional-channel
-            // two_channel_data's max_sfb when we read it below; for now
-            // pass the largest channel-data max_sfb seen so far (the
-            // chparam SAP DPCM walker is bounded by its own
-            // `max_sfb_per_group` argument).
-            let max_sfb_g = largest_tl.and_then(crate::tables::num_sfb_48).unwrap_or(63);
-            let cp0 = match parse_chparam_info(br, &[max_sfb_g]) {
-                Ok(c) => c,
-                Err(_) => return Ok(()),
-            };
-            let cp1 = match parse_chparam_info(br, &[max_sfb_g]) {
-                Ok(c) => c,
-                Err(_) => return Ok(()),
-            };
-            tools.seven_x_add_chparam_info = Some([cp0, cp1]);
-        }
-        // Additional `two_channel_data()` for the extra 2 channels.
-        match parse_two_channel_data(br, frame_len_base) {
-            Ok(d) => {
-                if let Some(ti) = d.transform_info.as_ref() {
-                    update_largest(ti.transform_length_0, &mut largest_tl);
-                }
-                tools.seven_x_additional_channel_data = Some(d);
+        let add_cfg = tools.aspx_config.clone();
+        let mut add_done = false;
+        let _pt_a0 = std::time::Instant::now();
+        // ---- normal attempt (only from a healthy front walk) ----
+        let normal_save = *br;
+        'normal: {
+            if !body_ok {
+                break 'normal;
             }
-            Err(_) => return Ok(()),
+            let Ok(b_use_sap_add_ch) = br.read_bit() else {
+                if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL sap-gate"); }
+                break 'normal;
+            };
+            tools.seven_x_b_use_sap_add_ch = Some(b_use_sap_add_ch);
+            if b_use_sap_add_ch {
+                // Round 406: when the aspx config is known, these SAP
+                // chparams cover the aspx-core band range (same count
+                // as the additional pair's own ms_used loop), not
+                // num_sfb_48(tl).
+                let max_sfb_g = tools
+                    .aspx_config
+                    .as_ref()
+                    .zip(largest_tl)
+                    .and_then(|(cfg, tl)| aspx_core_band_count(cfg, tl))
+                    .or_else(|| largest_tl.and_then(crate::tables::num_sfb_48))
+                    .unwrap_or(63);
+                let Ok(cp0) = parse_chparam_info(br, &[max_sfb_g]) else { break 'normal };
+                let Ok(cp1) = parse_chparam_info(br, &[max_sfb_g]) else { break 'normal };
+                tools.seven_x_add_chparam_info = Some([cp0, cp1]);
+            }
+            // Additional `two_channel_data()` for the extra 2 channels.
+            match parse_two_channel_data_additional(br, frame_len_base, add_cfg.as_ref()) {
+                Ok(d) => {
+                    // Round 407d: in ASPX mode, only accept when the
+                    // trailer block validates to the wall from here —
+                    // a fake add-pair parsed from a desynced front
+                    // otherwise poisons the trailers and the sticky
+                    // configs.
+                    let trailers_ok = if matches!(mode, SevenXCodecMode::Aspx) {
+                        match add_cfg.as_ref().map(|c| {
+                            validate_7x_trailers_slots(*br, tools, c, b_iframe, frame_len_base)
+                        }) {
+                            Some(Some(slots)) => {
+                                tools.aspx_xover_slots = slots;
+                                tools.aspx_xover_slots_good = Some(slots);
+                                true
+                            }
+                            Some(None) => false,
+                            None => true,
+                        }
+                    } else {
+                        true
+                    };
+                    if trailers_ok {
+                        if let Some(ti) = d.transform_info.as_ref() {
+                            update_largest(ti.transform_length_0, &mut largest_tl);
+                        }
+                        tools.seven_x_additional_channel_data = Some(d);
+                        add_done = true;
+                    } else if std::env::var_os("AC4_T").is_some() {
+                        eprintln!("BAIL add-2ch trailer-validate @{}", br.bit_position());
+                    }
+                }
+                Err(_) => {
+                    if std::env::var_os("AC4_T").is_some() {
+                        eprintln!("BAIL add-2ch @{}", br.bit_position());
+                    }
+                }
+            }
+        }
+        _pt_add = _pt_a0.elapsed();
+        let _pt_r0 = std::time::Instant::now();
+        // ---- resync fallback (ASPX only — needs the trailer oracle) ----
+        if !add_done && matches!(mode, SevenXCodecMode::Aspx) {
+            if let Some(cfg) = add_cfg.as_ref() {
+                if let Some((head, slots, joint)) =
+                    resync_7x_addpair(switch_floor, tools, cfg, b_iframe, frame_len_base)
+                {
+                    *br = head;
+                    tools.aspx_xover_slots = slots;
+                    tools.aspx_xover_slots_good = Some(slots);
+                    // The gate/chparams preceding the recovered head
+                    // were not parsed — clear the stale slots.
+                    tools.seven_x_b_use_sap_add_ch = None;
+                    tools.seven_x_add_chparam_info = None;
+                    // Round 408: FRONT backchain. The P-frame pre-cc
+                    // region is still unread (see riptide
+                    // docs/ac4-bitstream-reality.md), but the front
+                    // elements themselves follow the standard grammar
+                    // — proven by unique exact-end chains on frames
+                    // 1/2/5. Recover them from the proven head: the
+                    // front's last element ends at head-2 (uniform
+                    // 2-bit gate); chain backwards per coding_config
+                    // shape and OVERWRITE the garbage front parses.
+                    if std::env::var_os("AC4_NO_FRONT_RESYNC").is_none() {
+                        // Round 410c: the forward-walk front data on a
+                        // resynced frame is garbage by definition (the
+                        // walk desynced in the pre-cc region). Clear it
+                        // FIRST: if recovery fails the dispatch renders
+                        // silence for the front slots instead of noise
+                        // that OLA-smears into neighbouring frames.
+                        tools.three_channel_data = None;
+                        tools.two_channel_data.clear();
+                        tools.four_channel_data = None;
+                        tools.five_channel_data = None;
+                        tools.cfg0_centre_mono = None;
+                        tools.cfg2_back_mono = None;
+                        if let Some(cfg_found) = resync_7x_front(
+                            switch_floor,
+                            head.bit_position().saturating_sub(2),
+                            tools,
+                            frame_len_base,
+                            &mut largest_tl,
+                        ) {
+                            // Walk-flow gating (the cc0/2 trailing mono
+                            // AFTER the add pair) keeps the original
+                            // misread cfg: the trailer oracle validated
+                            // these frames WITHOUT a trailing mono, so
+                            // parsing one would eat trailer bits (meter
+                            // regression 199->171 proved it). The mono
+                            // for these frames presumably lives in the
+                            // opaque pre-cc region. The DECODER dispatch
+                            // reads the recovered cfg from tools.
+                            tools.seven_x_coding_config = Some(cfg_found);
+                        }
+                    }
+                    if let Some((k0, k1)) = joint {
+                        // Round 407p: consume the head fields, then the
+                        // two bodies at the trailer-proven bounds.
+                        let ok = (|| -> Result<TwoChannelData> {
+                            let _bmsp = br.read_bit()?;
+                            let ti = parse_asf_transform_info(br, frame_len_base)?;
+                            let psy =
+                                parse_asf_psy_info(br, &ti, frame_len_base, false, false)?;
+                            let ms = aspx_core_band_count(cfg, ti.transform_length_0)
+                                .unwrap_or(psy.max_sfb_0);
+                            let chparam = parse_chparam_info(br, &[ms])?;
+                            let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(
+                                br, &ti, k0, true,
+                            );
+                            let b1 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(
+                                br, &ti, k1, true,
+                            );
+                            Ok(TwoChannelData {
+                                b_enable_mdct_stereo_proc: true,
+                                transform_info: Some(ti),
+                                psy_info: Some(psy),
+                                transform_info_1: None,
+                                psy_info_1: None,
+                                chparam: Some(chparam),
+                                scaled_spec_per_channel: vec![b0, b1],
+                                scaled_spec_windows_per_channel: vec![None, None],
+                            })
+                        })();
+                        if let Ok(d) = ok {
+                            if let Some(ti) = d.transform_info.as_ref() {
+                                update_largest(ti.transform_length_0, &mut largest_tl);
+                            }
+                            tools.seven_x_additional_channel_data = Some(d);
+                            add_done = true;
+                        }
+                    } else if let Ok(d) =
+                        parse_two_channel_data_additional(br, frame_len_base, add_cfg.as_ref())
+                    {
+                        if let Some(ti) = d.transform_info.as_ref() {
+                            update_largest(ti.transform_length_0, &mut largest_tl);
+                        }
+                        tools.seven_x_additional_channel_data = Some(d);
+                        add_done = true;
+                    }
+                }
+            }
+        }
+        _pt_resync = _pt_r0.elapsed();
+        if !add_done {
+            *br = normal_save;
+            return Ok(());
         }
     }
 
@@ -1403,32 +2851,152 @@ pub fn parse_7x_audio_data_outer(
     // `if (7_X_codec_mode != SIMPLE) { aspx_data_2ch + aspx_data_2ch
     // + aspx_data_1ch }` — covers the L/R + Ls/Rs front pair and the
     // additional-channel pair plus the centre mono.
+    let _ttr = std::env::var_os("AC4_TRACE_BODIES").is_some();
+    // Round 407j: per-trailer F0-coding-mode search. Frame-0's
+    // fully-gated unique closure proves some trailers code their
+    // first envelope values as fixed-width raw fields while others
+    // use Table-58 Huffman (observed raw,raw,huff,huff); the selector
+    // rule is unknown, so for the 4-trailer ASPX layout we search the
+    // 16 per-trailer combinations on a reader copy (Huffman-first
+    // order — proven frames keep their old parse when it already
+    // closes) and commit the first whose chain ends within 8 bits of
+    // the wall.
+    let mut f0_combo: u8 = 0;
+    let _pt_c0 = std::time::Instant::now();
+    if matches!(mode, SevenXCodecMode::Aspx) {
+        if let Some(w) = tools.wall_bits {
+            let mut combos: Vec<u8> = (0u8..16).collect();
+            combos.sort_by_key(|c| (c.count_ones(), *c));
+            // The anchor-proven frame-0 pattern (raw,raw,huff,huff =
+            // 0b0011) goes first: the all-Huffman parse ALSO reaches
+            // the wall on rich I-frames (that's exactly the 31-bit
+            // masked drift this search exists to fix), so wall
+            // closure alone cannot rank them — the proven pattern
+            // wins ties by ordering. P-frame trailers are delta-time
+            // coded (no F0 reads), so this choice is a no-op there.
+            combos.retain(|&c| c != 3);
+            combos.insert(0, 3);
+            'combo: for &combo in &combos {
+                let mut vb = *br;
+                let mut vt = tools.clone();
+                let mut ok = true;
+                for (i, &chs) in [2u8, 2, 1, 2].iter().enumerate() {
+                    crate::aspx::set_f0_raw_mode((combo >> i) & 1 == 1);
+                    let r = if chs == 1 {
+                        crate::asf::parse_aspx_data_1ch_body(
+                            &mut vb,
+                            &mut vt,
+                            &aspx_cfg,
+                            b_iframe,
+                            frame_len_base,
+                        )
+                    } else {
+                        crate::asf::parse_aspx_data_2ch_body(
+                            &mut vb,
+                            &mut vt,
+                            &aspx_cfg,
+                            b_iframe,
+                            frame_len_base,
+                        )
+                    };
+                    if r.is_err() || vb.bit_position() > w {
+                        ok = false;
+                        break;
+                    }
+                }
+                crate::aspx::set_f0_raw_mode(false);
+                if ok && (0..=8).contains(&(w as i64 - vb.bit_position() as i64)) {
+                    f0_combo = combo;
+                    if std::env::var_os("AC4_T").is_some() && combo != 0 {
+                        eprintln!("F0 combo {combo:04b} selected @{}", br.bit_position());
+                    }
+                    break 'combo;
+                }
+            }
+        }
+    }
+    let _pt_combo = _pt_c0.elapsed();
+    let _pt_t0 = std::time::Instant::now();
+    let trailer_floor_br = *br;
     if !matches!(mode, SevenXCodecMode::Simple) {
+        crate::aspx::set_f0_raw_mode(f0_combo & 1 == 1);
+        let _t0 = br.bit_position();
+        if let Err(e) =
+            crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+        {
+            if std::env::var_os("AC4_T").is_some() {
+                eprintln!("BAIL aspx-2ch#1 @{} err={e:?}", br.bit_position());
+            }
+            return Ok(());
+        }
+        if _ttr {
+            eprintln!("TRL#1 2ch [{_t0}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
+        }
+        let _t1 = br.bit_position();
+        crate::aspx::set_f0_raw_mode((f0_combo >> 1) & 1 == 1);
         if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
+            crate::aspx::set_f0_raw_mode(false);
+            if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-2ch#2 @{}", br.bit_position()); }
             return Ok(());
         }
-        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
-        {
-            return Ok(());
+        if _ttr {
+            eprintln!("TRL#2 2ch [{_t1}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
+        let _t2 = br.bit_position();
+        crate::aspx::set_f0_raw_mode((f0_combo >> 2) & 1 == 1);
         if crate::asf::parse_aspx_data_1ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
             .is_err()
         {
+            crate::aspx::set_f0_raw_mode(false);
+            if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-1ch @{}", br.bit_position()); }
             return Ok(());
+        }
+        if _ttr {
+            eprintln!("TRL#3 1ch [{_t2}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
     }
     // `if (7_X_codec_mode == ASPX) { aspx_data_2ch }` — extra 2ch
     // envelope for the additional-channel pair in pure-ASPX mode (the
     // ASPX_ACPL_{1,2} paths fold the additional-channel ASPX into the
     // single aspx_data_1ch above).
-    if matches!(mode, SevenXCodecMode::Aspx)
-        && crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
-            .is_err()
-    {
-        return Ok(());
+    if matches!(mode, SevenXCodecMode::Aspx) {
+        crate::aspx::set_f0_raw_mode((f0_combo >> 3) & 1 == 1);
+        let r = crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base);
+        crate::aspx::set_f0_raw_mode(false);
+        if r.is_err() {
+            if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-extra @{}", br.bit_position()); }
+            return Ok(());
+        }
+        // Round 407j: I-frame slot-harvest repair. The linear parse's
+        // internal boundaries can drift (the trailer-1/2 F0 quirk),
+        // corrupting slots [2]/[3] that every following P-frame needs.
+        // The 1ch+final tail pair is uniquely locatable by hard
+        // constraints ('000' xover for the 1ch — five-frame-proven
+        // slot 2 = 0 on this content class — then a final 2ch parse
+        // ending within 8 bits of the wall); rescan and overwrite the
+        // harvested tail slots from the anchored reads.
+        if b_iframe {
+            if let Some(w) = tools.wall_bits {
+                if let Some((x2, s2, s3)) =
+                    scan_iframe_tail_slots(trailer_floor_br, w, tools, &aspx_cfg, frame_len_base)
+                {
+                    if tools.aspx_xover_slots[2] != Some(s2)
+                        || tools.aspx_xover_slots[3] != Some(s3)
+                    {
+                        if std::env::var_os("AC4_T").is_some() {
+                            eprintln!(
+                                "SLOT-REPAIR 1ch@{x2}: slots[2] {:?}->{s2} slots[3] {:?}->{s3}",
+                                tools.aspx_xover_slots[2], tools.aspx_xover_slots[3]
+                            );
+                        }
+                        tools.aspx_xover_slots[2] = Some(s2);
+                        tools.aspx_xover_slots[3] = Some(s3);
+                    }
+                }
+            }
+        }
     }
 
     // ACPL pair for ASPX_ACPL_{1,2} — `acpl_data_1ch()×2`, lands in
@@ -1465,7 +3033,151 @@ pub fn parse_7x_audio_data_outer(
             }
         }
     }
+    if _pt {
+        eprintln!(
+            "PHASE front={}ms add={}ms resync={}ms combo={}ms trail={}ms total={}ms",
+            _pt_front.as_millis(),
+            _pt_add.as_millis(),
+            _pt_resync.as_millis(),
+            _pt_combo.as_millis(),
+            _pt_t0.elapsed().as_millis(),
+            _pt0.elapsed().as_millis()
+        );
+    }
+    tools.walk_complete = true;
     Ok(())
+}
+
+// =====================================================================
+// §6.2.4.4 var_channel_element — A-JOC downmix spectral frontend
+// =====================================================================
+
+/// Parsed `var_channel_element()` (ETSI TS 103 190-2 §6.2.4.4) — the
+/// downmix-signal spectral frontend for an A-JOC object-coded substream.
+/// Reuses the same mono/two/three-channel ASF primitives as the
+/// channel-coded path (`parse_mono_data`, `parse_two_channel_data`,
+/// `parse_three_channel_data`).
+#[derive(Debug, Clone, Default)]
+pub struct VarChannelElement {
+    /// `var_codec_mode == ASPX`.
+    pub aspx_mode: bool,
+    /// Present only when `aspx_mode` and `b_iframe`.
+    pub aspx_config: Option<AspxConfig>,
+    /// Present only when `aspx_mode` and `n_dmx_signals <= 5`.
+    pub companding_control: Option<CompandingControl>,
+    /// `mono_data(1)` when `b_has_lfe`.
+    pub lfe: Option<MonoLfeData>,
+    /// The sole signal's `mono_data(0)` when `n_dmx_signals == 1` (the
+    /// only case with no pairs and no three-channel tail at all).
+    pub single_mono: Option<MonoLfeData>,
+    /// The `n_pairs` (or `n_pairs - 1` in the odd/two-channel-tail case)
+    /// leading `two_channel_data()` elements.
+    pub pairs: Vec<TwoChannelData>,
+    /// Odd-count tail when `var_coding_config == 0`: one more
+    /// `two_channel_data()` plus a trailing `mono_data(0)`.
+    pub odd_tail_two_and_mono: Option<(TwoChannelData, MonoLfeData)>,
+    /// Odd-count tail when `var_coding_config == 1`: one
+    /// `three_channel_data()` instead.
+    pub odd_tail_three: Option<ThreeChannelData>,
+    /// `n_pairs` `aspx_data_2ch()` trailers (present iff `aspx_mode`) —
+    /// note this loop always runs `n_pairs` times regardless of parity,
+    /// independent of how the core data above grouped channels.
+    pub aspx_pair_trailers: Vec<SubstreamTools>,
+    /// The trailing `aspx_data_1ch()` when `aspx_mode && b_isodd`.
+    pub aspx_single_trailer: Option<SubstreamTools>,
+}
+
+/// `var_channel_element(b_iframe, n_dmx_signals, b_has_lfe)` (§6.2.4.4).
+///
+/// `frame_len_base` is the same per-frame transform-length base the
+/// channel-coded path derives from `fs_index`/`frame_rate_index` and
+/// threads into `parse_asf_transform_info` throughout this module.
+///
+/// The trailing `aspx_data_2ch()`/`aspx_data_1ch()` bandwidth-extension
+/// elements (when `aspx_mode`) reuse `asf::parse_aspx_data_2ch_body` /
+/// `asf::parse_aspx_data_1ch_body` — the same production parsers the
+/// channel-coded path's `walk_ac4_substream_sticky` calls — each fed a
+/// fresh [`SubstreamTools`] rather than the caller's shared one, since
+/// this loop can run more than once (`n_pairs` times, always — that
+/// count is independent of how the core data above grouped channels
+/// into pairs/mono/three-channel elements) and those functions' fields
+/// hold one call's result at a time.
+///
+/// **Known limitation:** on a non-I-frame (`!b_iframe`), `aspx_config()`
+/// is never read (per spec, it's only present on I-frames) and the
+/// channel-coded path's answer — a per-substream "sticky" config
+/// carried across frames — isn't threaded into this AJOC downmix path
+/// yet. That case returns `Error::unsupported` rather than guessing;
+/// every I-frame call is real, tested parsing.
+pub fn parse_var_channel_element(
+    br: &mut BitReader<'_>,
+    b_iframe: bool,
+    n_dmx_signals: u32,
+    b_has_lfe: bool,
+    frame_len_base: u32,
+) -> Result<VarChannelElement> {
+    let mut out = VarChannelElement {
+        aspx_mode: br.read_bit()?,
+        ..Default::default()
+    };
+    let b_isodd = n_dmx_signals % 2 == 1;
+    let n_pairs = n_dmx_signals / 2;
+
+    if out.aspx_mode {
+        if b_iframe {
+            out.aspx_config = Some(parse_aspx_config(br)?);
+        }
+        if n_dmx_signals <= 5 {
+            out.companding_control = Some(parse_companding_control(br, n_dmx_signals)?);
+        }
+    }
+
+    if b_has_lfe {
+        out.lfe = Some(parse_mono_data(br, true, frame_len_base)?);
+    }
+
+    if b_isodd {
+        if n_dmx_signals == 1 {
+            out.single_mono = Some(parse_mono_data(br, false, frame_len_base)?);
+        } else {
+            for _ in 0..n_pairs.saturating_sub(1) {
+                out.pairs.push(parse_two_channel_data(br, frame_len_base)?);
+            }
+            let var_coding_config = br.read_bit()?;
+            if !var_coding_config {
+                let two = parse_two_channel_data(br, frame_len_base)?;
+                let mono = parse_mono_data(br, false, frame_len_base)?;
+                out.odd_tail_two_and_mono = Some((two, mono));
+            } else {
+                out.odd_tail_three = Some(parse_three_channel_data(br, frame_len_base)?);
+            }
+        }
+    } else {
+        for _ in 0..n_pairs {
+            out.pairs.push(parse_two_channel_data(br, frame_len_base)?);
+        }
+    }
+
+    if out.aspx_mode {
+        let cfg = out.aspx_config.clone().ok_or_else(|| {
+            Error::unsupported(
+                "ac4: var_channel_element non-I-frame A-SPX trailer needs a sticky aspx_config, \
+                 not yet threaded through for the A-JOC downmix path",
+            )
+        })?;
+        for _ in 0..n_pairs {
+            let mut tools = SubstreamTools::default();
+            parse_aspx_data_2ch_body(br, &mut tools, &cfg, b_iframe, frame_len_base)?;
+            out.aspx_pair_trailers.push(tools);
+        }
+        if b_isodd {
+            let mut tools = SubstreamTools::default();
+            parse_aspx_data_1ch_body(br, &mut tools, &cfg, b_iframe, frame_len_base)?;
+            out.aspx_single_trailer = Some(tools);
+        }
+    }
+
+    Ok(out)
 }
 
 // =====================================================================
@@ -1500,12 +3212,8 @@ mod tests {
     ///
     /// The decoder reads the body and produces an all-zero scaled
     /// spectrum of length `sfb_offset[max_sfb]`.
-    fn write_zero_sf_data_body(bw: &mut BitWriter, max_sfb: u32, transf_length_idx: u32) {
-        let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
-            (3, 7)
-        } else {
-            (5, 31)
-        };
+    fn write_zero_sf_data_body(bw: &mut BitWriter, max_sfb: u32, transform_length: u32) {
+        let (n_sect_bits, sect_esc_val) = crate::asf_data::sect_len_bits(transform_length);
         // sect_cb = 0.
         bw.write_u32(0, 4);
         // sect_len = 1 + sum of increments; we want sect_len == max_sfb.
@@ -1522,6 +3230,36 @@ mod tests {
         bw.write_u32(120, 8);
         // asf_snf_data: b_snf_data_exists = 0.
         bw.write_bit(false);
+    }
+
+    /// Write a whole grouped `sf_data(ASF)` body (§4.2.8, Tables 39-42)
+    /// for one channel spanning `num_groups` window groups, all-zero
+    /// (`sect_cb == 0` for every band in every group). Unlike calling
+    /// [`write_zero_sf_data_body`] `num_groups` times — which duplicates
+    /// a full `reference_scale_factor`(8) + `b_snf_data_exists`(1)
+    /// header per group, matching the *old*, incorrect per-group-header
+    /// assumption — this writes the section data once per group but the
+    /// `reference_scale_factor` / `b_snf_data_exists` header only once
+    /// for the whole body, per Tables 41/42's real syntax.
+    fn write_zero_sf_data_body_grouped(
+        bw: &mut BitWriter,
+        max_sfb: u32,
+        transform_length: u32,
+        num_groups: u32,
+    ) {
+        let (n_sect_bits, sect_esc_val) = crate::asf_data::sect_len_bits(transform_length);
+        for _ in 0..num_groups {
+            bw.write_u32(0, 4); // sect_cb = 0
+            let mut remaining = max_sfb.saturating_sub(1);
+            while remaining >= sect_esc_val {
+                bw.write_u32(sect_esc_val, n_sect_bits);
+                remaining -= sect_esc_val;
+            }
+            bw.write_u32(remaining, n_sect_bits);
+        }
+        // asf_spectral_data: nothing (cb=0 in every group).
+        bw.write_u32(120, 8); // reference_scale_factor, once.
+        bw.write_bit(false); // b_snf_data_exists, once.
     }
 
     #[test]
@@ -1550,12 +3288,11 @@ mod tests {
 
     #[test]
     fn parse_mono_data_lfe_long_frame() {
-        // mono_data(1) for frame_len_base=1920 long-frame:
-        //   asf_transform_info: b_long_frame=1 -> tl=1920.
-        //   sf_info_lfe(): max_sfb[0] read with n_msfbl_bits=3 (Table
-        //   106 column 4 for tl=1920) = value 5.
+        // mono_data(1) for frame_len_base=1920: sf_info_lfe() (Table 35)
+        // sets b_long_frame=1 *implicitly* (no bits read — "transform
+        // length = frame_length") and reads only max_sfb[0] with
+        // n_msfbl_bits=3 (Table 106 column 4 for tl=1920) = value 5.
         let mut bw = BitWriter::new();
-        bw.write_bit(true); // b_long_frame
         bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 for tl=1920
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -1575,19 +3312,14 @@ mod tests {
 
     #[test]
     fn parse_mono_data_lfe_rejects_short_only_transform() {
-        // tl=480 -> n_msfbl_bits = 0 (LFE not permitted at this tl).
-        // Reach `parse_asf_psy_info_lfe` by feeding b_long_frame=0
-        // followed by a 2-bit `transf_length` selecting tl=480 at
-        // frame_len_base=1920. asf_transform_info Table 99 row for
-        // 1920 maps transf_length=0..=3 to {1920, 960, 480, 240}.
-        let mut bw = BitWriter::new();
-        bw.write_bit(false); // b_long_frame=0
-        bw.write_u32(2, 2); // transf_length=2 -> tl=480 (Table 99)
-        bw.write_u32(2, 2); // transf_length[1]=2 -> tl=480 (no different framing)
-        bw.align_to_byte();
-        let bytes = bw.finish();
+        // frame_len_base=480 forces the (implicit) long-frame transform
+        // length to 480 too — n_msfb_bits_48(480) has n_msfbl_bits=0
+        // (Table 106: LFE isn't permitted at this transform length).
+        // sf_info_lfe() reads zero bits before this check fires, so no
+        // bitstream content is needed at all.
+        let bytes: [u8; 0] = [];
         let mut br = BitReader::new(&bytes);
-        let err = parse_mono_data(&mut br, true, 1920).unwrap_err();
+        let err = parse_mono_data(&mut br, true, 480).unwrap_err();
         let msg = format!("{err}");
         assert!(
             msg.contains("LFE") || msg.contains("transform_length"),
@@ -1606,7 +3338,7 @@ mod tests {
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -1638,9 +3370,8 @@ mod tests {
     #[test]
     fn parse_mono_data_lfe_walks_sf_data_body() {
         let mut bw = BitWriter::new();
-        bw.write_bit(true); // b_long_frame
         bw.write_u32(5, 3); // max_sfb[0] — n_msfbl_bits=3 @ tl=1920
-        write_zero_sf_data_body(&mut bw, 5, 0);
+        write_zero_sf_data_body(&mut bw, 5, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -1741,7 +3472,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 12, 0);
+            write_zero_sf_data_body(&mut bw, 12, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -1770,7 +3501,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 20, 0);
+            write_zero_sf_data_body(&mut bw, 20, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -1804,7 +3535,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 15, 0);
+            write_zero_sf_data_body(&mut bw, 15, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -1830,10 +3561,10 @@ mod tests {
         // Then coding_config=3 + five_channel_data shell + 5x sf_data.
         let mut bw = BitWriter::new();
         bw.write_u32(0, 3); // SIMPLE
-                            // LFE mono_data(1):
-        bw.write_bit(true); // b_long_frame
+                            // LFE mono_data(1): sf_info_lfe() implies b_long_frame=1
+                            // with no bits read.
         bw.write_u32(4, 3); // max_sfb[0] -- n_msfbl_bits = 3 for tl=1920
-        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+        write_zero_sf_data_body(&mut bw, 4, 1920); // round 38: LFE body
                                                 // coding_config = 3, then five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true);
@@ -1843,7 +3574,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -1868,11 +3599,12 @@ mod tests {
         // Long-frame @1920, max_sfb=20, chparam_info sap_mode=0,
         // r23: + 2 sf_data(ASF) all-zero bodies.
         let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(20, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 20, 0);
-        write_zero_sf_data_body(&mut bw, 20, 0);
+        write_zero_sf_data_body(&mut bw, 20, 1920);
+        write_zero_sf_data_body(&mut bw, 20, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -1898,17 +3630,19 @@ mod tests {
         bw.write_u32(0, 2); // coding_config = 0 (Cfg0)
         bw.write_bit(true); // b_2ch_mode
                             // two_channel_data #1: long-frame, max_sfb=10, chparam=0.
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #1
-        write_zero_sf_data_body(&mut bw, 10, 0); // sf_data #2
+        write_zero_sf_data_body(&mut bw, 10, 1920); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 10, 1920); // sf_data #2
                                                  // two_channel_data #2: long-frame, max_sfb=12, chparam=0.
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #1
-        write_zero_sf_data_body(&mut bw, 12, 0); // sf_data #2
+        write_zero_sf_data_body(&mut bw, 12, 1920); // sf_data #1
+        write_zero_sf_data_body(&mut bw, 12, 1920); // sf_data #2
                                                  // mono_data(0): spec_frontend bit + transform + psy.
         bw.write_bit(false); // spec_frontend = 0 (ASF)
         bw.write_bit(true); // b_long_frame
@@ -1961,14 +3695,15 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 14, 0);
+            write_zero_sf_data_body(&mut bw, 14, 1920);
         }
         // two_channel_data: long-frame, max_sfb=18, chparam=0.
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(18, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 18, 0);
-        write_zero_sf_data_body(&mut bw, 18, 0);
+        write_zero_sf_data_body(&mut bw, 18, 1920);
+        write_zero_sf_data_body(&mut bw, 18, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2005,7 +3740,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 22, 0);
+            write_zero_sf_data_body(&mut bw, 22, 1920);
         }
         // mono_data(0): spec_frontend + transform + psy.
         bw.write_bit(false);
@@ -2072,8 +3807,8 @@ mod tests {
     fn decode_mch_sf_data_long_frame_all_zero_two_channels() {
         let mut bw = BitWriter::new();
         // Two stacked sf_data bodies for max_sfb=8 at tl=1920.
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2089,7 +3824,7 @@ mod tests {
             num_window_groups: 1,
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
+        let (out, _windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
         assert_eq!(out.len(), 2);
         let sfbo = crate::sfb_offset::sfb_offset_48(1920).unwrap();
         let expected_len = sfbo[8] as usize;
@@ -2122,9 +3857,9 @@ mod tests {
             num_window_groups: 2,
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 5);
-        assert_eq!(out.len(), 5);
-        assert!(out.iter().all(|c| c.is_none()));
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 5);
+        assert_eq!(windows.len(), 5);
+        assert!(windows.iter().all(|c| c.is_none()));
     }
 
     /// `parse_three_channel_data` populates all three
@@ -2143,7 +3878,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2173,7 +3908,7 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 8, 0);
+            write_zero_sf_data_body(&mut bw, 8, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2197,7 +3932,7 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 6, 0);
+            write_zero_sf_data_body(&mut bw, 6, 1920);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2222,7 +3957,7 @@ mod tests {
         bw.write_u32(2, 4);
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2250,11 +3985,12 @@ mod tests {
     #[test]
     fn parse_two_channel_data_per_channel_lengths_match_sfb_offset() {
         let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(15, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam_info sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 15, 0);
-        write_zero_sf_data_body(&mut bw, 15, 0);
+        write_zero_sf_data_body(&mut bw, 15, 1920);
+        write_zero_sf_data_body(&mut bw, 15, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2286,12 +4022,10 @@ mod tests {
         let max_sfb = 8u32;
         let tl_idx = 2u32; // matches transf_length=2 (tl=480 short-frame).
         let mut bw = BitWriter::new();
-        // Channel 0: two grouped bodies.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        // Channel 1: two grouped bodies.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        // Channel 0: one grouped body spanning both window groups.
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, 480, 2);
+        // Channel 1: ditto.
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, 480, 2);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2308,15 +4042,18 @@ mod tests {
             scale_factor_grouping: vec![0],
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
-        assert_eq!(out.len(), 2);
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 2);
+        assert_eq!(windows.len(), 2);
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let per_group_len = sfbo[max_sfb as usize] as usize;
-        let expected_total = per_group_len * 2; // num_window_groups
-        for slot in &out {
+        let per_window_len = sfbo[max_sfb as usize] as usize;
+        for slot in &windows {
             let v = slot.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
-            assert!(v.iter().all(|&s| s == 0.0));
+            assert_eq!(v.len(), 2); // num_windows (one window per group here)
+            for (tl, spec) in v {
+                assert_eq!(*tl, 480);
+                assert_eq!(spec.len(), per_window_len);
+                assert!(spec.iter().all(|&s| s == 0.0));
+            }
         }
     }
 
@@ -2328,9 +4065,7 @@ mod tests {
         let max_sfb = 6u32;
         let tl_idx = 2u32;
         let mut bw = BitWriter::new();
-        for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
-        }
+        write_zero_sf_data_body_grouped(&mut bw, max_sfb, 480, 3);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2347,11 +4082,15 @@ mod tests {
             scale_factor_grouping: vec![0, 0],
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
-        assert_eq!(out.len(), 1);
-        let v = out[0].as_ref().expect("decode succeeds");
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
+        assert_eq!(windows.len(), 1);
+        let v = windows[0].as_ref().expect("decode succeeds");
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        assert_eq!(v.len(), 3 * sfbo[max_sfb as usize] as usize);
+        assert_eq!(v.len(), 3); // 3 window groups, 1 window each
+        for (tl, spec) in v {
+            assert_eq!(*tl, 480);
+            assert_eq!(spec.len(), sfbo[max_sfb as usize] as usize);
+        }
     }
 
     /// `parse_three_channel_data` correctly drives the grouped path
@@ -2384,11 +4123,11 @@ mod tests {
         bw.write_u32(0, 4);
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        // Three channels x two window groups of sf_data(ASF) bodies.
+        // Three channels, each one grouped body spanning both window
+        // groups (num_win_in_group == [2, 2] — a *real* multi-window
+        // group, not the degenerate 1-window-per-group case).
         for _ in 0..3 {
-            for _ in 0..2 {
-                write_zero_sf_data_body(&mut bw, max_sfb, 2);
-            }
+            write_zero_sf_data_body_grouped(&mut bw, max_sfb, 2, 2);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2396,14 +4135,20 @@ mod tests {
         let d = parse_three_channel_data(&mut br, 1920).unwrap();
         let psy = d.psy_info.as_ref().unwrap();
         assert_eq!(psy.num_window_groups, 2);
+        assert_eq!(psy.num_windows, 4);
         assert!(!d.transform_info.as_ref().unwrap().b_long_frame);
-        assert_eq!(d.scaled_spec_per_channel.len(), 3);
+        assert_eq!(d.scaled_spec_windows_per_channel.len(), 3);
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let expected_total = (sfbo[max_sfb as usize] as usize) * 2;
-        for ch in &d.scaled_spec_per_channel {
+        let expected_win_len = sfbo[max_sfb as usize] as usize;
+        for ch in &d.scaled_spec_windows_per_channel {
             let v = ch.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
-            assert!(v.iter().all(|&s| s == 0.0));
+            // 2 groups x 2 windows each (num_win_in_group == [2, 2]).
+            assert_eq!(v.len(), 4);
+            for (tl, spec) in v {
+                assert_eq!(*tl, 480);
+                assert_eq!(spec.len(), expected_win_len);
+                assert!(spec.iter().all(|&s| s == 0.0));
+            }
         }
     }
 
@@ -2413,6 +4158,7 @@ mod tests {
     #[test]
     fn parse_two_channel_data_grouped_short_frame_walks_per_group() {
         let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(false); // b_long_frame = 0
         bw.write_u32(2, 2); // transf_length[0] = 2 (tl=480)
         bw.write_u32(2, 2); // transf_length[1] = 2 (tl=480)
@@ -2424,11 +4170,9 @@ mod tests {
         bw.write_u32(0, 1);
         // chparam_info: sap_mode=0.
         bw.write_u32(0, 2);
-        // 2 channels x 4 window groups of bodies.
+        // 2 channels, each one grouped body spanning 4 window groups.
         for _ in 0..2 {
-            for _ in 0..4 {
-                write_zero_sf_data_body(&mut bw, max_sfb, 2);
-            }
+            write_zero_sf_data_body_grouped(&mut bw, max_sfb, 2, 4);
         }
         bw.align_to_byte();
         let bytes = bw.finish();
@@ -2436,12 +4180,16 @@ mod tests {
         let d = parse_two_channel_data(&mut br, 1920).unwrap();
         let psy = d.psy_info.as_ref().unwrap();
         assert_eq!(psy.num_window_groups, 4);
-        assert_eq!(d.scaled_spec_per_channel.len(), 2);
+        assert_eq!(d.scaled_spec_windows_per_channel.len(), 2);
         let sfbo = crate::sfb_offset::sfb_offset_48(480).unwrap();
-        let expected_total = (sfbo[max_sfb as usize] as usize) * 4;
-        for ch in &d.scaled_spec_per_channel {
+        let expected_win_len = sfbo[max_sfb as usize] as usize;
+        for ch in &d.scaled_spec_windows_per_channel {
             let v = ch.as_ref().expect("each channel decodes");
-            assert_eq!(v.len(), expected_total);
+            assert_eq!(v.len(), 4); // 4 window groups, 1 window each
+            for (tl, spec) in v {
+                assert_eq!(*tl, 480);
+                assert_eq!(spec.len(), expected_win_len);
+            }
         }
     }
 
@@ -2454,7 +4202,7 @@ mod tests {
         let tl_idx = 2u32;
         let mut bw = BitWriter::new();
         // Only one body when num_window_groups=2 expects two.
-        write_zero_sf_data_body(&mut bw, max_sfb, tl_idx);
+        write_zero_sf_data_body(&mut bw, max_sfb, 480);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2471,13 +4219,13 @@ mod tests {
             scale_factor_grouping: vec![0],
             ..Default::default()
         };
-        let out = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
-        assert_eq!(out.len(), 1);
+        let (_flat, windows) = decode_mch_sf_data_channels(&mut br, &ti, &psy, 1);
+        assert_eq!(windows.len(), 1);
         // Single channel: with only 1 of 2 groups present, the second
         // group attempt should bail (Huffman miss on garbage / EOF).
         // We allow either Some (if zero-padding accidentally validates
         // as a section header) or None — but we must NOT panic.
-        let _ = &out[0];
+        let _ = &windows[0];
     }
 
     // =================================================================
@@ -2594,11 +4342,12 @@ mod tests {
         write_companding_3_all_on(&mut bw);
         bw.write_bit(false); // coding_config = 0 -> two_channel_data + mono(0)
                              // two_channel_data() outer + 2x sf_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         // mono_data(0): spec_frontend bit + asf_transform_info long +
         // sf_info(ASF, 0, 0).
         bw.write_bit(false); // spec_frontend = ASF
@@ -2637,15 +4386,15 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // Joint-MDCT residual layer (ASPX_ACPL_1 only): max_sfb_master
         // is read with n_side_bits=5 @ tl=1920 (Table 106).
         bw.write_u32(8, 5); // max_sfb_master = 8
         bw.write_u32(0, 2); // chparam_info residual ch0 (sap_mode=0)
         bw.write_u32(0, 2); // chparam_info residual ch1
-        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch0 sf_data
-        write_zero_sf_data_body(&mut bw, 8, 0); // residual ch1 sf_data
+        write_zero_sf_data_body(&mut bw, 8, 1920); // residual ch0 sf_data
+        write_zero_sf_data_body(&mut bw, 8, 1920); // residual ch1 sf_data
                                                 // Pad to be safe.
         bw.align_to_byte();
         while bw.byte_len() < 64 {
@@ -2703,7 +4452,7 @@ mod tests {
         bw.write_u32(0, 2); // chparam_info #0
         bw.write_u32(0, 2); // chparam_info #1
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // Pad with zeros for downstream aspx/acpl walkers (which are
         // try-and-bail).
@@ -2743,18 +4492,19 @@ mod tests {
         write_companding_3_all_on(&mut bw);
         bw.write_bit(false); // coding_config = 0 -> two_channel_data
                              // two_channel_data outer (Table 26):
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(12, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // Joint-MDCT residual layer (ASPX_ACPL_1):
         // max_sfb_master uses n_side_bits = 5 @ tl=1920.
         bw.write_u32(6, 5); // max_sfb_master = 6
         bw.write_u32(0, 2); // chparam residual ch0
         bw.write_u32(0, 2); // chparam residual ch1
-        write_zero_sf_data_body(&mut bw, 6, 0);
-        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
         // Cfg0 trailer: mono_data(0) for the centre channel.
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
@@ -2837,7 +4587,7 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // max_sfb_master = 0 (n_side_bits = 5 @ tl=1920).
         bw.write_u32(0, 5);
@@ -2897,16 +4647,17 @@ mod tests {
             bw.write_u32(0, 2); // chparam_info
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 15, 0);
+            write_zero_sf_data_body(&mut bw, 15, 1920);
         }
         // SIMPLE additional-channel block: b_use_sap_add_ch = 0.
         bw.write_bit(false);
         // additional two_channel_data (no SAP):
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(10, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2935,10 +4686,10 @@ mod tests {
     fn parse_7x_outer_simple_71_walks_lfe_and_five_channel() {
         let mut bw = BitWriter::new();
         bw.write_u32(0, 2); // SIMPLE
-                            // LFE mono_data(1):
-        bw.write_bit(true); // b_long_frame
+                            // LFE mono_data(1): sf_info_lfe() implies b_long_frame=1
+                            // with no bits read.
         bw.write_u32(4, 3); // max_sfb[0] (n_msfbl_bits=3 @ tl=1920)
-        write_zero_sf_data_body(&mut bw, 4, 0); // round 38: LFE body
+        write_zero_sf_data_body(&mut bw, 4, 1920); // round 38: LFE body
                                                 // coding_config = 3 -> five_channel_data:
         bw.write_u32(3, 2);
         bw.write_bit(true); // b_long_frame
@@ -2948,15 +4699,16 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true); // b_long_frame
         bw.write_u32(8, 6); // max_sfb[0]
         bw.write_u32(0, 2); // chparam sap_mode = 0
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -2982,25 +4734,28 @@ mod tests {
         // 2ch_mode (1 bit).
         bw.write_bit(false);
         // two_channel_data #0:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // two_channel_data #1:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
                              // additional two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         // Trailing mono_data(0) for Cfg0 (centre).
         bw.write_bit(false); // spec_frontend = ASF
         bw.write_bit(true); // b_long_frame
@@ -3036,15 +4791,16 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..4 {
-            write_zero_sf_data_body(&mut bw, 11, 0);
+            write_zero_sf_data_body(&mut bw, 11, 1920);
         }
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch = 0
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(9, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 9, 0);
-        write_zero_sf_data_body(&mut bw, 9, 0);
+        write_zero_sf_data_body(&mut bw, 9, 1920);
+        write_zero_sf_data_body(&mut bw, 9, 1920);
         // Trailing mono_data(0) for Cfg2 (back surround).
         bw.write_bit(false);
         bw.write_bit(true);
@@ -3079,21 +4835,23 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         // SIMPLE additional-channel block.
         bw.write_bit(false); // b_use_sap_add_ch
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3126,18 +4884,19 @@ mod tests {
             bw.write_u32(0, 2);
         }
         for _ in 0..5 {
-            write_zero_sf_data_body(&mut bw, 12, 0);
+            write_zero_sf_data_body(&mut bw, 12, 1920);
         }
         // SIMPLE additional-channel block with SAP.
         bw.write_bit(true); // b_use_sap_add_ch = 1
         bw.write_u32(0, 2); // chparam_info #0 sap_mode = 0
         bw.write_u32(0, 2); // chparam_info #1 sap_mode = 0
                             // additional two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(8, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 8, 0);
-        write_zero_sf_data_body(&mut bw, 8, 0);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
+        write_zero_sf_data_body(&mut bw, 8, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3170,14 +4929,15 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         bw.align_to_byte();
         let bytes = bw.finish();
         let mut br = BitReader::new(&bytes);
@@ -3213,23 +4973,25 @@ mod tests {
         bw.write_u32(0, 2); // coding_config = 0 -> 2ch_mode + 2x two_channel_data
         bw.write_bit(false); // 2ch_mode
                              // two_channel_data #0:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // two_channel_data #1:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(12, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 12, 0);
-        write_zero_sf_data_body(&mut bw, 12, 0);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
+        write_zero_sf_data_body(&mut bw, 12, 1920);
         // ASPX_ACPL_1 joint-MDCT residual layer (n_side_bits=5 @ tl=1920).
         bw.write_u32(6, 5); // max_sfb_master = 6
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 6, 0);
-        write_zero_sf_data_body(&mut bw, 6, 0);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
+        write_zero_sf_data_body(&mut bw, 6, 1920);
         // Cfg0 trailer: mono_data(0) for the centre.
         bw.write_bit(false);
         bw.write_bit(true);
@@ -3276,14 +5038,15 @@ mod tests {
         bw.write_u32(0, 2);
         bw.write_u32(0, 2);
         for _ in 0..3 {
-            write_zero_sf_data_body(&mut bw, 10, 0);
+            write_zero_sf_data_body(&mut bw, 10, 1920);
         }
         // two_channel_data:
+        bw.write_bit(true); // b_enable_mdct_stereo_proc
         bw.write_bit(true);
         bw.write_u32(10, 6);
         bw.write_u32(0, 2);
-        write_zero_sf_data_body(&mut bw, 10, 0);
-        write_zero_sf_data_body(&mut bw, 10, 0);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
+        write_zero_sf_data_body(&mut bw, 10, 1920);
         // max_sfb_master = 0 (n_side_bits=5).
         bw.write_u32(0, 5);
         bw.align_to_byte();
@@ -3323,5 +5086,185 @@ mod tests {
         );
         assert!(tools.five_channel_data.is_none());
         assert!(tools.seven_x_additional_channel_data.is_none());
+    }
+
+    /// Generous zero-padding after the leading control bits — every
+    /// `mono_data`/`two_channel_data`/`three_channel_data` call's outer
+    /// shell (transform_info/psy_info/chparam) reads real required
+    /// fields, but their inner `sf_data` spectral body is try-and-bail
+    /// (leaves `scaled_spec` as `None` rather than erroring on garbage),
+    /// so this just needs to be long enough, not bit-exact.
+    fn padded_var_channel_bits(leading: &[u8]) -> Vec<u8> {
+        let mut bw = BitWriter::new();
+        for &b in leading {
+            bw.write_bit(b != 0);
+        }
+        for _ in 0..2000 {
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        bw.finish()
+    }
+
+    #[test]
+    fn var_channel_element_even_pairs_no_lfe() {
+        // aspx_mode = 0, n_dmx_signals = 4 (even) -> 2 pairs, no LFE.
+        let bytes = padded_var_channel_bits(&[0]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 4, false, 1920).unwrap();
+        assert!(!out.aspx_mode);
+        assert!(out.lfe.is_none());
+        assert!(out.single_mono.is_none());
+        assert_eq!(out.pairs.len(), 2);
+        assert!(out.odd_tail_two_and_mono.is_none());
+        assert!(out.odd_tail_three.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_single_signal_is_mono_only() {
+        // n_dmx_signals = 1 -> single_mono, nothing else.
+        let bytes = padded_var_channel_bits(&[0]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 1, false, 1920).unwrap();
+        assert!(out.single_mono.is_some());
+        assert!(out.pairs.is_empty());
+        assert!(out.odd_tail_two_and_mono.is_none());
+        assert!(out.odd_tail_three.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_odd_var_coding_config_0_gives_two_and_mono_tail() {
+        // n_dmx_signals = 3 (odd, n_pairs = 1): 0 leading pairs, then
+        // var_coding_config = 0 -> two_channel_data + mono_data tail.
+        let bytes = padded_var_channel_bits(&[0, 0]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 3, false, 1920).unwrap();
+        assert!(out.pairs.is_empty());
+        assert!(out.odd_tail_two_and_mono.is_some());
+        assert!(out.odd_tail_three.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_odd_var_coding_config_1_gives_three_channel_tail() {
+        // Same shape, but var_coding_config = 1 -> three_channel_data tail.
+        let bytes = padded_var_channel_bits(&[0, 1]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 3, false, 1920).unwrap();
+        assert!(out.pairs.is_empty());
+        assert!(out.odd_tail_two_and_mono.is_none());
+        assert!(out.odd_tail_three.is_some());
+    }
+
+    #[test]
+    fn var_channel_element_with_lfe_parses_lfe_first() {
+        // n_dmx_signals = 2 (even), b_has_lfe = true -> lfe then 1 pair.
+        // The LFE's own mono_data(1) call requires b_long_frame = 1
+        // (asf_psy_info_lfe rejects short transforms for LFE), so that
+        // bit can't be part of the generic zero padding.
+        let bytes = padded_var_channel_bits(&[0, 1]);
+        let mut br = BitReader::new(&bytes);
+        let out = parse_var_channel_element(&mut br, true, 2, true, 1920).unwrap();
+        assert!(out.lfe.is_some());
+        assert_eq!(out.pairs.len(), 1);
+    }
+
+    #[test]
+    fn var_channel_element_aspx_non_iframe_errors_on_missing_sticky_config() {
+        // aspx_mode = 1, n_dmx_signals = 2, b_iframe = false: aspx_config()
+        // is never read (only present on I-frames per spec), and this
+        // path doesn't yet thread a sticky config through for the AJOC
+        // downmix case, so it should report that specific limitation
+        // rather than guess.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // aspx_mode = 1
+        bw.write_bit(true); // companding_control: sync_flag = true (num_chan=2 > 1)
+        bw.write_bit(true); // b_compand_on[0] = true (sync -> single flag, all on)
+        for _ in 0..2000 {
+            bw.write_bit(false);
+        }
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let err = parse_var_channel_element(&mut br, false, 2, false, 1920).unwrap_err();
+        assert!(err.to_string().contains("sticky aspx_config"));
+    }
+
+    fn minimal_test_aspx_cfg() -> crate::aspx::AspxConfig {
+        crate::aspx::AspxConfig {
+            quant_mode_env: crate::aspx::AspxQuantStep::Fine,
+            start_freq: 0,
+            stop_freq: 0,
+            master_freq_scale: crate::aspx::AspxMasterFreqScale::LowRes,
+            interpolation: false,
+            preflat: false,
+            limiter: false,
+            noise_sbg: 0,
+            num_env_bits_fixfix: 0,
+            freq_res_mode: crate::aspx::AspxFreqResMode::DurationDependent,
+        }
+    }
+
+    #[test]
+    fn var_channel_element_aspx_iframe_real_trailer_roundtrips() {
+        // n_dmx_signals = 2 (even, aspx_mode = 1, b_iframe = true):
+        // aspx_config, then companding_control (n_dmx_signals <= 5),
+        // then the core two_channel_data pair (padded — try-and-bail),
+        // then exactly one real aspx_data_2ch() trailer (n_pairs = 1)
+        // built with the crate's own minimal encoder helper and parsed
+        // back through the same production parser the channel-coded
+        // path uses.
+        let cfg = minimal_test_aspx_cfg();
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // aspx_mode = 1
+        crate::encoder_acpl3::write_aspx_config(&mut bw, &cfg);
+        bw.write_bit(true); // companding_control: sync_flag = true
+        bw.write_bit(true); // b_compand_on[0] = true
+                            // Core two_channel_data pair: enough zero padding for its
+                            // outer shell; the inner sf_data is try-and-bail.
+        for _ in 0..200 {
+            bw.write_bit(false);
+        }
+        crate::encoder_acpl3::write_aspx_data_2ch_minimal(&mut bw, &cfg).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let out = parse_var_channel_element(&mut br, true, 2, false, 1920).unwrap();
+        assert!(out.aspx_mode);
+        assert!(out.aspx_config.is_some());
+        assert!(out.companding_control.is_some());
+        assert_eq!(out.pairs.len(), 1);
+        assert_eq!(out.aspx_pair_trailers.len(), 1);
+        assert!(out.aspx_single_trailer.is_none());
+    }
+
+    #[test]
+    fn var_channel_element_aspx_iframe_odd_gets_pair_plus_single_trailer() {
+        // n_dmx_signals = 3 (odd, n_pairs = 1): the ASPX trailer loop
+        // still runs n_pairs = 1 times regardless of parity, plus one
+        // more aspx_data_1ch() because b_isodd — independent of how the
+        // core data above split into a two+mono or three-channel tail.
+        let cfg = minimal_test_aspx_cfg();
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // aspx_mode = 1
+        crate::encoder_acpl3::write_aspx_config(&mut bw, &cfg);
+        bw.write_bit(true); // companding_control: sync_flag = true (num_chan=3)
+        bw.write_bit(true); // b_compand_on[0] = true (sync -> single flag)
+                            // Core: n_pairs - 1 = 0 leading pairs, then var_coding_config
+                            // = 0 -> two_channel_data + mono_data(0), padded.
+        bw.write_bit(false); // var_coding_config = 0
+        for _ in 0..200 {
+            bw.write_bit(false);
+        }
+        crate::encoder_acpl3::write_aspx_data_2ch_minimal(&mut bw, &cfg).unwrap();
+        crate::encoder_acpl3::write_aspx_data_1ch_minimal(&mut bw, &cfg).unwrap();
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let out = parse_var_channel_element(&mut br, true, 3, false, 1920).unwrap();
+        assert!(out.odd_tail_two_and_mono.is_some());
+        assert_eq!(out.aspx_pair_trailers.len(), 1);
+        assert!(out.aspx_single_trailer.is_some());
     }
 }

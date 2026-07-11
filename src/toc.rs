@@ -173,19 +173,23 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
     // streams; for this foundation we treat them as opaque — the field is
     // still consumed correctly so downstream bit-alignment is preserved.
     //
-    // We read up to 7 bits; on the 0b1111111 escape the caller is expected
-    // to run `variable_bits(2)` to extend the encoded index.
+    // Returns `(channels, channel_mode)` — the second value is the real
+    // Table 85 index (not a bit count, as it used to be), since three
+    // distinct 7.1 layouts (channel_mode 6/8/10 — 3/4/0.1, 5/2/0.1,
+    // 3/2/2.1) all report the same channel count and can only be told
+    // apart by this index. On the `0b1111111` escape the returned index
+    // already folds in the `variable_bits(2)` extension.
     let b0 = br.read_u32(1)?;
     if b0 == 0 {
-        return Ok((1, 1));
+        return Ok((1, 0));
     }
     let b1 = br.read_u32(1)?;
     if b1 == 0 {
-        return Ok((2, 2));
+        return Ok((2, 1));
     }
     let nx = br.read_u32(2)?;
     if nx != 0b11 {
-        // 4-bit prefix group: 1100 / 1101 / 1110.
+        // 4-bit prefix group: 1100 / 1101 / 1110 -> channel_mode 2/3/4.
         return Ok((
             match nx {
                 0b00 => 3,
@@ -193,11 +197,12 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
                 0b10 => 6,
                 _ => 0,
             },
-            4,
+            nx + 2,
         ));
     }
-    // 7-bit prefix group: 1111xxx.
+    // 7-bit prefix group: 1111xxx -> channel_mode 5..=12.
     let tail = br.read_u32(3)?;
+    let channel_mode = 5 + tail;
     let channels = match tail {
         0b000 => 7, // channel_mode 5 — 7.0 (3/4/0)
         0b001 => 8, // channel_mode 6 — 7.1 (3/4/0.1)
@@ -207,14 +212,14 @@ pub fn decode_channel_mode(br: &mut BitReader<'_>) -> Result<(u32, u32)> {
         0b101 => 8, // channel_mode 10 — 7.1 (3/2/2.1)
         0b110 => 7, // channel_mode 11 — 7.0.4
         0b111 => {
-            // 1111111 — escape. Caller reads variable_bits(2); we leave
-            // channel count unknown.
-            let _ext = variable_bits(br, 2)?;
-            return Ok((0, 7 + 3));
+            // 1111111 — escape. The extension folds into the index; we
+            // leave channel count unknown for these IFM-only modes.
+            let ext = variable_bits(br, 2)?;
+            return Ok((0, 12 + ext));
         }
         _ => unreachable!("3-bit tail is 0..=7"),
     };
-    Ok((channels, 7))
+    Ok((channels, channel_mode))
 }
 
 /// Parsed AC-4 frame information — the result of running
@@ -263,6 +268,38 @@ pub struct Ac4FrameInfo {
     /// first substream starts at `toc_size + payload_base` bytes into
     /// the `raw_ac4_frame()` payload.
     pub toc_size: u32,
+    /// Full `ac4_substream_info_ajoc()` descriptor for the first
+    /// A-JOC-coded substream (bitstream_version >= 2 only) — the
+    /// bed/dynamic-object/ISF breakdown behind `channels`. `None` for
+    /// channel-coded frames, or when no A-JOC substream was found.
+    pub ajoc_info: Option<SubstreamInfoAjoc>,
+    /// Whether the first substream group's `b_channel_coded` flag was
+    /// set — `true` means `channels` came from the plain channel-coded
+    /// path (already fully decodable by the existing ASF/A-SPX/A-CPL
+    /// pipeline), regardless of `bitstream_version`. A v2-syntax frame
+    /// can still carry a plain channel-coded bed rather than A-JOC
+    /// objects; this is the only reliable way to tell which.
+    pub channel_coded: bool,
+    /// The first substream group's real Table 85 `channel_mode` index
+    /// (only when `channel_coded`) — distinguishes the three
+    /// same-channel-count 7.1 layouts. See
+    /// `SubstreamGroupSummary::channel_mode`.
+    pub channel_mode: Option<u32>,
+    /// Every `ac4_substream_group_info()` in this frame (bitstream_version
+    /// >= 2 only) — a frame can carry more than one (the classic Dolby
+    /// Atmos "bed + objects" model: a channel-coded group for the static
+    /// bed, a separate A-JOC group for dynamic objects). Empty for
+    /// bitstream_version <= 1 frames.
+    pub substream_groups: Vec<SubstreamGroupSummary>,
+    /// The first substream group's physical substream index (into
+    /// `substream_sizes`) — the byte offset of the actual audio for
+    /// `channels`/`channel_mode` is *not* necessarily substream 0;
+    /// `b_substreams_present` frames carry an explicit index that must
+    /// be honoured, or decode silently reads the wrong physical
+    /// substream. `None` on single-substream frames (`b_substreams_present
+    /// == false`), where the substream implicitly follows the TOC, and
+    /// for bitstream_version <= 1 frames (no substream_groups tracked).
+    pub substream_index: Option<u32>,
 }
 
 /// Per-presentation information we extract from `ac4_presentation_info()`.
@@ -351,6 +388,14 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
     // path; >= 2 runs `ac4_presentation_v1_info()` per presentation followed
     // by `ac4_substream_group_info()` × `total_n_substream_groups`.
     let mut presentations = Vec::with_capacity(n_presentations as usize);
+    let mut ajoc_info: Option<SubstreamInfoAjoc> = None;
+    // `ac4_presentation_info()` (bitstream_version <= 1) always calls the
+    // plain channel-coded `ac4_substream_info()` — that path structurally
+    // cannot carry A-JOC/object content at all.
+    let mut channel_coded = bitstream_version <= 1;
+    let mut channel_mode: Option<u32> = None;
+    let mut substream_index: Option<u32> = None;
+    let mut substream_groups: Vec<SubstreamGroupSummary> = Vec::new();
     if bitstream_version <= 1 {
         for _ in 0..n_presentations {
             let pi = parse_presentation_info(&mut br, fs_index, frame_rate_index)?;
@@ -375,29 +420,33 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
             total_n_substream_groups += n_sg;
             presentations.push(pi);
         }
-        // §6.3.2.5 ac4_substream_group_info() loop. The walker returns
-        // the first substream's `(channels, sf_multiplier)` so we can
-        // back-fill the leading presentation's `channels` field — for
-        // single-substream-group v2 frames this is the only path the
-        // channel count comes through.
-        let mut first_group_channels: u16 = 0;
-        let mut first_group_sf_mul: u32 = 0;
-        for j in 0..total_n_substream_groups {
+        // §6.3.2.5 ac4_substream_group_info() loop. A frame can carry
+        // more than one group (bed + objects), so every group's summary
+        // is kept — the leading presentation's `channels`/`sf_multiplier`
+        // back-fill, and the top-level `ajoc_info`/`channel_coded`, still
+        // reflect the first group specifically, for single-group frames
+        // (the overwhelmingly common case) where that's the whole story.
+        let mut groups: Vec<SubstreamGroupSummary> = Vec::with_capacity(total_n_substream_groups as usize);
+        for _ in 0..total_n_substream_groups {
             let g =
                 parse_substream_group_info(&mut br, bitstream_version, fs_index, frame_rate_index)?;
-            if j == 0 {
-                first_group_channels = g.first_channels;
-                first_group_sf_mul = g.first_sf_multiplier;
-            }
+            groups.push(g);
         }
-        if let Some(p) = presentations.first_mut() {
-            if p.channels == 0 {
-                p.channels = first_group_channels;
+        if let Some(first) = groups.first() {
+            if let Some(p) = presentations.first_mut() {
+                if p.channels == 0 {
+                    p.channels = first.channels;
+                }
+                if p.sf_multiplier == 0 {
+                    p.sf_multiplier = first.sf_multiplier;
+                }
             }
-            if p.sf_multiplier == 0 {
-                p.sf_multiplier = first_group_sf_mul;
-            }
+            ajoc_info = first.ajoc_info.clone();
+            channel_coded = first.channel_coded;
+            channel_mode = first.channel_mode;
+            substream_index = first.substream_index;
         }
+        substream_groups = groups;
     }
 
     // substream_index_table().
@@ -437,6 +486,11 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         payload_base,
         presentations,
         toc_size,
+        ajoc_info,
+        channel_coded,
+        channel_mode,
+        substream_groups,
+        substream_index,
     })
 }
 
@@ -507,22 +561,30 @@ fn parse_emdf_payloads_substream_info(br: &mut BitReader<'_>) -> Result<()> {
     Ok(())
 }
 
+/// `emdf_reserved()` (§4.2.3.12, Table 80 — the table's syntax box is
+/// itself headed `emdf_protection()`, apparently a naming artifact in
+/// the spec, but this is the only definition given for what
+/// `emdf_info()` calls `emdf_reserved()`).
+///
+/// Two 2-bit skip-byte-length codes (primary/secondary); each, when
+/// nonzero, contributes `1 << (2*(code-1))` bytes of opaque reserved
+/// data (so 0, 1, 4, or 16 bytes per code — max 32 bytes combined).
+/// The previous implementation here read a `b_more_bits` flag plus a
+/// `variable_bits(5)`-encoded skip count, which doesn't match this
+/// syntax at all and misaligned every real-world stream tested against
+/// it (misreading downstream fields until something claimed an
+/// absurd/impossible bit count).
 fn parse_emdf_reserved(br: &mut BitReader<'_>) -> Result<()> {
-    // §4.2.3.12 — emdf_reserved(): b_more_bits and optional
-    // variable_bits(32) chunk list. Consumes a minimum of 1 bit.
-    let b_more_bits = br.read_bit()?;
-    if b_more_bits {
-        // Spec phrasing: emdf_reserved() carries a payload of
-        // variable_bits(5) skip bytes, each treated as opaque reserved.
-        let n_bits = variable_bits(br, 5)?;
-        // Clamp — the spec says the reserved field must fit within the
-        // remaining frame, so we trust it but cap at a sane upper bound
-        // to avoid runaway reads on malformed streams.
-        if n_bits > 1 << 20 {
-            return Err(Error::invalid("ac4: emdf_reserved claims too many bits"));
-        }
-        br.skip(n_bits)?;
+    let primary = br.read_u32(2)?;
+    let secondary = br.read_u32(2)?;
+    let mut n_skip_bytes: u32 = 0;
+    if primary > 0 {
+        n_skip_bytes += 1 << (2 * (primary - 1));
     }
+    if secondary > 0 {
+        n_skip_bytes += 1 << (2 * (secondary - 1));
+    }
+    br.skip(n_skip_bytes * 8)?;
     Ok(())
 }
 
@@ -855,7 +917,16 @@ fn parse_presentation_v1_info(
         // b_pres_ndot, substream_index (2 + optional variable_bits(2)).
         let _b_alternative = br.read_bit()?;
         let b_pres_ndot = br.read_bit()?;
-        info.b_iframe = !b_pres_ndot; // ndot = "not intra-coded" → invert.
+        // `b_pres_ndot` = "no dependency over time": 1 ⇒ the substream can
+        // be decoded independently of preceding frames, i.e. it *is* an
+        // I-frame. So `b_iframe = b_pres_ndot`, NOT its negation. (An
+        // earlier `!b_pres_ndot` misread "ndot" as "not intra-coded" and
+        // inverted it, so every P-frame spuriously read the I-frame-only
+        // `aspx_config()` — a 15-bit desync that shredded the whole
+        // channel element. The spec's `b_audio_ndot`/`b_pres_ndot` share
+        // this "1 = independent" polarity; the reference decoder reads the
+        // bit straight into its `iframe` flag with no inversion.)
+        info.b_iframe = b_pres_ndot;
         let si = br.read_u32(2)?;
         if si == 3 {
             let _ = variable_bits(br, 2)?;
@@ -936,8 +1007,11 @@ fn parse_substream_group_info(
             let chan =
                 parse_substream_info_chan(br, fs_index, frame_rate_index, b_substreams_present)?;
             if sus == 0 {
-                summary.first_channels = chan.channels;
-                summary.first_sf_multiplier = chan.sf_multiplier;
+                summary.channels = chan.channels;
+                summary.sf_multiplier = chan.sf_multiplier;
+                summary.channel_coded = true;
+                summary.channel_mode = Some(chan.channel_mode);
+                summary.substream_index = chan.substream_index;
             }
             if b_hsf_ext && b_substreams_present {
                 let si = br.read_u32(2)?;
@@ -958,15 +1032,36 @@ fn parse_substream_group_info(
                 }
             }
         }
-        // ac4_substream_info_ajoc / ac4_substream_info_obj are not
-        // implemented for v2 audio body parsing yet; the loop returns
-        // Unsupported on the first iteration so callers surface an
-        // error rather than silently mis-aligning the bitstream.
-        if n_lf_substreams > 0 {
-            let _b_ajoc = br.read_bit()?;
-            return Err(Error::unsupported(
-                "ac4: ajoc / object substream parsing not implemented",
-            ));
+        for sus in 0..n_lf_substreams {
+            let b_ajoc = br.read_bit()?;
+            if b_ajoc {
+                let ajoc_info =
+                    parse_substream_info_ajoc(br, fs_index, frame_rate_index, b_substreams_present)?;
+                if sus == 0 {
+                    let upmix_channels =
+                        ajoc_info.n_fullband_upmix_signals + u32::from(ajoc_info.b_lfe);
+                    summary.channels = upmix_channels as u16;
+                    summary.sf_multiplier = ajoc_info.sf_multiplier;
+                    summary.substream_index = ajoc_info.substream_index;
+                    summary.ajoc_info = Some(ajoc_info.clone());
+                    summary.channel_coded = false;
+                }
+                if b_hsf_ext && b_substreams_present {
+                    let si = br.read_u32(2)?;
+                    if si == 3 {
+                        let _ = variable_bits(br, 2)?;
+                    }
+                }
+            } else {
+                // Direct-coded (non-A-JOC) object substreams
+                // (ac4_substream_info_obj) aren't implemented — Tidal's
+                // AC-4 IMS content uses the A-JOC path, per the earlier
+                // real-file investigation that motivated this whole
+                // object-decode effort.
+                return Err(Error::unsupported(
+                    "ac4: direct object-coded (non-A-JOC) substream parsing not implemented",
+                ));
+            }
         }
     }
     let b_content_type = br.read_bit()?;
@@ -985,7 +1080,7 @@ fn parse_substream_info_chan(
     frame_rate_index: u32,
     b_substreams_present: bool,
 ) -> Result<SubstreamInfoChan> {
-    let (channels, _mode_bits) = decode_channel_mode(br)?;
+    let (channels, channel_mode) = decode_channel_mode(br)?;
     let mut sf_multiplier = 0;
     if fs_index == 1 {
         let b_sf_multiplier = br.read_bit()?;
@@ -1000,21 +1095,26 @@ fn parse_substream_info_chan(
             let _ = br.read_u32(2)?;
         }
     }
-    // §6.2.1.8 add_ch_base bit gate — skipped for the v2 walker for the
-    // same reason as the v0 walker (we don't surface raw channel_mode).
+    // §6.2.1.8 add_ch_base bit gate — not yet consumed; only reachable
+    // for the wide add-channel-form channel_mode values (16..=19).
     let factor = frame_rate_factor(frame_rate_index, false, 0);
     for _ in 0..factor.max(1) {
         let _b_audio_ndot = br.read_bit()?;
     }
-    if b_substreams_present {
-        let si = br.read_u32(2)?;
+    let substream_index = if b_substreams_present {
+        let mut si = br.read_u32(2)?;
         if si == 3 {
-            let _ = variable_bits(br, 2)?;
+            si += variable_bits(br, 2)?;
         }
-    }
+        Some(si)
+    } else {
+        None
+    };
     Ok(SubstreamInfoChan {
         channels: channels as u16,
         sf_multiplier,
+        channel_mode,
+        substream_index,
     })
 }
 
@@ -1022,12 +1122,446 @@ fn parse_substream_info_chan(
 struct SubstreamInfoChan {
     channels: u16,
     sf_multiplier: u32,
+    /// The real Table 85 `channel_mode` index (see `decode_channel_mode`)
+    /// — distinguishes the three same-channel-count 7.1 layouts.
+    channel_mode: u32,
+    /// Physical substream this descriptor's audio actually lives in,
+    /// indexing into `substream_index_table()`'s size list — `None`
+    /// when `b_substreams_present` is false (single-substream frame,
+    /// audio implicitly follows the TOC in bitstream order).
+    substream_index: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct SubstreamGroupSummary {
-    first_channels: u16,
-    first_sf_multiplier: u32,
+/// Summary of one `ac4_substream_group_info()` (§6.3.2.5) — a frame can
+/// carry more than one of these (the classic Dolby Atmos "bed +
+/// objects" model: one channel-coded group for the static bed, a
+/// separate A-JOC group for dynamic objects layered on top), so
+/// `Ac4FrameInfo::substream_groups` holds one entry per group rather
+/// than only the first.
+#[derive(Debug, Clone, Default)]
+pub struct SubstreamGroupSummary {
+    pub channels: u16,
+    pub sf_multiplier: u32,
+    /// Full `ac4_substream_info_ajoc()` descriptor for the first
+    /// A-JOC-coded substream in this group, if any — this is where the
+    /// actual bed-channel-vs-dynamic-object breakdown lives.
+    pub ajoc_info: Option<SubstreamInfoAjoc>,
+    /// Whether this group's `b_channel_coded` flag was set — `channels`
+    /// came from the plain channel-coded path (`ac4_substream_info_chan`)
+    /// rather than A-JOC when this is `true`, regardless of
+    /// `bitstream_version`.
+    pub channel_coded: bool,
+    /// The real Table 85 `channel_mode` index (only meaningful when
+    /// `channel_coded`) — distinguishes the three same-channel-count
+    /// 7.1 layouts (6/8/10 — 3/4/0.1, 5/2/0.1, 3/2/2.1) that `channels`
+    /// alone can't tell apart. `None` for A-JOC-coded groups.
+    pub channel_mode: Option<u32>,
+    /// Physical substream index (into `substream_index_table()`'s size
+    /// list) that carries this group's first substream's audio data —
+    /// `None` on single-substream frames (`b_substreams_present ==
+    /// false`), where the substream implicitly follows the TOC. This is
+    /// distinct from the *ordinal* position of the substream within the
+    /// group: a group's audio is not necessarily the first entry in
+    /// `substream_sizes`.
+    pub substream_index: Option<u32>,
+}
+
+// ---------------------------------------------------------------------
+// ETSI TS 103 190-2 §6.2.1.9 / §6.2.1.10 / §6.2.1.11 — object-coded
+// (A-JOC) substream descriptors.
+// ---------------------------------------------------------------------
+
+/// The three object kinds `bed_dyn_obj_assignment()` / `ac4_substream_info_obj()`
+/// can assign to a signal (§6.2.1.10/.11, §6.3.2.10.3/.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjType {
+    /// A fixed, speaker-anchored bed channel.
+    Bed,
+    /// A dynamic object with its own position metadata.
+    Dyn,
+    /// An Intermediate Spatial Format object (Table 61 layouts).
+    Isf,
+}
+
+/// One signal's object descriptor, as produced by `bed_dyn_obj_assignment()`.
+#[derive(Debug, Clone, Copy)]
+pub struct ObjDescriptor {
+    pub obj_type: ObjType,
+    pub b_lfe: bool,
+    pub b_ajoc_coded: bool,
+}
+
+/// `bed_dyn_obj_assignment(n_signals)` (§6.2.1.10): assigns each of
+/// `n_signals` signals a bed/ISF descriptor from the bitstream, then pads
+/// any remainder up to `n_signals` as dynamic objects — covering the
+/// `b_dyn_objects_only` case, where no bed/ISF bits are read at all and
+/// every signal is dynamic (§6.3.2.10.3).
+pub fn parse_bed_dyn_obj_assignment(
+    br: &mut BitReader<'_>,
+    n_signals: u32,
+) -> Result<Vec<ObjDescriptor>> {
+    let mut objs = Vec::new();
+    let bed = ObjDescriptor {
+        obj_type: ObjType::Bed,
+        b_lfe: false,
+        b_ajoc_coded: true,
+    };
+
+    let b_dyn_objects_only = br.read_bit()?;
+    if !b_dyn_objects_only {
+        let b_isf = br.read_bit()?;
+        if b_isf {
+            let isf_config = br.read_u32(3)?;
+            let n_isf = match isf_config {
+                0 => 4,
+                1 => 8,
+                2 => 10,
+                3 => 14,
+                4 => 15,
+                5 => 30,
+                _ => {
+                    return Err(Error::invalid("ac4: reserved isf_config value"));
+                }
+            };
+            for _ in 0..n_isf {
+                objs.push(ObjDescriptor {
+                    obj_type: ObjType::Isf,
+                    b_lfe: false,
+                    b_ajoc_coded: true,
+                });
+            }
+        } else {
+            let b_ch_assign_code = br.read_bit()?;
+            if b_ch_assign_code {
+                const COUNTS: [u32; 8] = [2, 3, 5, 7, 9, 7, 9, 11];
+                let bed_chan_assign_code = br.read_u32(3)?;
+                for _ in 0..COUNTS[bed_chan_assign_code as usize] {
+                    objs.push(bed);
+                }
+            } else {
+                let b_channel_assignment_flags_present = br.read_bit()?;
+                if b_channel_assignment_flags_present {
+                    let b_nonstd = br.read_bit()?;
+                    if b_nonstd {
+                        let mut flags = [false; 17];
+                        for f in flags.iter_mut() {
+                            *f = br.read_bit()?;
+                        }
+                        for i in 0..17usize {
+                            if flags[16 - i] && i != 3 && i != 16 {
+                                objs.push(bed);
+                            }
+                        }
+                    } else {
+                        const COUNTS2: [u32; 10] = [2, 1, 1, 2, 2, 2, 2, 2, 2, 1];
+                        let mut flags = [false; 10];
+                        for f in flags.iter_mut() {
+                            *f = br.read_bit()?;
+                        }
+                        for i in 0..10usize {
+                            if flags[9 - i] {
+                                for _ in 0..COUNTS2[i] {
+                                    objs.push(bed);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let n_bed_signals = if n_signals > 1 {
+                        // ceil(log2(n_signals)) bits to represent 0..n_signals-1.
+                        let bed_ch_bits = 32 - (n_signals - 1).leading_zeros();
+                        br.read_u32(bed_ch_bits)? + 1
+                    } else {
+                        1
+                    };
+                    for _ in 0..n_bed_signals {
+                        let nonstd_bed_channel_assignment = br.read_u32(4)?;
+                        if nonstd_bed_channel_assignment != 3 {
+                            objs.push(bed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Any signals not accounted for above are dynamic objects — the only
+    // case reached when b_dyn_objects_only was set, since objs is empty.
+    while (objs.len() as u32) < n_signals {
+        objs.push(ObjDescriptor {
+            obj_type: ObjType::Dyn,
+            b_lfe: false,
+            b_ajoc_coded: false,
+        });
+    }
+    Ok(objs)
+}
+
+/// `oamd_common_data()` (§6.2.8.1). The `bed_render_info()` / `headphone()`
+/// sub-fields inside `b_additional_data` describe screen-relative and
+/// headphone-specific rendering hints we don't need for decode or a basic
+/// render; `add_data_bytes` declares their exact combined length, so the
+/// whole block is skipped as opaque bits rather than parsed field-by-field
+/// — safe, since it doesn't change how anything downstream aligns.
+pub fn parse_oamd_common_data(br: &mut BitReader<'_>) -> Result<()> {
+    let b_default_screen_size_ratio = br.read_bit()?;
+    if !b_default_screen_size_ratio {
+        let _master_screen_size_ratio_code = br.read_u32(5)?;
+    }
+    let _b_bed_object_chan_distribute = br.read_bit()?;
+    let b_additional_data = br.read_bit()?;
+    if b_additional_data {
+        let add_data_bytes_minus1 = br.read_u32(1)?;
+        let mut add_data_bytes = add_data_bytes_minus1 + 1;
+        if add_data_bytes == 2 {
+            add_data_bytes += variable_bits(br, 2)?;
+        }
+        br.skip(add_data_bytes * 8)?;
+    }
+    Ok(())
+}
+
+/// `ac4_substream_info_ajoc(b_substreams_present)` (§6.2.1.9): the
+/// substream descriptor for A-JOC coded object substreams — signal
+/// counts, bed/ISF assignment for the downmix and upmix signal sets, and
+/// the same bitrate/sf-multiplier/substream-index tail as
+/// `ac4_substream_info_chan`.
+#[derive(Debug, Clone)]
+pub struct SubstreamInfoAjoc {
+    pub b_lfe: bool,
+    pub b_static_dmx: bool,
+    pub n_fullband_dmx_signals: u32,
+    /// Empty when `b_static_dmx` — the downmix is a plain 5.0/5.1 bed
+    /// decoded via `audio_data_chan`, not individually assigned objects.
+    pub dmx_objs: Vec<ObjDescriptor>,
+    pub n_fullband_upmix_signals: u32,
+    pub umx_objs: Vec<ObjDescriptor>,
+    pub sf_multiplier: u32,
+    /// Physical substream this descriptor's audio actually lives in,
+    /// indexing into `substream_index_table()`'s size list — mirrors
+    /// the same field on the channel-coded substream descriptor.
+    pub substream_index: Option<u32>,
+}
+
+pub fn parse_substream_info_ajoc(
+    br: &mut BitReader<'_>,
+    fs_index: u32,
+    frame_rate_index: u32,
+    b_substreams_present: bool,
+) -> Result<SubstreamInfoAjoc> {
+    let b_lfe = br.read_bit()?;
+    let b_static_dmx = br.read_bit()?;
+    let (n_fullband_dmx_signals, dmx_objs) = if b_static_dmx {
+        (5, Vec::new())
+    } else {
+        let n_fullband_dmx_signals = br.read_u32(4)? + 1;
+        let objs = parse_bed_dyn_obj_assignment(br, n_fullband_dmx_signals)?;
+        (n_fullband_dmx_signals, objs)
+    };
+
+    let b_oamd_common_data_present = br.read_bit()?;
+    if b_oamd_common_data_present {
+        parse_oamd_common_data(br)?;
+    }
+
+    let mut n_fullband_upmix_signals = br.read_u32(4)? + 1;
+    if n_fullband_upmix_signals == 16 {
+        n_fullband_upmix_signals += variable_bits(br, 3)?;
+    }
+    let umx_objs = parse_bed_dyn_obj_assignment(br, n_fullband_upmix_signals)?;
+
+    let mut sf_multiplier = 0;
+    if fs_index == 1 {
+        let b_sf_multiplier = br.read_bit()?;
+        if b_sf_multiplier {
+            sf_multiplier = br.read_u32(1)? + 1;
+        }
+    }
+    let b_bitrate_info = br.read_bit()?;
+    if b_bitrate_info {
+        let short = br.read_u32(3)?;
+        if short == 0b111 {
+            let _ = br.read_u32(2)?;
+        }
+    }
+    let factor = frame_rate_factor(frame_rate_index, false, 0);
+    for _ in 0..factor.max(1) {
+        let _b_audio_ndot = br.read_bit()?;
+    }
+    let substream_index = if b_substreams_present {
+        let mut si = br.read_u32(2)?;
+        if si == 3 {
+            si += variable_bits(br, 2)?;
+        }
+        Some(si)
+    } else {
+        None
+    };
+
+    Ok(SubstreamInfoAjoc {
+        b_lfe,
+        b_static_dmx,
+        n_fullband_dmx_signals,
+        dmx_objs,
+        n_fullband_upmix_signals,
+        umx_objs,
+        sf_multiplier,
+        substream_index,
+    })
+}
+
+/// Result of `audio_data_ajoc()` (§6.2.3.4): everything decoded from one
+/// A-JOC object-coded substream's audio-data element.
+#[derive(Debug, Clone)]
+pub struct AudioDataAjoc {
+    pub var_channel: crate::mch::VarChannelElement,
+    pub dmx_dyndata: crate::oamd::OamdDyndataSingle,
+    pub ajoc: crate::ajoc::AjocParsed,
+    pub dmx_de_data: crate::ajoc::AjocDmxDeData,
+    pub umx_dyndata: crate::oamd::OamdDyndataSingle,
+}
+
+/// `audio_data_ajoc(n_fb_upmix_signals, b_static_dmx, n_fb_dmx_signals,
+/// b_lfe, b_iframe)` (§6.2.3.4) — the top-level per-frame walk for an
+/// A-JOC object-coded substream, tying together `var_channel_element`,
+/// `ajoc()`, `ajoc_dmx_de_data()`, and two calls to
+/// `oamd_dyndata_single()` (once for the downmix signal set, once for
+/// the upmix/output set).
+///
+/// `b_alternative` and `frame_len_base` are threaded in from outside
+/// this substream descriptor: `b_alternative` comes from the enclosing
+/// `ac4_presentation_substream_info()`, and `frame_len_base` from the
+/// TOC's `fs_index`/`frame_rate_index` — the same value the
+/// channel-coded path derives and threads into
+/// `parse_asf_transform_info` throughout `mch.rs`/`asf.rs`.
+///
+/// **Not yet supported:** the `b_static_dmx` path (`audio_data_chan(5.0
+/// or 5.1, b_iframe)` — a plain fixed 5-channel bed using the
+/// channel-coded decode machinery directly) isn't wired up, nor is a
+/// non-timed downmix/upmix frame (`b_dmx_timing`/`b_umx_timing == 0`),
+/// which per spec relies on a sticky `num_obj_info_blocks` from a
+/// previous frame that isn't threaded through yet — both return
+/// `Error::unsupported` rather than guessing.
+pub fn parse_audio_data_ajoc(
+    br: &mut BitReader<'_>,
+    info: &SubstreamInfoAjoc,
+    b_iframe: bool,
+    b_alternative: bool,
+    frame_len_base: u32,
+) -> Result<AudioDataAjoc> {
+    if info.b_static_dmx {
+        return Err(Error::unsupported(
+            "ac4: audio_data_ajoc static-downmix path (audio_data_chan) not implemented",
+        ));
+    }
+
+    let b_some_signals_inactive = br.read_bit()?;
+    if b_some_signals_inactive {
+        let _dmx_active_signals_mask = br.read_u32(info.n_fullband_dmx_signals)?;
+    }
+
+    let var_channel = crate::mch::parse_var_channel_element(
+        br,
+        b_iframe,
+        info.n_fullband_dmx_signals,
+        info.b_lfe,
+        frame_len_base,
+    )?;
+
+    let b_dmx_timing = br.read_bit()?;
+    let num_obj_info_blocks_dmx = if b_dmx_timing {
+        crate::oamd::parse_oamd_timing_data(br)?.num_obj_info_blocks
+    } else {
+        return Err(Error::unsupported(
+            "ac4: audio_data_ajoc non-timed downmix frame (sticky num_obj_info_blocks) \
+             not implemented",
+        ));
+    };
+
+    // An A-JOC bed object can't itself carry an LFE (see `ObjDescriptor`'s
+    // doc) — `ac4_substream_info_ajoc`'s own `b_lfe` flag is instead
+    // represented as an extra leading signal here (`is_lfe[0] = 1`),
+    // ahead of `bed_dyn_obj_assignment`'s own descriptors.
+    let (obj_type_dmx, is_lfe_dmx) = lfe_prefixed_descriptors(info.b_lfe, &info.dmx_objs);
+    let dmx_dyndata = crate::oamd::parse_oamd_dyndata_single(
+        br,
+        num_obj_info_blocks_dmx,
+        b_iframe,
+        b_alternative,
+        &obj_type_dmx,
+        &is_lfe_dmx,
+    )?;
+
+    let b_oamd_extension_present = br.read_bit()?;
+    if b_oamd_extension_present {
+        let declared_bits = (variable_bits(br, 3)? + 1) * 8;
+        let bed_info = crate::ajoc::parse_ajoc_bed_info(br)?;
+        let remaining = declared_bits.checked_sub(bed_info.bits_read).ok_or_else(|| {
+            Error::invalid(
+                "ac4: audio_data_ajoc oamd extension: ajoc_bed_info overran its declared \
+                 skip budget",
+            )
+        })?;
+        br.skip(remaining)?;
+    }
+
+    let ajoc = crate::ajoc::parse_ajoc(
+        br,
+        info.n_fullband_dmx_signals,
+        info.n_fullband_upmix_signals,
+    )?;
+    let dmx_de_data = crate::ajoc::parse_ajoc_dmx_de_data(
+        br,
+        info.n_fullband_dmx_signals,
+        info.n_fullband_upmix_signals,
+    )?;
+
+    let b_umx_timing = br.read_bit()?;
+    let num_obj_info_blocks_umx = if b_umx_timing {
+        crate::oamd::parse_oamd_timing_data(br)?.num_obj_info_blocks
+    } else {
+        // "Derive timing from dmx": the spec names this bit but doesn't
+        // spell out the derivation beyond that; reusing the downmix
+        // side's block count is the most direct reading of "derive ...
+        // from dmx" available from the syntax table alone.
+        let _b_derive_timing_from_dmx = br.read_bit()?;
+        num_obj_info_blocks_dmx
+    };
+
+    let (obj_type_umx, is_lfe_umx) = lfe_prefixed_descriptors(info.b_lfe, &info.umx_objs);
+    let umx_dyndata = crate::oamd::parse_oamd_dyndata_single(
+        br,
+        num_obj_info_blocks_umx,
+        b_iframe,
+        b_alternative,
+        &obj_type_umx,
+        &is_lfe_umx,
+    )?;
+
+    Ok(AudioDataAjoc {
+        var_channel,
+        dmx_dyndata,
+        ajoc,
+        dmx_de_data,
+        umx_dyndata,
+    })
+}
+
+/// Build the combined `(obj_type, is_lfe)` arrays `oamd_dyndata_single`
+/// expects: an optional leading LFE entry (`ac4_substream_info_ajoc`'s
+/// own `b_lfe` flag) ahead of `bed_dyn_obj_assignment`'s descriptors.
+fn lfe_prefixed_descriptors(b_lfe: bool, objs: &[ObjDescriptor]) -> (Vec<ObjType>, Vec<bool>) {
+    let mut obj_type = Vec::with_capacity(objs.len() + 1);
+    let mut is_lfe = Vec::with_capacity(objs.len() + 1);
+    if b_lfe {
+        obj_type.push(ObjType::Bed);
+        is_lfe.push(true);
+    }
+    for o in objs {
+        obj_type.push(o.obj_type);
+        is_lfe.push(o.b_lfe);
+    }
+    (obj_type, is_lfe)
 }
 
 /// `frame_rate_fractions_info()` per ETSI TS 103 190-2 §6.2.1.4 — gated
@@ -1180,19 +1714,419 @@ mod tests {
 
     #[test]
     fn channel_mode_mono_stereo_51() {
-        // Mono prefix: 0.
+        // Mono prefix: 0 -> channel_mode 0.
         let bytes = [0b0_0000000];
         let mut br = BitReader::new(&bytes);
-        assert_eq!(decode_channel_mode(&mut br).unwrap(), (1, 1));
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (1, 0));
 
-        // Stereo prefix: 10.
+        // Stereo prefix: 10 -> channel_mode 1.
         let bytes = [0b10_000000];
         let mut br = BitReader::new(&bytes);
-        assert_eq!(decode_channel_mode(&mut br).unwrap(), (2, 2));
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (2, 1));
 
-        // 5.1 prefix: 1110.
+        // 5.1 prefix: 1110 -> channel_mode 4.
         let bytes = [0b1110_0000];
         let mut br = BitReader::new(&bytes);
         assert_eq!(decode_channel_mode(&mut br).unwrap(), (6, 4));
+    }
+
+    #[test]
+    fn channel_mode_distinguishes_same_channel_count_71_layouts() {
+        // channel_mode 6 (3/4/0.1): prefix 1111 001 -> tail 0b001.
+        let bytes = [0b1111_001_0];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (8, 6));
+
+        // channel_mode 8 (5/2/0.1): prefix 1111 011 -> tail 0b011.
+        let bytes = [0b1111_011_0];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (8, 8));
+
+        // channel_mode 10 (3/2/2.1): prefix 1111 101 -> tail 0b101.
+        let bytes = [0b1111_101_0];
+        let mut br = BitReader::new(&bytes);
+        assert_eq!(decode_channel_mode(&mut br).unwrap(), (8, 10));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_dyn_only_pads_all_signals() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only = 1: no further bits read; every one of the
+        // 3 signals comes back as a padded Dyn descriptor.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 3).unwrap();
+        assert_eq!(objs.len(), 3);
+        assert!(objs.iter().all(|o| o.obj_type == ObjType::Dyn && !o.b_ajoc_coded));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_isf_config_0_gives_4_objects() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only=0, b_isf=1, isf_config=0 (0b000) -> 4 ISF objects.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(0, 3);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 4).unwrap();
+        assert_eq!(objs.len(), 4);
+        assert!(objs.iter().all(|o| o.obj_type == ObjType::Isf && o.b_ajoc_coded));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_isf_config_reserved_errors() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(6, 3); // reserved isf_config
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert!(parse_bed_dyn_obj_assignment(&mut br, 4).is_err());
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_ch_assign_code_then_dyn_padding() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only=0, b_isf=0, b_ch_assign_code=1,
+        // bed_chan_assign_code=0 (-> 2 bed objects). n_signals=5, so the
+        // remaining 3 signals pad out as Dyn.
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(true);
+        bw.write_u32(0, 3);
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 5).unwrap();
+        assert_eq!(objs.len(), 5);
+        assert_eq!(objs[0].obj_type, ObjType::Bed);
+        assert_eq!(objs[1].obj_type, ObjType::Bed);
+        assert!(objs[2..].iter().all(|o| o.obj_type == ObjType::Dyn));
+    }
+
+    #[test]
+    fn bed_dyn_obj_assignment_nonstd_per_signal_skips_value_3() {
+        use oxideav_core::bits::BitWriter;
+        // b_dyn_objects_only=0, b_isf=0, b_ch_assign_code=0,
+        // b_channel_assignment_flags_present=0, n_signals=2 (1 bit for
+        // n_bed_signals_minus1): n_bed_signals_minus1=1 -> n_bed_signals=2,
+        // then two nonstd_bed_channel_assignment codes: 0 (kept), 3 (skipped).
+        let mut bw = BitWriter::new();
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_bit(false);
+        bw.write_u32(1, 1); // n_bed_signals_minus1 = 1 -> n_bed_signals = 2
+        bw.write_u32(0, 4); // first: kept
+        bw.write_u32(3, 4); // second: skipped (== 3)
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let objs = parse_bed_dyn_obj_assignment(&mut br, 2).unwrap();
+        // 1 bed object kept, 1 signal unaccounted for -> padded as Dyn.
+        assert_eq!(objs.len(), 2);
+        assert_eq!(objs[0].obj_type, ObjType::Bed);
+        assert_eq!(objs[1].obj_type, ObjType::Dyn);
+    }
+
+    #[test]
+    fn oamd_common_data_no_additional_data() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_default_screen_size_ratio
+        bw.write_bit(false); // b_bed_object_chan_distribute
+        bw.write_bit(false); // b_additional_data
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        assert!(parse_oamd_common_data(&mut br).is_ok());
+    }
+
+    #[test]
+    fn oamd_common_data_skips_additional_data_block() {
+        use oxideav_core::bits::BitWriter;
+        // add_data_bytes_minus1 = 0 -> add_data_bytes = 1 -> skip 8 bits,
+        // then one more real bit after it that must still be reachable.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_default_screen_size_ratio
+        bw.write_bit(false); // b_bed_object_chan_distribute
+        bw.write_bit(true); // b_additional_data
+        bw.write_u32(0, 1); // add_data_bytes_minus1 = 0 -> 1 byte
+        bw.write_u32(0xAB, 8); // the skipped byte
+        bw.write_bit(true); // sentinel after the block
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_oamd_common_data(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel bit after the skipped block should still be reachable");
+    }
+
+    #[test]
+    fn substream_info_ajoc_static_dmx_skips_dmx_objs() {
+        use oxideav_core::bits::BitWriter;
+        // b_lfe=1, b_static_dmx=1 (n_fullband_dmx_signals=5, no bed_dyn read),
+        // b_oamd_common_data_present=0,
+        // n_fullband_upmix_signals_minus1=1 (-> 2), then dyn-only bed
+        // assignment for those 2 upmix signals, then no sf_multiplier
+        // (fs_index=0), b_bitrate_info=0, frame_rate_index chosen so
+        // factor=1, b_substreams_present=false.
+        let mut bw = BitWriter::new();
+        bw.write_bit(true); // b_lfe
+        bw.write_bit(true); // b_static_dmx
+        bw.write_bit(false); // b_oamd_common_data_present
+        bw.write_u32(1, 4); // n_fullband_upmix_signals_minus1 = 1 -> 2
+        bw.write_bit(true); // upmix bed_dyn_obj_assignment: b_dyn_objects_only=1
+        bw.write_bit(false); // b_bitrate_info
+        bw.write_bit(false); // b_audio_ndot (frame_rate_index maps to factor 1)
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        let info = parse_substream_info_ajoc(&mut br, 0, 4, false).unwrap();
+        assert!(info.b_lfe);
+        assert!(info.b_static_dmx);
+        assert_eq!(info.n_fullband_dmx_signals, 5);
+        assert!(info.dmx_objs.is_empty());
+        assert_eq!(info.n_fullband_upmix_signals, 2);
+        assert_eq!(info.umx_objs.len(), 2);
+        assert!(info.umx_objs.iter().all(|o| o.obj_type == ObjType::Dyn));
+    }
+
+    /// The simplest possible `audio_data_ajoc()`: 1 downmix signal, 1
+    /// upmix signal, no LFE, no decorrelators, non-ASPX, non-alternative,
+    /// no OAMD extension, `b_keep_dmx_de_coeffs` — exercises every stage
+    /// of the chain (`var_channel_element` -> `oamd_timing_data` ->
+    /// `oamd_dyndata_single` -> `ajoc` -> `ajoc_dmx_de_data` ->
+    /// `oamd_timing_data` -> `oamd_dyndata_single` again) end to end.
+    #[test]
+    fn audio_data_ajoc_minimal_one_signal_each_side() {
+        use oxideav_core::bits::BitWriter;
+
+        let info = SubstreamInfoAjoc {
+            b_lfe: false,
+            b_static_dmx: false,
+            n_fullband_dmx_signals: 1,
+            dmx_objs: vec![ObjDescriptor {
+                obj_type: ObjType::Dyn,
+                b_lfe: false,
+                b_ajoc_coded: false,
+            }],
+            n_fullband_upmix_signals: 1,
+            umx_objs: vec![ObjDescriptor {
+                obj_type: ObjType::Dyn,
+                b_lfe: false,
+                b_ajoc_coded: false,
+            }],
+            sf_multiplier: 0,
+            substream_index: None,
+        };
+
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_some_signals_inactive
+
+        // var_channel_element(b_iframe=true, n_dmx_signals=1, b_has_lfe=false):
+        // var_codec_mode = 0 (non-ASPX), n_dmx_signals == 1 -> mono_data(0).
+        bw.write_bit(false); // var_codec_mode
+                             // mono_data(0): spec_frontend_bit(1) + transform_info(1, long-frame
+                             // at frame_len_base=1920) + psy_info max_sfb_0(6 bits at this
+                             // transform length) — empirically exactly 8 bits total, and
+                             // max_sfb_0 = 0 means the sf_data body decode consumes nothing
+                             // further (no scalefactor bands to read), so nothing to pad here.
+        bw.write_bit(false); // spec_frontend_bit = 0 (ASF)
+        bw.write_bit(true); // transform_info: b_long_frame = 1 (frame_len_base >= 1536)
+        bw.write_u32(0, 6); // psy_info: max_sfb_0 = 0
+
+        bw.write_bit(true); // b_dmx_timing = 1
+                            // oamd_timing_data(): oa_sample_offset_type=0, num_obj_info_blocks=1,
+                            // one block with a simple (non-0b11) ramp_duration_code.
+        bw.write_bit(false);
+        bw.write_u32(1, 3);
+        bw.write_u32(0, 6); // block_offset_factor
+        bw.write_u32(0b01, 2); // ramp_duration_code != 0b11
+
+        // oamd_dyndata_single(n_dmx=1, n_blocks=1, iframe, !alternative,
+        // [Dyn], [false]): object_info_block(b_no_delta=true, dynamic=true).
+        bw.write_bit(false); // b_object_not_active = 0
+        bw.write_bit(true); // b_default_basic_info_md = 1 (basic_info: nothing else)
+                            // render_info ALL_NEW: position + zone + otherprops all present.
+        bw.write_u32(1, 6); // pos3D_X
+        bw.write_u32(2, 6); // pos3D_Y
+        bw.write_bit(false); // pos3D_Z_sign
+        bw.write_u32(3, 4); // pos3D_Z
+        bw.write_bit(true); // b_grouped_zone_defaults
+        bw.write_bit(true); // b_grouped_other_defaults
+        bw.write_bit(false); // b_add_table_data = 0
+                             // b_alternative = false -> nothing more for oamd_dyndata_single.
+
+        bw.write_bit(false); // b_oamd_extension_present = 0
+
+        // ajoc(num_dmx_signals=1, num_umx_signals=1):
+        bw.write_u32(0, 3); // ajoc_num_decorr = 0
+                            // ajoc_ctrl_info: decorr_enable has 0 entries.
+        bw.write_bit(true); // object_present[0] = true
+        bw.write_u32(1, 2); // ajoc_data_point_info: num_dpoints = 1
+        bw.write_u32(0, 5); // start_pos[0]
+        bw.write_u32(0, 6); // ramp_len_minus1[0]
+        bw.write_u32(7, 3); // num_bands_code = 7 -> 1 band
+        bw.write_bit(false); // quant_select = Fine
+        bw.write_bit(false); // sparse_select = false
+                             // ajoc_data: ajoc_b_nodt = true -> dp=0 is DF-only; 1 channel, 1 band.
+        bw.write_bit(true);
+        // A single F0 codeword for the sole (o=0, dp=0, ch=0) entry.
+        write_shortest_dry_fine_f0_codeword(&mut bw);
+
+        // ajoc_dmx_de_data(1, 1): b_dmx_de_cfg=0, b_keep_dmx_de_coeffs=1
+        // (skips the de_dlg_dmx_coeff loop entirely).
+        bw.write_bit(false);
+        bw.write_bit(true);
+
+        bw.write_bit(true); // b_umx_timing = 1
+        bw.write_bit(false); // oamd_timing_data: oa_sample_offset_type=0
+        bw.write_u32(1, 3); // num_obj_info_blocks = 1
+        bw.write_u32(0, 6); // block_offset_factor
+        bw.write_u32(0b01, 2); // ramp_duration_code
+
+        // oamd_dyndata_single for the umx side — identical shape.
+        bw.write_bit(false); // b_object_not_active
+        bw.write_bit(true); // b_default_basic_info_md
+        bw.write_u32(4, 6); // pos3D_X
+        bw.write_u32(5, 6); // pos3D_Y
+        bw.write_bit(true); // pos3D_Z_sign
+        bw.write_u32(6, 4); // pos3D_Z
+        bw.write_bit(true); // b_grouped_zone_defaults
+        bw.write_bit(true); // b_grouped_other_defaults
+        bw.write_bit(false); // b_add_table_data
+
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let out = parse_audio_data_ajoc(&mut br, &info, true, false, 1920).unwrap();
+        assert_eq!(out.ajoc.ctrl.num_bands[0], 1);
+        assert_eq!(out.dmx_dyndata.blocks.len(), 1);
+        let dmx_pos = out.dmx_dyndata.blocks[0][0]
+            .render_info
+            .as_ref()
+            .unwrap()
+            .position
+            .unwrap();
+        assert_eq!((dmx_pos.x, dmx_pos.y, dmx_pos.z_sign, dmx_pos.z), (1, 2, false, 3));
+        let umx_pos = out.umx_dyndata.blocks[0][0]
+            .render_info
+            .as_ref()
+            .unwrap()
+            .position
+            .unwrap();
+        assert_eq!((umx_pos.x, umx_pos.y, umx_pos.z_sign, umx_pos.z), (4, 5, true, 6));
+        assert!(out.dmx_de_data.keep_dmx_de_coeffs);
+    }
+
+    /// Writes the shortest codeword of `AJOC_HCB_DRY_FINE_F0` — used by
+    /// `audio_data_ajoc_minimal_one_signal_each_side` to supply the sole
+    /// `ajoc_huff_data(DRY, ...)` codeword its minimal frame needs.
+    fn write_shortest_dry_fine_f0_codeword(bw: &mut oxideav_core::bits::BitWriter) {
+        let (len, cw) = crate::ajoc::shortest_dry_fine_f0_for_test();
+        bw.write_u32(cw, len);
+    }
+
+    #[test]
+    fn substream_group_info_ajoc_no_longer_errors() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_bit(false); // b_substreams_present
+        bw.write_bit(false); // b_hsf_ext
+        bw.write_bit(true); // b_single_substream -> n_lf_substreams = 1
+        bw.write_bit(false); // b_channel_coded = 0 (object-coded)
+        bw.write_bit(false); // b_oamd_substream = 0
+        bw.write_bit(true); // b_ajoc = 1 (this substream is A-JOC coded)
+
+        // ac4_substream_info_ajoc: b_lfe=0, b_static_dmx=1 (n_fullband_dmx=5,
+        // no bed_dyn_obj_assignment read), b_oamd_common_data_present=0,
+        // n_fullband_upmix_signals_minus1=1 -> 2, then dyn-only bed
+        // assignment for those 2 upmix signals, no sf_multiplier
+        // (fs_index=0), no bitrate info, one b_audio_ndot bit
+        // (frame_rate_factor is always 1 here), no substream_index
+        // (b_substreams_present=0).
+        bw.write_bit(false); // b_lfe
+        bw.write_bit(true); // b_static_dmx
+        bw.write_bit(false); // b_oamd_common_data_present
+        bw.write_u32(1, 4); // n_fullband_upmix_signals_minus1 = 1 -> 2
+        bw.write_bit(true); // upmix bed_dyn_obj_assignment: b_dyn_objects_only = 1
+        bw.write_bit(false); // b_bitrate_info
+        bw.write_bit(false); // b_audio_ndot
+
+        bw.write_bit(false); // b_content_type
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+
+        let summary = parse_substream_group_info(&mut br, 2, 0, 4).unwrap();
+        assert_eq!(summary.channels, 2);
+    }
+
+    // Regression coverage for the emdf_reserved() bitstream bug found by
+    // testing against real Tidal AC-4 files: the previous implementation
+    // read a nonexistent `b_more_bits` flag plus a `variable_bits(5)`
+    // skip count, which doesn't match the spec (Table 80 — two 2-bit
+    // skip-byte-length codes) and misaligned every real-world stream
+    // tested against it.
+
+    #[test]
+    fn emdf_reserved_all_zero_consumes_exactly_four_bits() {
+        use oxideav_core::bits::BitWriter;
+        let mut bw = BitWriter::new();
+        bw.write_u32(0, 2); // primary = 0
+        bw.write_u32(0, 2); // secondary = 0
+        bw.write_bit(true); // sentinel — must still be reachable right after
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_emdf_reserved(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel bit should be reachable after exactly 4 bits");
+    }
+
+    #[test]
+    fn emdf_reserved_skips_primary_and_secondary_bytes() {
+        use oxideav_core::bits::BitWriter;
+        // primary = 2 -> 1 << (2*(2-1)) = 4 bytes; secondary = 1 -> 1 byte.
+        // Total 5 reserved bytes (40 bits) to skip before the sentinel.
+        let mut bw = BitWriter::new();
+        bw.write_u32(2, 2);
+        bw.write_u32(1, 2);
+        for _ in 0..40 {
+            bw.write_bit(false);
+        }
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_emdf_reserved(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel should be reachable after skipping 5 bytes");
+    }
+
+    #[test]
+    fn emdf_reserved_max_codes_skip_32_bytes() {
+        use oxideav_core::bits::BitWriter;
+        // primary = 3 -> 16 bytes; secondary = 3 -> 16 bytes; 32 total.
+        let mut bw = BitWriter::new();
+        bw.write_u32(3, 2);
+        bw.write_u32(3, 2);
+        for _ in 0..(32 * 8) {
+            bw.write_bit(false);
+        }
+        bw.write_bit(true); // sentinel
+        bw.align_to_byte();
+        let bytes = bw.finish();
+        let mut br = BitReader::new(&bytes);
+        parse_emdf_reserved(&mut br).unwrap();
+        assert!(br.read_bit().unwrap(), "sentinel should be reachable after skipping 32 bytes");
     }
 }

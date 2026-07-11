@@ -46,11 +46,15 @@ pub struct Ac4Decoder {
     /// for the substream (e.g. single-substream frame where
     /// `b_size_present == 0`).
     pub last_substream: Option<asf::Ac4SubstreamInfo>,
-    /// Per-channel overlap-add state (length = transform_length samples).
-    /// Keyed by channel index; resized on transform-length change.
-    overlap: Vec<Vec<f32>>,
-    /// Transform length of the previous frame (for overlap sizing).
-    prev_transform_length: u32,
+    /// Per-channel block-switching overlap-add state (§5.5.2.2
+    /// Pseudocodes 63/64), keyed by channel slot. Persists across
+    /// transform-length changes — transitions are handled by
+    /// asymmetric windows, not by dropping history.
+    ola: Vec<mdct::BlockSwitchOla>,
+    /// Current frame length in samples (the §5.5.3 full-block grid the
+    /// per-block OLA centres partial blocks in). Set at the top of
+    /// `receive_frame`; 0 until the first frame.
+    cur_frame_samples: usize,
     /// Per-channel A-SPX persistent state — noise generator
     /// `noise_idx_prev` (§5.7.6.4.3 Pseudocode 103), tone generator
     /// `sine_idx_prev` (§5.7.6.4.4 Pseudocode 105), and the
@@ -145,6 +149,23 @@ struct StereoCpeChannelInput<'a> {
     tna_mode: Option<&'a [u8]>,
 }
 
+
+/// Synthesis-war corpus dump: AC4_DUMP_ROLE=<dir> writes committed
+/// (dispatch-level) dequantised spectra tagged frame/role — the mass
+/// law-regression corpus. Scan/resync parses never reach dispatch, so
+/// this is free of candidate noise. Frame index from DUMP_FRAME_IDX,
+/// bumped once per decoded frame.
+pub(crate) static DUMP_FRAME_IDX: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+pub(crate) fn dump_role_spec(role: &str, scaled: &[f32]) {
+    if let Some(dir) = std::env::var_os("AC4_DUMP_ROLE") {
+        let f = DUMP_FRAME_IDX.load(std::sync::atomic::Ordering::Relaxed);
+        let p = std::path::Path::new(&dir).join(format!("f{f:05}_{role}.f32"));
+        let bytes: Vec<u8> = scaled.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = std::fs::write(p, bytes);
+    }
+}
+
 impl Ac4Decoder {
     pub fn new(params: &CodecParameters) -> Self {
         Self {
@@ -155,8 +176,8 @@ impl Ac4Decoder {
             eof: false,
             last_info: None,
             last_substream: None,
-            overlap: Vec::new(),
-            prev_transform_length: 0,
+            ola: Vec::new(),
+            cur_frame_samples: 0,
             aspx_ext_state: Vec::new(),
             acpl_state: acpl_synth::AcplSubstreamState::new(),
             acpl_5x_pair_state: acpl_synth::Acpl5xPairPcmState::new(),
@@ -228,6 +249,10 @@ impl Ac4Decoder {
         compand_mode: aspx::CompandingMode,
         compand_sb0_override: Option<u32>,
     ) -> Vec<f32> {
+        // Synthesis-war kill switch: core PCM only, no HF extension.
+        if std::env::var_os("AC4_NO_ASPX").is_some() {
+            return pcm_in.to_vec();
+        }
         let extended = Self::aspx_extend_to_qmf(
             pcm_in,
             tables,
@@ -529,33 +554,69 @@ impl Ac4Decoder {
         out
     }
 
-    /// Run IMDCT + KBD overlap-add for a single channel, returning
-    /// floating-point PCM (suitable for the A-SPX QMF pipeline).
+    /// Run IMDCT + block-switching overlap-add (§5.5.2.2 Pseudocodes
+    /// 63/64) for a single channel, returning floating-point PCM
+    /// (suitable for the A-SPX QMF pipeline). Handles long↔short
+    /// transform transitions with the spec's asymmetric transition
+    /// windows; overlap history is never dropped on a length change.
     fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
-        // Transform-length change clears *all* channel overlap state so
-        // the next frame starts from a consistent history.
-        if self.prev_transform_length != n as u32 {
-            self.overlap.clear();
-            self.prev_transform_length = n as u32;
+        if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH imdct ch={} n={} energy={:.1}", ch, n, scaled.iter().map(|v| v*v).sum::<f32>()); }
+        // Synthesis-war: dump raw dequantised spectra for offline
+        // spectral-domain comparison against a reference forward MDCT.
+        if let Some(dir) = std::env::var_os("AC4_DUMP_SPEC") {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static SPEC_N: AtomicU32 = AtomicU32::new(0);
+            let k = SPEC_N.fetch_add(1, Ordering::Relaxed);
+            if k < 256 {
+                let p = std::path::Path::new(&dir).join(format!("spec{k:03}_ch{ch}_n{n}.f32"));
+                let bytes: Vec<u8> = scaled.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let _ = std::fs::write(p, bytes);
+            }
         }
-        while self.overlap.len() <= ch {
-            self.overlap.push(vec![0.0_f32; n]);
+        // The §5.5.3 full-block grid partial blocks are centred in:
+        // the frame length when this block subdivides it evenly,
+        // otherwise the block is its own grid (defensive — permitted
+        // block lengths always divide the frame length).
+        let n_full = if self.cur_frame_samples >= n && self.cur_frame_samples % n.max(1) == 0 {
+            self.cur_frame_samples
+        } else {
+            n
+        };
+        while self.ola.len() <= ch {
+            self.ola.push(mdct::BlockSwitchOla::new(n_full));
         }
-        if self.overlap[ch].len() != n {
-            self.overlap[ch] = vec![0.0_f32; n];
+        if self.ola[ch].n_full() != n_full {
+            // Frame geometry changed (sample-rate/frame-length
+            // reconfig) — a genuine stream discontinuity, so a state
+            // reset is correct here.
+            self.ola[ch] = mdct::BlockSwitchOla::new(n_full);
         }
         let mut x = vec![0.0_f32; n];
         let copy = scaled.len().min(n);
         x[..copy].copy_from_slice(&scaled[..copy]);
         let y = mdct::imdct(&x);
-        let window = mdct::kbd_window(n as u32);
-        mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
+        self.ola[ch].process_block(&y)
     }
 
     /// Convert an f32 PCM buffer to i16, clamping to the i16 range.
     fn pcm_f32_to_i16(pcm: &[f32]) -> Vec<i16> {
+        // Synthesis-war probe: AC4_OUT_GAIN_LOG2=<k> scales the f32 PCM
+        // by 2^k before the i16 conversion. The signed-SF dequant law
+        // leaves coded-band content ~2^58 below the sentinel bands (see
+        // riptide docs, two-wars section) — this knob lets the
+        // reference-correlation harness calibrate the missing global
+        // constant without touching the dequant path.
+        use std::sync::OnceLock;
+        static GAIN: OnceLock<f32> = OnceLock::new();
+        let g = *GAIN.get_or_init(|| {
+            std::env::var("AC4_OUT_GAIN_LOG2")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|k| 2.0_f32.powf(k))
+                .unwrap_or(1.0)
+        });
         pcm.iter()
-            .map(|&s| (s * 32767.0).clamp(-32768.0, 32767.0) as i16)
+            .map(|&s| (s * g * 32767.0).clamp(-32768.0, 32767.0) as i16)
             .collect()
     }
 
@@ -584,7 +645,7 @@ impl Ac4Decoder {
         ch: usize,
         data: &crate::ssf::SsfData,
         frame_samples: usize,
-    ) -> Vec<i16> {
+    ) -> Vec<f32> {
         // Drive the synth.
         let state_idx = ch.min(self.ssf_synth_state.len().saturating_sub(1));
         let mut spec_concat: Vec<f32> = Vec::new();
@@ -632,7 +693,59 @@ impl Ac4Decoder {
         } else if pcm_out.len() < frame_samples {
             pcm_out.resize(frame_samples, 0.0);
         }
-        Self::pcm_f32_to_i16(&pcm_out)
+        pcm_out
+    }
+
+    /// IMDCT a sequence of already-ungrouped per-window spectra
+    /// (`crate::mch::WindowSpectrum` — `(transform_length, spectrum)`,
+    /// one entry per physical window in window order) into a single
+    /// frame's PCM, advancing the channel's shared overlap-add state
+    /// window by window. Mirrors `run_ssf_channel`'s per-block
+    /// accumulation pattern — each window's IMDCT hop is `transform_length`
+    /// new samples, so concatenating every window's output in order
+    /// reconstructs the whole `frame_samples`-long frame.
+    fn imdct_grouped_channel_f32(
+        &mut self,
+        ch: usize,
+        windows: &[crate::mch::WindowSpectrum],
+        frame_samples: usize,
+    ) -> Vec<f32> {
+        let mut pcm_out: Vec<f32> = Vec::with_capacity(frame_samples);
+        for (tl, spec) in windows {
+            let pcm_block = self.imdct_channel_f32(ch, spec, *tl as usize);
+            pcm_out.extend_from_slice(&pcm_block);
+        }
+        if pcm_out.len() > frame_samples {
+            pcm_out.truncate(frame_samples);
+        } else if pcm_out.len() < frame_samples {
+            pcm_out.resize(frame_samples, 0.0);
+        }
+        pcm_out
+    }
+
+    /// IMDCT one channel's grouped/short-frame per-window spectra (if
+    /// present) straight into `pcm_per_channel[slot]`. No-op when
+    /// `windows` is `None` — the caller has typically already tried the
+    /// long-frame single-spectrum dispatch first, which is the only
+    /// other case that could have already populated this slot.
+    fn store_grouped_slot(
+        &mut self,
+        slot: usize,
+        windows: Option<&[crate::mch::WindowSpectrum]>,
+        samples: usize,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
+    ) {
+        let Some(windows) = windows else {
+            return;
+        };
+        if windows.is_empty() {
+            return;
+        }
+        let pcm_f = self.imdct_grouped_channel_f32(slot, windows, samples);
+        while pcm_per_channel.len() <= slot {
+            pcm_per_channel.push(None);
+        }
+        pcm_per_channel[slot] = Some(pcm_f.clone());
     }
 
     /// IMDCT a `MonoLfeData` payload's `scaled_spec` to PCM `f32` using
@@ -654,6 +767,20 @@ impl Ac4Decoder {
             return None;
         }
         Some(self.imdct_channel_f32(ch, scaled, n))
+    }
+
+    /// Grouped/short-frame counterpart of [`Self::imdct_mono_lfe_data_f32`]
+    /// — drives [`Self::imdct_grouped_channel_f32`] off `mono`'s
+    /// `scaled_spec_windows` instead of the long-frame-only `scaled_spec`.
+    /// Returns `None` when the grouped body wasn't decoded.
+    fn imdct_mono_lfe_data_grouped_f32(
+        &mut self,
+        mono: &crate::mch::MonoLfeData,
+        ch: usize,
+        frame_samples: usize,
+    ) -> Option<Vec<f32>> {
+        let windows = mono.scaled_spec_windows.as_ref()?;
+        Some(self.imdct_grouped_channel_f32(ch, windows, frame_samples))
     }
 
     /// §5.7.7.6.1 ASPX_ACPL_1 / ASPX_ACPL_2 5_X dispatch helper —
@@ -691,7 +818,7 @@ impl Ac4Decoder {
         centre_pcm: Option<&[f32]>,
         ls_pcm: Option<&[f32]>,
         rs_pcm: Option<&[f32]>,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let n = samples;
         // run_acpl_5x_pair_pcm requires every PCM input to be a multiple
@@ -756,11 +883,11 @@ impl Ac4Decoder {
             while pcm_per_channel.len() < 5 {
                 pcm_per_channel.push(None);
             }
-            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
-            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
-            pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
-            pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
-            pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
+            pcm_per_channel[0] = Some(out.left.clone());
+            pcm_per_channel[1] = Some(out.right.clone());
+            pcm_per_channel[2] = Some(out.centre.clone());
+            pcm_per_channel[3] = Some(out.left_surround.clone());
+            pcm_per_channel[4] = Some(out.right_surround.clone());
         }
     }
 
@@ -901,6 +1028,7 @@ impl Ac4Decoder {
                 self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
             }
             let state = &mut self.aspx_ext_state[*slot];
+            if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH aspx-phase1-A"); }
             let qres = Self::aspx_extend_to_qmf(
                 pcm_in,
                 &trailer.frequency_tables,
@@ -1014,6 +1142,7 @@ impl Ac4Decoder {
                 self.aspx_ext_state.push(aspx::AspxChannelExtState::new());
             }
             let state = &mut self.aspx_ext_state[input.ch_index];
+            if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH aspx-phase1-B"); }
             phase1[i].2 = Self::aspx_extend_to_qmf(
                 input.pcm_in,
                 tables,
@@ -1100,7 +1229,7 @@ impl Ac4Decoder {
         aspx_cfg: Option<aspx::AspxConfig>,
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
-        pcm_per_channel: &mut [Option<Vec<i16>>],
+        pcm_per_channel: &mut [Option<Vec<f32>>],
     ) {
         let synced = Self::five_x_synced_mode(companding);
         if let (Some(mode), Some(cfg)) = (synced, aspx_cfg) {
@@ -1129,10 +1258,10 @@ impl Ac4Decoder {
             let extended =
                 self.extend_5x_channels_with_sync_companding(&sync_entries, num_ts_in_ats, mode);
             for (slot, pcm) in extended {
-                pcm_per_channel[slot] = Some(Self::pcm_f32_to_i16(&pcm));
+                pcm_per_channel[slot] = Some(pcm.clone());
             }
             for (slot, pcm) in passthrough {
-                pcm_per_channel[slot] = Some(Self::pcm_f32_to_i16(pcm));
+                pcm_per_channel[slot] = Some(pcm.to_vec());
             }
             return;
         }
@@ -1156,9 +1285,9 @@ impl Ac4Decoder {
                         compand_mode,
                         None,
                     );
-                    Self::pcm_f32_to_i16(&extended)
+                    extended
                 }
-                _ => Self::pcm_f32_to_i16(&pcm_f),
+                _ => pcm_f,
             };
             pcm_per_channel[slot] = Some(pcm_i16);
         }
@@ -1201,7 +1330,7 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let Some(ti) = four.transform_info.as_ref() else {
             return;
@@ -1296,28 +1425,13 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
-        let Some(ti_a) = tcd_a.transform_info.as_ref() else {
-            return;
-        };
-        let n_a = ti_a.transform_length_0 as usize;
-        if n_a == 0 || n_a != samples {
-            return;
-        }
-        let Some(ti_b) = tcd_b.transform_info.as_ref() else {
-            return;
-        };
-        let n_b = ti_b.transform_length_0 as usize;
-        if n_b == 0 || n_b != samples {
-            return;
-        }
-        if tcd_a.scaled_spec_per_channel.len() < 2 || tcd_b.scaled_spec_per_channel.len() < 2 {
-            return;
-        }
-        // Slot map per Table 180 column 0:
-        //   2ch_mode == 0: [0,1] then [3,4] (L,R / Ls,Rs)
-        //   2ch_mode == 1: [0,3] then [1,4] (L,Ls / R,Rs)
+        // `tcd_a`/`tcd_b` are gated *independently* — real content can
+        // legitimately pair a grouped/short-frame half with a
+        // long-frame one (each is its own `sf_info(ASF, 0, 0)`), and a
+        // combined check would silently drop the matching half's
+        // perfectly good data whenever the other half didn't match.
         let slot_map_a: [usize; 2] = if b_2ch_mode { [0, 3] } else { [0, 1] };
         let slot_map_b: [usize; 2] = if b_2ch_mode { [1, 4] } else { [3, 4] };
         while pcm_per_channel.len() < 5 {
@@ -1332,27 +1446,47 @@ impl Ac4Decoder {
         //   slot 4 (Rs) -> aspx_ls_rs.secondary
         //   slot 2 (C)  -> aspx_centre.primary
         let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
-        for (ch_in, &slot) in slot_map_a.iter().enumerate() {
-            let Some(scaled) = tcd_a.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let n_a = tcd_a
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n| n != 0 && n == samples);
+        if let Some(n_a) = n_a {
+            if tcd_a.scaled_spec_per_channel.len() >= 2 {
+                let pair_a = Self::tcd_spectra_pair(tcd_a);
+                for (ch_in, &slot) in slot_map_a.iter().enumerate() {
+                    let Some(scaled) = pair_a[ch_in].as_ref() else {
+                        continue;
+                    };
+                    let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
+                    entries.push((
+                        slot,
+                        pcm_f,
+                        Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                    ));
+                }
+            }
         }
-        for (ch_in, &slot) in slot_map_b.iter().enumerate() {
-            let Some(scaled) = tcd_b.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let n_b = tcd_b
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n| n != 0 && n == samples);
+        if let Some(n_b) = n_b {
+            if tcd_b.scaled_spec_per_channel.len() >= 2 {
+                let pair_b = Self::tcd_spectra_pair(tcd_b);
+                for (ch_in, &slot) in slot_map_b.iter().enumerate() {
+                    let Some(scaled) = pair_b[ch_in].as_ref() else {
+                        continue;
+                    };
+                    let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
+                    entries.push((
+                        slot,
+                        pcm_f,
+                        Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                    ));
+                }
+            }
         }
         if let Some(mono) = centre_mono {
             if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(mono, 2, samples) {
@@ -1417,7 +1551,7 @@ impl Ac4Decoder {
         aspx_cfg: Option<aspx::AspxConfig>,
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
-    ) -> Vec<i16> {
+    ) -> Vec<f32> {
         let trailer_pair = Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre);
         match (aspx_cfg, trailer_pair) {
             (Some(cfg), Some((trailer, is_secondary))) => {
@@ -1439,9 +1573,9 @@ impl Ac4Decoder {
                     // ASPX_ACPL_1, so sb0 stays at aspx_xover_band.
                     None,
                 );
-                Self::pcm_f32_to_i16(&extended)
+                extended
             }
-            _ => Self::pcm_f32_to_i16(&pcm_f),
+            _ => pcm_f,
         }
     }
 
@@ -1455,8 +1589,14 @@ impl Ac4Decoder {
     ///     two_channel_data[0..2]   -> [3, 4]    (Ls, Rs)
     /// ```
     ///
-    /// No-op on transform-length / sample-count mismatch, or when a
-    /// per-channel scaled spectrum is absent.
+    /// No-op per half on transform-length / sample-count mismatch, or
+    /// when a per-channel scaled spectrum is absent. `three` and `tcd`
+    /// are gated *independently* — real content can legitimately pair a
+    /// grouped/short-frame `three_channel_data` with a long-frame
+    /// trailing `two_channel_data` (or vice versa), since each is its
+    /// own `sf_info(ASF, 0, 0)` with its own transform info. Gating both
+    /// halves on a single combined check would silently drop whichever
+    /// half *did* match `samples` whenever the other one didn't.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_5x_cfg1_simple_aspx(
         &mut self,
@@ -1469,52 +1609,85 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
-        let Some(ti3) = three.transform_info.as_ref() else {
-            return;
-        };
-        let n3 = ti3.transform_length_0 as usize;
-        if n3 == 0 || n3 != samples {
-            return;
-        }
-        let Some(ti2) = tcd.transform_info.as_ref() else {
-            return;
-        };
-        let n2 = ti2.transform_length_0 as usize;
-        if n2 == 0 || n2 != samples {
-            return;
-        }
-        if three.scaled_spec_per_channel.len() < 3 || tcd.scaled_spec_per_channel.len() < 2 {
-            return;
-        }
         while pcm_per_channel.len() < 5 {
             pcm_per_channel.push(None);
         }
-        const THREE_SLOTS: [usize; 3] = [0, 1, 2];
         let mut entries: Vec<FiveXChannelEntry<'_>> = Vec::with_capacity(5);
-        for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {
-            let Some(scaled) = three.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let three_ok = three
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n3| n3 != 0 && n3 == samples)
+            .is_some()
+            && three.scaled_spec_per_channel.len() >= 3;
+        if three_ok {
+            let n3 = samples;
+            const THREE_SLOTS: [usize; 3] = [0, 1, 2];
+            // Round 407l: apply the Table-178 matrix before synthesis
+            // when all three long spectra are present.
+            let mut matrixed: Option<Vec<Vec<f32>>> = None;
+            if let (Some(i0), Some(i1), Some(i2), Some(info)) = (
+                three.scaled_spec_per_channel[0].as_ref(),
+                three.scaled_spec_per_channel[1].as_ref(),
+                three.scaled_spec_per_channel[2].as_ref(),
+                three.info.as_ref(),
+            ) {
+                dump_role_spec("c1_3ch0", i0);
+                dump_role_spec("c1_3ch1", i1);
+                dump_role_spec("c1_3ch2", i2);
+                if std::env::var_os("AC4_SYNTH_TRACE").is_some() { eprintln!("SYNTH cfg1-3ch-matrix"); }
+            let mut sp = vec![i0.clone(), i1.clone(), i2.clone()];
+                if std::env::var_os("AC4_NO_SAP").is_none() {
+                    Self::apply_three_channel_matrix(&mut sp, info, n3 as u32);
+                }
+                matrixed = Some(sp);
+            }
+            for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {
+                let owned;
+                let scaled: &Vec<f32> = if let Some(m) = matrixed.as_ref() {
+                    &m[ch_in]
+                } else {
+                    let Some(sc) = three.scaled_spec_per_channel[ch_in].as_ref() else {
+                        continue;
+                    };
+                    owned = sc;
+                    owned
+                };
+                let pcm_f = self.imdct_channel_f32(slot, scaled, n3);
+                entries.push((
+                    slot,
+                    pcm_f,
+                    Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                ));
+            }
         }
-        const TWO_SLOTS: [usize; 2] = [3, 4];
-        for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
-            let Some(scaled) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
-                continue;
-            };
-            let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
-            entries.push((
-                slot,
-                pcm_f,
-                Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
-            ));
+        let tcd_ok = tcd
+            .transform_info
+            .as_ref()
+            .map(|ti| ti.transform_length_0 as usize)
+            .filter(|&n2| n2 != 0 && n2 == samples)
+            .is_some()
+            && tcd.scaled_spec_per_channel.len() >= 2;
+        if tcd_ok {
+            if let Some(Some(t0)) = tcd.scaled_spec_per_channel.get(0) { dump_role_spec("c1_tcd0", t0); }
+            if let Some(Some(t1)) = tcd.scaled_spec_per_channel.get(1) { dump_role_spec("c1_tcd1", t1); }
+            let n2 = samples;
+            // §5.3.3.2: bmsp=1 pairs get the per-band 2x2 unmix.
+            let pair = Self::tcd_spectra_pair(tcd);
+            const TWO_SLOTS: [usize; 2] = [3, 4];
+            for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
+                let Some(scaled) = pair[ch_in].as_ref() else {
+                    continue;
+                };
+                let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
+                entries.push((
+                    slot,
+                    pcm_f,
+                    Self::trailer_for_5x_slot(slot, aspx_lr, aspx_ls_rs, aspx_centre),
+                ));
+            }
         }
         self.extend_5x_entries(
             entries,
@@ -1525,17 +1698,174 @@ impl Ac4Decoder {
         );
     }
 
-    /// §5.3.4.3.1 / Table 180 — 5_X SIMPLE/ASPX `coding_config == 3`
-    /// dispatch. The body is a single `five_channel_data`; channel
-    /// mapping is the identity:
+    /// §5.3.3.3 / Table 178 — apply the three_channel_data transform
+    /// matrix in place. Round 407l: the table decomposes into two 2x2
+    /// butterflies (machine-verified against the spec text, 12/12):
     ///
-    /// ```text
-    ///     five_channel_data[0..5] -> [0, 1, 2, 3, 4] (L, R, C, Ls, Rs)
-    /// ```
+    ///   B0 = [a0 b0; c0 d0] applied to (I_p, I_q) giving (T_hi, T_lo)
+    ///   variant A: out[q] = T_lo;  B1(T_hi, I_u): out[p] = a1*T_hi
+    ///     + b1*I_u, out[u] = c1*T_hi + d1*I_u
+    ///   variant C: out[p] = T_hi;  B1(I_u, T_lo): out[u] = a1*I_u
+    ///     + b1*T_lo, out[q] = c1*I_u + d1*T_lo
     ///
-    /// No-op on transform-length / sample-count mismatch, or when a
-    /// per-channel scaled spectrum is absent.
-    #[allow(clippy::too_many_arguments)]
+    /// Per-band a/b/c/d come from Pseudocode 59 (sap_mode 0 identity;
+    /// 2 or 1-with-ms_used the M/S butterfly; 3 = full SAP, applied
+    /// as identity until alpha gains are wired).
+
+
+    /// Round 410b: produce the (possibly §5.3.3.2-unmixed) spectra pair
+    /// for a two_channel_data element. bmsp=1 pairs get the per-band
+    /// [[a,b],[c,d]] unmix; independent pairs pass through.
+    fn tcd_spectra_pair(
+        tcd: &crate::mch::TwoChannelData,
+    ) -> [Option<Vec<f32>>; 2] {
+        let raw0 = tcd.scaled_spec_per_channel.get(0).cloned().flatten();
+        let raw1 = tcd.scaled_spec_per_channel.get(1).cloned().flatten();
+        if tcd.b_enable_mdct_stereo_proc {
+            if let (Some(mut u0), Some(mut u1), Some(cp), Some(ti)) = (
+                raw0.clone(),
+                raw1.clone(),
+                tcd.chparam.as_ref(),
+                tcd.transform_info.as_ref(),
+            ) {
+                Self::apply_two_channel_matrix(&mut u0, &mut u1, cp, ti.transform_length_0);
+                return [Some(u0), Some(u1)];
+            }
+        }
+        [raw0, raw1]
+    }
+
+    /// §5.3.3.2 EXACT: per-band 2x2 unmix for a two_channel_data pair
+    /// coded with b_enable_mdct_stereo_proc == 1. O = [[a,b],[c,d]] * I
+    /// with quads from Pseudocode 59 (extract_sap_abcd).
+    fn apply_two_channel_matrix(
+        s0: &mut [f32],
+        s1: &mut [f32],
+        cp: &asf::ChparamInfo,
+        transform_length: u32,
+    ) {
+        let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+            return;
+        };
+        let num_sfb = (sfbo.len() - 1) as u32;
+        let qv = asf::extract_sap_abcd(cp, &[num_sfb]);
+        let n = s0.len().min(s1.len());
+        for sfb in 0..num_sfb as usize {
+            let lo = sfbo[sfb] as usize;
+            let hi = (sfbo[sfb + 1] as usize).min(n);
+            if lo >= hi {
+                break;
+            }
+            let (a, b, c, d) = qv.abcd[0].get(sfb).copied().unwrap_or((1.0, 0.0, 0.0, 1.0));
+            for k in lo..hi {
+                let i0 = s0[k];
+                let i1 = s1[k];
+                s0[k] = a * i0 + b * i1;
+                s1[k] = c * i0 + d * i1;
+            }
+        }
+    }
+
+    fn apply_three_channel_matrix(
+        specs: &mut [Vec<f32>],
+        info: &crate::mch::ThreeChannelInfo,
+        transform_length: u32,
+    ) {
+        // §5.3.3.3 EXACT: extract per-band (a,b,c,d) quads from the two
+        // chparam_info elements via Pseudocode 59 (extract_sap_abcd),
+        // compose the Table-178 3x3 for chel_matsel, apply per sfb.
+        // (Round 409: replaces the approximate butterfly LUT that
+        // amplified one output ~2^15 past its body and zeroed the
+        // siblings — the frame-0 python proof in riptide docs.)
+        if specs.len() < 3 {
+            return;
+        }
+        let ms = info.chel_matsel as usize;
+        if ms >= 12 {
+            return;
+        }
+        let Some(sfbo) = crate::sfb_offset::sfb_offset_48(transform_length) else {
+            return;
+        };
+        let num_sfb = (sfbo.len() - 1) as u32;
+        let q0v = asf::extract_sap_abcd(&info.chparam[0], &[num_sfb]);
+        let q1v = asf::extract_sap_abcd(&info.chparam[1], &[num_sfb]);
+        let n = specs.iter().map(|v| v.len()).min().unwrap_or(0);
+        if std::env::var_os("AC4_SYNTH_TRACE").is_some() {
+            let fmt = |q: &asf::SapCoeffs| -> String {
+                q.abcd[0]
+                    .iter()
+                    .take(20)
+                    .map(|&(a, b, _c, d)| {
+                        if (a, b, d) == (1.0, 0.0, 1.0) { 'I' }
+                        else if (a, b, d) == (1.0, 1.0, -1.0) { 'M' }
+                        else { 'A' }
+                    })
+                    .collect()
+            };
+            eprintln!(
+                "MTX3-exact matsel={ms} sap=({},{}) ms_used_len=({},{}) q0[{}] q1[{}]",
+                info.chparam[0].sap_mode,
+                info.chparam[1].sap_mode,
+                info.chparam[0].ms_used.first().map(|r| r.len()).unwrap_or(0),
+                info.chparam[1].ms_used.first().map(|r| r.len()).unwrap_or(0),
+                fmt(&q0v),
+                fmt(&q1v)
+            );
+        }
+        for sfb in 0..num_sfb as usize {
+            let lo = sfbo[sfb] as usize;
+            let hi = (sfbo[sfb + 1] as usize).min(n);
+            if lo >= hi {
+                break;
+            }
+            let (a0, b0, c0, d0) = q0v.abcd[0].get(sfb).copied().unwrap_or((1.0, 0.0, 0.0, 1.0));
+            let (a1, b1, c1, d1) = q1v.abcd[0].get(sfb).copied().unwrap_or((1.0, 0.0, 0.0, 1.0));
+            // Table 178, transcribed: rows of M per chel_matsel.
+            let m3: [[f32; 3]; 3] = match ms {
+                0 => [[a0*a1, b0*a1, b1], [c0, d0, 0.0], [a0*c1, b0*c1, d1]],
+                1 => [[d0, c0, 0.0], [b0*a1, a0*a1, b1], [b0*c1, a0*c1, d1]],
+                2 => [[a0*a1, b1, b0*a1], [a0*c1, d1, b0*c1], [c0, 0.0, d0]],
+                3 => [[a1, c0*b1, d0*b1], [0.0, a0, b0], [c1, c0*d1, d0*d1]],
+                4 => [[a0, 0.0, b0], [c0*b1, a1, d0*b1], [c0*d1, c1, d0*d1]],
+                5 => [[a1, d0*b1, c0*b1], [c1, d0*d1, c0*d1], [0.0, b0, a0]],
+                6 => [[d0*d1, c0*d1, c1], [b0, a0, 0.0], [d0*b1, c0*b1, a1]],
+                7 => [[a0, b0, 0.0], [c0*d1, d0*d1, c1], [c0*b1, d0*b1, a1]],
+                8 => [[d0*d1, c1, c0*d1], [d0*b1, a1, c0*b1], [b0, 0.0, a0]],
+                9 => [[d1, b0*c1, a0*c1], [0.0, d0, c0], [b1, b0*a1, a0*a1]],
+                10 => [[d0, 0.0, c0], [b0*c1, d1, a0*c1], [b0*a1, b1, a0*a1]],
+                _ => [[d1, a0*c1, b0*c1], [b1, a0*a1, b0*a1], [0.0, c0, d0]],
+            };
+            for k in lo..hi {
+                // AC4_MTX_ORDER=abc maps matrix inputs (I0,I1,I2) to
+                // parsed bodies (B_a,B_b,B_c). Frame-0 forensics: the
+                // clean body belongs at I1 (center passthrough) and
+                // the hot mid/side pair at I0/I2 — bitstream order is
+                // one rotation off the Table-178 input order.
+                use std::sync::OnceLock;
+                static ORD: OnceLock<[usize; 3]> = OnceLock::new();
+                let ord = *ORD.get_or_init(|| {
+                    std::env::var("AC4_MTX_ORDER")
+                        .ok()
+                        .and_then(|v| {
+                            let b: Vec<usize> = v
+                                .chars()
+                                .filter_map(|c| c.to_digit(10).map(|d| d as usize))
+                                .collect();
+                            (b.len() == 3 && b.iter().all(|&x| x < 3)).then(|| [b[0], b[1], b[2]])
+                        })
+                        .unwrap_or([0, 1, 2])
+                });
+                let i0 = specs[ord[0]][k];
+                let i1 = specs[ord[1]][k];
+                let i2 = specs[ord[2]][k];
+                specs[0][k] = m3[0][0] * i0 + m3[0][1] * i1 + m3[0][2] * i2;
+                specs[1][k] = m3[1][0] * i0 + m3[1][1] * i1 + m3[1][2] * i2;
+                specs[2][k] = m3[2][0] * i0 + m3[2][1] * i1 + m3[2][2] * i2;
+            }
+        }
+    }
+
     fn dispatch_5x_cfg3_simple_aspx(
         &mut self,
         five: &crate::mch::FiveChannelData,
@@ -1546,7 +1876,7 @@ impl Ac4Decoder {
         companding: Option<&aspx::CompandingControl>,
         num_ts_in_ats: u32,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let Some(ti) = five.transform_info.as_ref() else {
             return;
@@ -1624,7 +1954,7 @@ impl Ac4Decoder {
         partner_slots: [usize; 2],
         chparam: Option<&[asf::ChparamInfo; 2]>,
         samples: usize,
-        pcm_per_channel: &mut Vec<Option<Vec<i16>>>,
+        pcm_per_channel: &mut Vec<Option<Vec<f32>>>,
     ) {
         let Some(ti) = add.transform_info.as_ref() else {
             return;
@@ -1674,7 +2004,7 @@ impl Ac4Decoder {
                     Some(s) => s,
                     None => {
                         // SFB table missing — fall through to identity.
-                        let pcm = self.imdct_channel(pair_out_slots[ch_in], scaled_add, n);
+                        let pcm = self.imdct_channel_f32(pair_out_slots[ch_in], scaled_add, n);
                         pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm);
                         continue;
                     }
@@ -1709,15 +2039,15 @@ impl Ac4Decoder {
                     out_high[unmixed_lo..unmixed_hi]
                         .copy_from_slice(&partner[unmixed_lo..unmixed_hi]);
                 }
-                let pcm_high = self.imdct_channel(partner_slots[ch_in], &out_high, n);
+                let pcm_high = self.imdct_channel_f32(partner_slots[ch_in], &out_high, n);
                 pcm_per_channel[partner_slots[ch_in]] = Some(pcm_high);
-                let pcm_low = self.imdct_channel(pair_out_slots[ch_in], &out_low, n);
+                let pcm_low = self.imdct_channel_f32(pair_out_slots[ch_in], &out_low, n);
                 pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm_low);
             } else {
                 // Identity passthrough — only render the additional pair
                 // (slots 5/6). Partner slots untouched (their independent
                 // 5_X-core IMDCT runs separately).
-                let pcm = self.imdct_channel(pair_out_slots[ch_in], scaled_add, n);
+                let pcm = self.imdct_channel_f32(pair_out_slots[ch_in], scaled_add, n);
                 pcm_per_channel[pair_out_slots[ch_in]] = Some(pcm);
             }
         }
@@ -1791,21 +2121,37 @@ impl Decoder for Ac4Decoder {
                 info.frame_length
             }
         };
-        // Best-effort walk of the first substream. The exact byte offset
-        // of substream 0 is `toc_len + payload_base`, where `toc_len` is
-        // the length of the byte-aligned ac4_toc() element. We don't
-        // currently track `toc_len` out of [`toc::parse_ac4_toc`]; as a
-        // cheap approximation we try the first substream size if the
-        // substream_index_table exposed one, carving the tail of the
-        // packet. This is fine for single-substream frames (the
-        // overwhelmingly common case).
+        // Publish the frame grid for the per-block OLA (the §5.5.3
+        // full-block length partial blocks are centred in).
+        self.cur_frame_samples = samples as usize;
+        // Best-effort walk of our substream group's audio substream. The
+        // exact byte offset of substream 0 is `toc_len + payload_base`,
+        // where `toc_len` is the length of the byte-aligned ac4_toc()
+        // element. We don't currently track `toc_len` out of
+        // [`toc::parse_ac4_toc`]; as a cheap approximation we start from
+        // that offset and walk `substream_sizes` forward.
+        //
+        // Critically, on `b_substreams_present` frames the group's audio
+        // is *not* necessarily physical substream 0 — `ac4_substream_info_chan`
+        // / `ac4_substream_info_ajoc` each carry an explicit
+        // `substream_index` into `substream_index_table()`'s size list,
+        // and other physical substreams (e.g. a small companion
+        // substream) can legitimately sit before it. Skip forward by the
+        // sizes of every substream ahead of that index.
         let substream_try = {
-            // Substream 0 starts at toc_size + payload_base.
-            let start = (info.toc_size + info.payload_base) as usize;
-            let first_size = info.substream_sizes.first().copied();
+            let base = (info.toc_size + info.payload_base) as usize;
+            let idx = info.substream_index.unwrap_or(0) as usize;
+            let start = base
+                + info
+                    .substream_sizes
+                    .iter()
+                    .take(idx)
+                    .map(|&s| s as usize)
+                    .sum::<usize>();
+            let size = info.substream_sizes.get(idx).copied();
             if start >= raw.len() {
                 None
-            } else if let Some(sz) = first_size {
+            } else if let Some(sz) = size {
                 let sz = sz as usize;
                 let end = start.saturating_add(sz).min(raw.len());
                 if sz > 0 {
@@ -1826,6 +2172,7 @@ impl Decoder for Ac4Decoder {
         while self.ssf_walker_state.len() < channels as usize {
             self.ssf_walker_state.push(ssf::SsfChannelState::new());
         }
+        DUMP_FRAME_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.last_substream = substream_try.and_then(|sb| {
             let channels_u16 = channels;
             let b_iframe = info
@@ -1849,8 +2196,8 @@ impl Decoder for Ac4Decoder {
         // frame's channel count. Any channel without decoded spectra
         // stays silent. We detach the per-channel inputs from
         // `last_substream` up front so the IMDCT step can mutate
-        // `self.overlap` without a borrow conflict.
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![None; channels as usize];
+        // `self.ola` without a borrow conflict.
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![None; channels as usize];
         // Detach the inputs + the ASPX tables once so we can run IMDCT
         // (which mutates overlap state) and the ASPX extension without
         // a borrow conflict on self.
@@ -2388,8 +2735,8 @@ impl Decoder for Ac4Decoder {
                         pcm_per_channel.push(None);
                     }
                 }
-                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&ext_pri));
-                pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&ext_sec));
+                pcm_per_channel[0] = Some(ext_pri.clone());
+                pcm_per_channel[1] = Some(ext_sec.clone());
             }
         }
         if !use_stereo_cpe_synced {
@@ -2449,19 +2796,19 @@ impl Decoder for Ac4Decoder {
                                     )
                                 };
                                 if let Some((left, right)) = acpl1_result {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&left));
-                                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&right));
+                                    pcm_per_channel[0] = Some(left.clone());
+                                    pcm_per_channel[1] = Some(right.clone());
                                 } else {
-                                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                                    pcm_per_channel[0] = Some(extended.clone());
                                 }
                             } else {
-                                pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                                pcm_per_channel[0] = Some(extended.clone());
                             }
                         } else {
-                            pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&extended));
+                            pcm_per_channel[0] = Some(extended.clone());
                         }
                     } else {
-                        pcm_per_channel[0] = Some(self.imdct_channel(0, &scaled, n));
+                        pcm_per_channel[0] = Some(self.imdct_channel_f32(0, &scaled, n));
                     }
                 }
             }
@@ -2487,9 +2834,9 @@ impl Decoder for Ac4Decoder {
                                 compand_mode_sec,
                                 compand_sb0_override,
                             );
-                            pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&extended));
+                            pcm_per_channel[1] = Some(extended.clone());
                         } else {
-                            pcm_per_channel[1] = Some(self.imdct_channel(1, &scaled, n));
+                            pcm_per_channel[1] = Some(self.imdct_channel_f32(1, &scaled, n));
                         }
                     }
                 }
@@ -2562,11 +2909,11 @@ impl Decoder for Ac4Decoder {
                     while pcm_per_channel.len() < 5 {
                         pcm_per_channel.push(None);
                     }
-                    pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&out.left));
-                    pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&out.right));
-                    pcm_per_channel[2] = Some(Self::pcm_f32_to_i16(&out.centre));
-                    pcm_per_channel[3] = Some(Self::pcm_f32_to_i16(&out.left_surround));
-                    pcm_per_channel[4] = Some(Self::pcm_f32_to_i16(&out.right_surround));
+                    pcm_per_channel[0] = Some(out.left.clone());
+                    pcm_per_channel[1] = Some(out.right.clone());
+                    pcm_per_channel[2] = Some(out.centre.clone());
+                    pcm_per_channel[3] = Some(out.left_surround.clone());
+                    pcm_per_channel[4] = Some(out.right_surround.clone());
                 }
             }
         }
@@ -2709,8 +3056,8 @@ impl Decoder for Ac4Decoder {
                         while pcm_per_channel.len() < 2 {
                             pcm_per_channel.push(None);
                         }
-                        pcm_per_channel[0] = Some(Self::pcm_f32_to_i16(&l_pcm));
-                        pcm_per_channel[1] = Some(Self::pcm_f32_to_i16(&r_pcm));
+                        pcm_per_channel[0] = Some(l_pcm.clone());
+                        pcm_per_channel[1] = Some(r_pcm.clone());
                         let ls_pcm = self.imdct_channel_f32(3, ls_spec, n);
                         let rs_pcm = self.imdct_channel_f32(4, rs_spec, n);
                         (Some(ls_pcm), Some(rs_pcm))
@@ -2883,48 +3230,225 @@ impl Decoder for Ac4Decoder {
             }
         }
         // Round 91: 7_X SIMPLE/ASPX inner 5-channel core render (slots
-        // 0..4). The 7_X SIMPLE/Cfg3Five path inherits the inner
-        // `five_channel_data()` from the 5_X Table 29 layout (5 SCEs in
+        // 0..4). The 7_X SIMPLE/ASPX path inherits its inner channel
+        // bodies from the same 5_X Table 29 layouts (5/4/3+2/2+2 SCEs in
         // L/R/C/Ls/Rs order, identity SAP via 5x `chparam_info(sap_mode
         // = 0)`); the only difference from the 5_X dispatch is which
-        // walker populated `tools.five_channel_data` (7_X here, vs 5_X
-        // for the 5.0/5.1 paths). The 5_X dispatch fires the same
-        // IMDCT/KBD/overlap-add chain regardless of which walker
-        // populated the slot, so we route the 7_X-walker-produced
-        // five_channel_data through it. With identity SAP no joint-MDCT
-        // mixing happens at decode time so each output slot 0..4 reflects
-        // only its own input SCE. ASPX trailers for the 7_X path land in
-        // different `tools.*_aspx_*` slots (the 7_X walker has its own
-        // ASPX trailer plumbing — out of scope here); pass `None` for
-        // the trailer slots so the round-91 SIMPLE path reduces to
-        // low-band only. Cfg0/Cfg1/Cfg2 7_X variants need their own
-        // wiring (queued for follow-up rounds — they share the same
-        // 5_X core dispatchers, just with the 7_X-specific trailing
-        // `mono_data(0)` gate and ASPX trailer plumbing).
-        if seven_x_simple_aspx_active
-            && matches!(
-                self.last_substream
-                    .as_ref()
-                    .and_then(|sub| sub.tools.seven_x_coding_config),
-                Some(crate::mch::FiveXCodingConfig::Cfg3Five)
-            )
-        {
-            if let Some(five) = self
+        // walker populated `tools.five_channel_data`/`four_channel_data`/
+        // etc (7_X here, vs 5_X for the 5.0/5.1 paths). The 5_X
+        // dispatchers fire the same IMDCT/KBD/overlap-add chain
+        // regardless of which walker populated the slot, so we route the
+        // 7_X-walker-produced data through them directly — one dispatch
+        // call per `seven_x_coding_config` value, mirroring the 5_X
+        // match above. With identity SAP no joint-MDCT mixing happens at
+        // decode time so each output slot 0..4 reflects only its own
+        // input SCE. ASPX trailers for the 7_X path land in different
+        // `tools.*_aspx_*` slots (the 7_X walker has its own ASPX
+        // trailer plumbing — out of scope here); pass `None` for the
+        // trailer slots so every branch below reduces to low-band only.
+        //
+        // Round 398: Cfg0/Cfg1/Cfg2 were previously unwired here — only
+        // Cfg3Five fired — even though the walker had already parsed
+        // real, non-silent spectral data into `two_channel_data`/
+        // `three_channel_data`/`four_channel_data` for the other three
+        // configs. That data was silently discarded: the whole L/R/C/
+        // Ls/Rs core came out as digital silence for every frame whose
+        // `seven_x_coding_config` wasn't `Cfg3Five` (confirmed against
+        // real content: 100% of `Cfg0`/`Cfg1`/`Cfg2` frames had a silent
+        // slot 0, vs the LFE channel — decoded independently of this
+        // gate — masking it as "some nonzero audio" at the whole-frame
+        // level).
+        if seven_x_simple_aspx_active {
+            match self
                 .last_substream
                 .as_ref()
-                .and_then(|sub| sub.tools.five_channel_data.clone())
+                .and_then(|sub| sub.tools.seven_x_coding_config)
             {
-                self.dispatch_5x_cfg3_simple_aspx(
-                    &five,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    num_ts_in_ats,
-                    samples as usize,
-                    &mut pcm_per_channel,
-                );
+                Some(crate::mch::FiveXCodingConfig::Cfg0Stereo2plusMono) => {
+                    if cfg_two_channel_data.len() >= 2 {
+                        let b_2ch = cfg_b_2ch_mode.unwrap_or(false);
+                        self.dispatch_5x_cfg0_simple_aspx(
+                            &cfg_two_channel_data[0],
+                            &cfg_two_channel_data[1],
+                            b_2ch,
+                            cfg0_centre_mono.as_ref(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                        // Round 399: grouped/short-frame fallback. The
+                        // dispatch above only handles the single
+                        // long-frame spectrum (a no-op on grouped
+                        // data); route each channel's per-window
+                        // grouped spectra (if any) through the generic
+                        // grouped IMDCT with the same Table 180 column-0
+                        // slot mapping.
+                        let slot_map_a: [usize; 2] = if b_2ch { [0, 3] } else { [0, 1] };
+                        let slot_map_b: [usize; 2] = if b_2ch { [1, 4] } else { [3, 4] };
+                        for (ch_in, &slot) in slot_map_a.iter().enumerate() {
+                            let windows = cfg_two_channel_data[0]
+                                .scaled_spec_windows_per_channel
+                                .get(ch_in)
+                                .and_then(|o| o.as_deref());
+                            self.store_grouped_slot(
+                                slot,
+                                windows,
+                                samples as usize,
+                                &mut pcm_per_channel,
+                            );
+                        }
+                        for (ch_in, &slot) in slot_map_b.iter().enumerate() {
+                            let windows = cfg_two_channel_data[1]
+                                .scaled_spec_windows_per_channel
+                                .get(ch_in)
+                                .and_then(|o| o.as_deref());
+                            self.store_grouped_slot(
+                                slot,
+                                windows,
+                                samples as usize,
+                                &mut pcm_per_channel,
+                            );
+                        }
+                        let centre_windows = cfg0_centre_mono
+                            .as_ref()
+                            .and_then(|m| m.scaled_spec_windows.as_deref());
+                        self.store_grouped_slot(
+                            2,
+                            centre_windows,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg1ThreeStereo) => {
+                    if let (Some(three), Some(tcd)) = (
+                        cfg_three_channel_data.as_ref(),
+                        cfg_two_channel_data.first(),
+                    ) {
+                        self.dispatch_5x_cfg1_simple_aspx(
+                            three,
+                            tcd,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                        // Round 399: grouped/short-frame fallback —
+                        // three_channel_data[0..3] -> slots [0,1,2],
+                        // two_channel_data[0][0..2] -> slots [3,4].
+                        const THREE_SLOTS: [usize; 3] = [0, 1, 2];
+                        for (ch_in, &slot) in THREE_SLOTS.iter().enumerate() {
+                            let windows = three
+                                .scaled_spec_windows_per_channel
+                                .get(ch_in)
+                                .and_then(|o| o.as_deref());
+                            self.store_grouped_slot(
+                                slot,
+                                windows,
+                                samples as usize,
+                                &mut pcm_per_channel,
+                            );
+                        }
+                        const TWO_SLOTS: [usize; 2] = [3, 4];
+                        for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
+                            let windows = tcd
+                                .scaled_spec_windows_per_channel
+                                .get(ch_in)
+                                .and_then(|o| o.as_deref());
+                            self.store_grouped_slot(
+                                slot,
+                                windows,
+                                samples as usize,
+                                &mut pcm_per_channel,
+                            );
+                        }
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg2FourMono) => {
+                    if let Some(four) = cfg2_four_channel_data.as_ref() {
+                        self.dispatch_5x_cfg2_simple_aspx(
+                            four,
+                            cfg2_back_mono.as_ref(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                        // Round 399: grouped/short-frame fallback —
+                        // four_channel_data[0..4] -> slots [0,1,3,4]
+                        // per Table 180 cfg2, cfg2_back_mono -> slot 2.
+                        const SLOT_MAP: [usize; 4] = [0, 1, 3, 4];
+                        for (ch_in, &slot) in SLOT_MAP.iter().enumerate() {
+                            let windows = four
+                                .scaled_spec_windows_per_channel
+                                .get(ch_in)
+                                .and_then(|o| o.as_deref());
+                            self.store_grouped_slot(
+                                slot,
+                                windows,
+                                samples as usize,
+                                &mut pcm_per_channel,
+                            );
+                        }
+                        let centre_windows = cfg2_back_mono
+                            .as_ref()
+                            .and_then(|m| m.scaled_spec_windows.as_deref());
+                        self.store_grouped_slot(
+                            2,
+                            centre_windows,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                    }
+                }
+                Some(crate::mch::FiveXCodingConfig::Cfg3Five) => {
+                    if let Some(five) = self
+                        .last_substream
+                        .as_ref()
+                        .and_then(|sub| sub.tools.five_channel_data.clone())
+                    {
+                        self.dispatch_5x_cfg3_simple_aspx(
+                            &five,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            num_ts_in_ats,
+                            samples as usize,
+                            &mut pcm_per_channel,
+                        );
+                        // Round 399: grouped/short-frame fallback —
+                        // five_channel_data[0..5] -> slots [0..5]
+                        // (identity per Table 180 cfg3).
+                        for slot in 0..5 {
+                            let windows = five
+                                .scaled_spec_windows_per_channel
+                                .get(slot)
+                                .and_then(|o| o.as_deref());
+                            self.store_grouped_slot(
+                                slot,
+                                windows,
+                                samples as usize,
+                                &mut pcm_per_channel,
+                            );
+                        }
+                    }
+                }
+                None | Some(crate::mch::FiveXCodingConfig::AcplLite2) => {}
             }
         }
         // Round 39 / 40: §5.3.4.4.1 / Table 182 + Table 183 — 7_X
@@ -2949,6 +3473,8 @@ impl Decoder for Ac4Decoder {
         // branch is gated on the SIMPLE/ASPX active-flag.
         if seven_x_simple_aspx_active {
             if let Some(add) = seven_x_additional_channel_data.as_ref() {
+                if let Some(Some(a0)) = add.scaled_spec_per_channel.get(0) { dump_role_spec("add0", a0); }
+                if let Some(Some(a1)) = add.scaled_spec_per_channel.get(1) { dump_role_spec("add1", a1); }
                 // Resolve partner spectra + slots based on the active
                 // 7_X coding_config. Per Table 183 row "3/4/0.x" (the
                 // standard 7.0/7.1 layout that our 7_X walker handles)
@@ -3032,11 +3558,12 @@ impl Decoder for Ac4Decoder {
                 .as_ref()
                 .and_then(|sub| sub.tools.lfe_mono_data.clone());
             if let Some(lfe) = lfe_mono.as_ref() {
+                if let Some(sc) = lfe.scaled_spec.as_ref() { dump_role_spec("lfe", sc); }
                 if let Some(pcm_f) = self.imdct_mono_lfe_data_f32(lfe, lfe_slot, samples as usize) {
                     while pcm_per_channel.len() <= lfe_slot {
                         pcm_per_channel.push(None);
                     }
-                    pcm_per_channel[lfe_slot] = Some(Self::pcm_f32_to_i16(&pcm_f));
+                    pcm_per_channel[lfe_slot] = Some(pcm_f.clone());
                 }
             }
         }
@@ -3045,25 +3572,61 @@ impl Decoder for Ac4Decoder {
         let any_decoded = pcm_per_channel.iter().any(|p| p.is_some());
         let data = if any_decoded {
             let mut buf = vec![0u8; byte_count];
-            // Channel fallback: if only channel 0 was decoded for a
-            // multi-channel stream (e.g. a stereo frame whose CPE body
-            // didn't parse), duplicate it across the remaining slots so
-            // the output is audible rather than one-sided.
-            let fallback = pcm_per_channel[0].clone();
+            // Round 410: pcm_per_channel carries f32 end-to-end; the
+            // ONLY i16 conversion (with the output gain) happens here.
+            // AC4_DUMP_PCMF32=<file> tees the interleaved f32 samples
+            // (pre-gain, pre-clip) for lossless QA / offline mastering.
+            let mut f32buf: Option<Vec<f32>> =
+                std::env::var_os("AC4_DUMP_PCMF32").map(|_| {
+                    Vec::with_capacity(samples as usize * channels as usize)
+                });
+            // Channel fallback: duplicate ch0 into empty slots ONLY for
+            // mono/stereo streams (a stereo frame whose CPE body didn't
+            // parse). For multichannel it sabotages front-muting and
+            // pollutes every silent slot with ch0's content (round 410c
+            // scorecard: 'muted' fronts showed 699/699 active).
+            let fallback = if channels <= 2 {
+                pcm_per_channel[0].clone()
+            } else {
+                None
+            };
+            let out_gain = {
+                use std::sync::OnceLock;
+                static G: OnceLock<f32> = OnceLock::new();
+                *G.get_or_init(|| {
+                    std::env::var("AC4_OUT_GAIN_LOG2")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .map(|k| 2.0_f32.powf(k))
+                        .unwrap_or(1.0)
+                })
+            };
             for i in 0..samples as usize {
                 for c in 0..channels as usize {
-                    let sample = pcm_per_channel
+                    let sample_f = pcm_per_channel
                         .get(c)
                         .and_then(|p| p.as_ref())
                         .or(fallback.as_ref())
                         .and_then(|p| p.get(i).copied())
-                        .unwrap_or(0);
+                        .unwrap_or(0.0);
+                    if let Some(fb) = f32buf.as_mut() {
+                        fb.push(sample_f);
+                    }
+                    let sample =
+                        (sample_f * out_gain * 32767.0).clamp(-32768.0, 32767.0) as i16;
                     let le = sample.to_le_bytes();
                     let off = (i * channels as usize + c) * 2;
                     if off + 1 < buf.len() {
                         buf[off] = le[0];
                         buf[off + 1] = le[1];
                     }
+                }
+            }
+            if let (Some(fb), Some(path)) = (f32buf, std::env::var_os("AC4_DUMP_PCMF32")) {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let bytes: Vec<u8> = fb.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = f.write_all(&bytes);
                 }
             }
             vec![buf]
@@ -3121,11 +3684,13 @@ mod tests {
         // b_multiplier bit, 0.
         bw.write_u32(0, 1);
         // emdf_info(): emdf_version=0 (2b), key_id=0 (3b),
-        // b_emdf_payloads_substream_info=0, emdf_reserved(): b_more=0.
+        // b_emdf_payloads_substream_info=0, emdf_reserved(): two 2-bit
+        // skip-byte-length codes, both 0 (no reserved bytes).
         bw.write_u32(0, 2);
         bw.write_u32(0, 3);
         bw.write_u32(0, 1);
-        bw.write_u32(0, 1);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
         // ac4_substream_info():
         //   channel_mode prefix '10' = stereo, fs_index==1 so
         //   b_sf_multiplier=0, b_bitrate_info=0, b_content_type=0,
@@ -3196,11 +3761,14 @@ mod tests {
         bw.write_u32(0, 3); // md_compat
         bw.write_u32(0, 1); // b_belongs_to_presentation_id
         bw.write_u32(0, 1); // frame_rate_multiply_info
-                            // emdf_info:
+                            // emdf_info: emdf_version=0, key_id=0,
+                            // b_emdf_payloads_substream_info=0,
+                            // emdf_reserved(): two 2-bit skip-byte-length codes, both 0.
         bw.write_u32(0, 2);
         bw.write_u32(0, 3);
         bw.write_u32(0, 1);
-        bw.write_u32(0, 1);
+        bw.write_u32(0, 2);
+        bw.write_u32(0, 2);
         // ac4_substream_info:
         bw.write_u32(0b0, 1); // channel_mode = 0 (mono) — prefix '0'
         bw.write_u32(0, 1); // b_sf_multiplier
@@ -3893,13 +4461,13 @@ mod tests {
         let n = 1_920usize;
         // Carrier PCM: low-amp alternating ±2000 to drive the QMF
         // analysis bank with finite energy.
-        let carrier_l: Vec<i16> = (0..n)
+        let carrier_l: Vec<f32> = (0..n)
             .map(|i| if i & 1 == 0 { 2_000_i16 } else { -2_000_i16 })
             .collect();
-        let carrier_r: Vec<i16> = (0..n)
+        let carrier_r: Vec<f32> = (0..n)
             .map(|i| if i & 1 == 0 { -1_500_i16 } else { 1_500_i16 })
             .collect();
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(3, 1, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(-2, 2, cfg.num_param_bands);
@@ -3953,13 +4521,13 @@ mod tests {
         let params = CodecParameters::audio(CodecId::new("ac4"));
         let mut dec = Ac4Decoder::new(&params);
         let n = 1_920usize;
-        let carrier_l: Vec<i16> = (0..n)
+        let carrier_l: Vec<f32> = (0..n)
             .map(|i| if i % 4 < 2 { 1_500_i16 } else { -1_500_i16 })
             .collect();
-        let carrier_r: Vec<i16> = (0..n)
+        let carrier_r: Vec<f32> = (0..n)
             .map(|i| if i % 4 < 2 { -1_200_i16 } else { 1_200_i16 })
             .collect();
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(2, 1, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(-3, 2, cfg.num_param_bands);
@@ -3994,9 +4562,9 @@ mod tests {
         let params = CodecParameters::audio(CodecId::new("ac4"));
         let mut dec = Ac4Decoder::new(&params);
         let n = 1_920usize;
-        let carrier_l: Vec<i16> = (0..n).map(|i| (i % 200) as i16 * 30).collect();
-        let carrier_r: Vec<i16> = (0..n).map(|i| ((i + 50) % 200) as i16 * 30).collect();
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let carrier_l: Vec<f32> = (0..n).map(|i| (i % 200) as i16 * 30).collect();
+        let carrier_r: Vec<f32> = (0..n).map(|i| ((i + 50) % 200) as i16 * 30).collect();
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(2, 1, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(-3, 2, cfg.num_param_bands);
@@ -4144,7 +4712,7 @@ mod tests {
         let n = 1_920usize;
         let carrier_l: Vec<i16> = vec![0; n];
         let carrier_r: Vec<i16> = vec![0; n];
-        let mut pcm_per_channel: Vec<Option<Vec<i16>>> = vec![Some(carrier_l), Some(carrier_r)];
+        let mut pcm_per_channel: Vec<Option<Vec<f32>>> = vec![Some(carrier_l), Some(carrier_r)];
         let cfg = dispatch_stub_cfg(12);
         let data_1 = dispatch_stub_data_1ch(0, 0, cfg.num_param_bands);
         let data_2 = dispatch_stub_data_1ch(0, 0, cfg.num_param_bands);
@@ -4232,6 +4800,7 @@ mod tests {
             transform_info: None,
             psy_info: None,
             scaled_spec: None,
+            scaled_spec_windows: None,
         };
         assert!(dec.imdct_mono_lfe_data_f32(&mono, 2, 1_920).is_none());
     }
@@ -4257,6 +4826,7 @@ mod tests {
             // buffer of zeros (modulo the windowed overlap-add IIR
             // ringing, which starts from zero history).
             scaled_spec: Some(vec![0.0_f32; 1_920]),
+            scaled_spec_windows: None,
         };
         let pcm = dec.imdct_mono_lfe_data_f32(&mono, 2, 1_920).unwrap();
         assert_eq!(pcm.len(), 1_920);
@@ -4296,6 +4866,7 @@ mod tests {
                 Some(mk_ramp(0.30)),
                 Some(mk_ramp(0.40)),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let back_mono = crate::mch::MonoLfeData {
             b_lfe: false,
@@ -4303,6 +4874,7 @@ mod tests {
             transform_info: Some(ti),
             psy_info: None,
             scaled_spec: Some(mk_ramp(0.50)),
+            scaled_spec_windows: None,
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         // No ASPX trailers (low-band only) — equivalent to round-38
@@ -4357,6 +4929,7 @@ mod tests {
                 Some(vec![0.3_f32; 1_024]),
                 Some(vec![0.4_f32; 1_024]),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         // Request a different sample count.
@@ -4409,6 +4982,7 @@ mod tests {
                 Some(mk_tone(900.0, 0.30)),
                 Some(mk_tone(1100.0, 0.40)),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let back_mono = crate::mch::MonoLfeData {
             b_lfe: false,
@@ -4416,6 +4990,7 @@ mod tests {
             transform_info: Some(ti),
             psy_info: None,
             scaled_spec: Some(mk_tone(1300.0, 0.50)),
+            scaled_spec_windows: None,
         };
         // Round-38 path: no trailers -> low-band PCM only.
         let params = CodecParameters::audio(CodecId::new("ac4"));
@@ -4549,16 +5124,24 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let tcd_a = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_ramp(0.10)), Some(mk_ramp(0.20))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd_b = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_ramp(0.30)), Some(mk_ramp(0.40))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let centre = crate::mch::MonoLfeData {
             b_lfe: false,
@@ -4566,6 +5149,7 @@ mod tests {
             transform_info: Some(ti),
             psy_info: None,
             scaled_spec: Some(mk_ramp(0.50)),
+            scaled_spec_windows: None,
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         dec.dispatch_5x_cfg0_simple_aspx(
@@ -4608,16 +5192,24 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let tcd_a = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_ramp(0.10)), Some(mk_ramp(0.20))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd_b = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_ramp(0.30)), Some(mk_ramp(0.40))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         // No centre — slot 2 stays None.
@@ -4661,12 +5253,17 @@ mod tests {
                 Some(mk_ramp(0.20)),
                 Some(mk_ramp(0.30)),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_ramp(0.40)), Some(mk_ramp(0.50))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         dec.dispatch_5x_cfg1_simple_aspx(
@@ -4708,6 +5305,7 @@ mod tests {
                 Some(mk_ramp(0.40)),
                 Some(mk_ramp(0.50)),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         dec.dispatch_5x_cfg3_simple_aspx(&five, None, None, None, None, None, 1, n, &mut pcm);
@@ -4736,10 +5334,14 @@ mod tests {
         };
         // cfg0
         let tcd = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti_short),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(vec![0.1; 1_024]), Some(vec![0.2; 1_024])],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         dec.dispatch_5x_cfg0_simple_aspx(
@@ -4756,6 +5358,7 @@ mod tests {
                 Some(vec![0.2; 1_024]),
                 Some(vec![0.3; 1_024]),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         dec.dispatch_5x_cfg1_simple_aspx(
@@ -4774,6 +5377,7 @@ mod tests {
                 Some(vec![0.4; 1_024]),
                 Some(vec![0.5; 1_024]),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         dec.dispatch_5x_cfg3_simple_aspx(&five, None, None, None, None, None, 1, 1_920, &mut pcm);
@@ -4855,16 +5459,24 @@ mod tests {
 
         // ===== cfg0 =====
         let tcd_a = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_tone(500.0, 0.10)), Some(mk_tone(700.0, 0.20))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd_b = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_tone(900.0, 0.30)), Some(mk_tone(1100.0, 0.40))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let centre = crate::mch::MonoLfeData {
             b_lfe: false,
@@ -4872,6 +5484,7 @@ mod tests {
             transform_info: Some(ti),
             psy_info: None,
             scaled_spec: Some(mk_tone(1300.0, 0.50)),
+            scaled_spec_windows: None,
         };
         let mut dec_lb = Ac4Decoder::new(&params);
         let mut pcm_lb: Vec<Option<Vec<i16>>> = vec![None; 5];
@@ -4928,12 +5541,17 @@ mod tests {
                 Some(mk_tone(700.0, 0.20)),
                 Some(mk_tone(900.0, 0.30)),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let tcd = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_tone(1100.0, 0.40)), Some(mk_tone(1300.0, 0.50))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut dec_lb = Ac4Decoder::new(&params);
         let mut pcm_lb: Vec<Option<Vec<i16>>> = vec![None; 5];
@@ -4988,6 +5606,7 @@ mod tests {
                 Some(mk_tone(1100.0, 0.40)),
                 Some(mk_tone(1300.0, 0.50)),
             ],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut dec_lb = Ac4Decoder::new(&params);
         let mut pcm_lb: Vec<Option<Vec<i16>>> = vec![None; 5];
@@ -5200,10 +5819,14 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let add = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_ramp(0.30)), Some(mk_ramp(0.40))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 5];
         dec.dispatch_7x_additional_channel_pair(&add, None, [3, 4], None, n, &mut pcm);
@@ -5235,10 +5858,14 @@ mod tests {
             transform_length_1: 1_024,
         };
         let add = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(vec![0.1; 1_024]), Some(vec![0.2; 1_024])],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let mut pcm: Vec<Option<Vec<i16>>> = vec![None; 7];
         dec.dispatch_7x_additional_channel_pair(&add, None, [3, 4], None, 1_920, &mut pcm);
@@ -5271,10 +5898,14 @@ mod tests {
         };
         let mk_ramp = |bias: f32| -> Vec<f32> { (0..n).map(|i| bias + 1e-3 * i as f32).collect() };
         let add = crate::mch::TwoChannelData {
+                        b_enable_mdct_stereo_proc: true,
+                        transform_info_1: None,
+                        psy_info_1: None,
             transform_info: Some(ti),
             psy_info: None,
             chparam: None,
             scaled_spec_per_channel: vec![Some(mk_ramp(0.30)), Some(mk_ramp(0.40))],
+            scaled_spec_windows_per_channel: Vec::new(),
         };
         let partner_d = mk_ramp(0.10);
         let partner_e = mk_ramp(0.20);

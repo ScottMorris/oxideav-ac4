@@ -31,6 +31,23 @@ use crate::huffman::{
 };
 use crate::tables::num_sfb_48;
 
+
+/// Synthesis-war calibration: AC4_SF_GAIN_BITS=<k> adds k to the log2
+/// scale-factor gain exponent of every CODED band (reference-measured
+/// at ~+57.7 on frame 0 post-matrix vs the E-AC-3 decode of the same
+/// master; see riptide docs two-wars section). Sentinel / no-sf bands
+/// keep gain 1.0 and fall away relatively — they are not real audio.
+pub(crate) fn sf_gain_bits() -> f32 {
+    use std::sync::OnceLock;
+    static K: OnceLock<f32> = OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("AC4_SF_GAIN_BITS")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(0.0)
+    })
+}
+
 /// Decoded section information for one window group.
 #[derive(Debug, Default, Clone)]
 pub struct AsfSections {
@@ -56,17 +73,52 @@ pub struct AsfSections {
 /// 103) that drives `n_sect_bits`. `transform_length` is the resolved
 /// length used for the `num_sfb_48` cap. `max_sfb` is the group's
 /// per-group max scale factor band.
+/// Section-length field width per Table 39: `n_sect_bits = 3` iff
+/// `get_transf_length(g) <= 2`, i.e. the block is a partial block with
+/// transform-length code 0..2; code 3 (1024/960/768) and long frames
+/// (code 4) use 5 bits. In the 44.1/48 kHz family the code<=2 sizes are
+/// all < 768 samples and the code-3/long sizes all >= 768, so the
+/// resolved transform length decides this unambiguously — unlike the
+/// `transf_length[]` field, which the transform-info parser leaves at 0
+/// for long frames (round 403 root cause: long frames read 3-bit
+/// section lengths and desynced every non-silent frame's sf_data). The
+/// 96/192 kHz families double/quadruple these sizes; HSF is not wired
+/// yet, so the 768 threshold is 48 kHz-family only.
+///
+/// Returns `(n_sect_bits, sect_esc_val)`.
+pub fn sect_len_bits(transform_length: u32) -> (u32, u32) {
+    if transform_length < 768 {
+        (3, 7)
+    } else {
+        (5, 31)
+    }
+}
+
 pub fn parse_asf_section_data(
     br: &mut BitReader<'_>,
     transf_length_idx: u32,
     transform_length: u32,
     max_sfb: u32,
 ) -> Result<AsfSections> {
-    let (n_sect_bits, sect_esc_val) = if transf_length_idx <= 2 {
-        (3u32, 7u32)
-    } else {
-        (5u32, 31u32)
-    };
+    parse_asf_section_data_ext(br, transf_length_idx, transform_length, max_sfb, false)
+}
+
+/// Like [`parse_asf_section_data`] but with an explicit `no_trunc`
+/// switch: when set, a section's stored `sect_end` is NOT saturated at
+/// `max_sfb`. The 7_X additional-channel `two_channel_data` bodies
+/// follow this untruncated grammar (round 406: proven by exact-end
+/// backchaining on real content — body0 carries a single section
+/// spanning well past its scalefac bound, and spectral data follows
+/// the section, not max_sfb), while LFE and the core channel elements
+/// need the saturating behavior.
+pub fn parse_asf_section_data_ext(
+    br: &mut BitReader<'_>,
+    _transf_length_idx: u32,
+    transform_length: u32,
+    max_sfb: u32,
+    no_trunc: bool,
+) -> Result<AsfSections> {
+    let (n_sect_bits, sect_esc_val) = sect_len_bits(transform_length);
     let num_sfb = num_sfb_48(transform_length)
         .ok_or_else(|| Error::invalid("ac4: asf_section_data: unsupported transform_length"))?;
 
@@ -114,7 +166,13 @@ pub fn parse_asf_section_data(
             k += sect_len;
             continue;
         }
-        if sect_end > max_sfb {
+        // Production behavior: a section's stored end saturates at
+        // max_sfb (encoders emit saturated length codes; validated by
+        // exact element chaining on real content — LFE + 3ch bodies).
+        // AC4_SECT_NO_TRUNC=1 lifts this for the offline debug_scan_*
+        // harnesses, which probe the alternate grammar some elements
+        // (the additional-2ch bodies) appear to use.
+        if sect_end > max_sfb && !no_trunc && std::env::var_os("AC4_SECT_NO_TRUNC").is_none() {
             sect_end = max_sfb;
         }
         out.sect_cb.push(sect_cb);
@@ -146,9 +204,25 @@ pub fn parse_asf_spectral_data(
     sfb_offset: &[u16],
     max_sfb: u32,
 ) -> Result<(Vec<i32>, Vec<u32>)> {
-    let end_bin = sfb_offset[max_sfb as usize] as usize;
+    // Sections may legitimately extend past max_sfb (the last section's
+    // sect_len is written as-is and, per Table 39's straddle handling,
+    // can run to num_sfb). Spectral data, max_quant_idx, scalefactors
+    // and SNF all follow the SECTIONS' extent, not max_sfb — sizing by
+    // max_sfb silently dropped the extended bands' scalefactor
+    // codewords and desynced everything after the body (round 406,
+    // found via a 51-bit deficit against a trailer-validated boundary
+    // on real content).
+    let sect_extent = sections
+        .sect_end
+        .iter()
+        .map(|&e| e as usize)
+        .max()
+        .unwrap_or(max_sfb as usize)
+        .max(max_sfb as usize)
+        .min(sfb_offset.len().saturating_sub(1));
+    let end_bin = sfb_offset[sect_extent] as usize;
     let mut quant_spec = vec![0i32; end_bin];
-    let mut max_quant_idx = vec![0u32; max_sfb as usize];
+    let mut max_quant_idx = vec![0u32; sect_extent];
     for i in 0..sections.num_sec_lsf as usize {
         let cb = sections.sect_cb[i] as u32;
         if cb == 0 || cb > 11 {
@@ -158,26 +232,36 @@ pub fn parse_asf_spectral_data(
             asf_hcb(cb).ok_or_else(|| Error::invalid("ac4: asf_spectral_data: bad codebook"))?;
         let dim = CB_DIM[cb as usize];
         let unsig = UNSIGNED_CB[cb as usize];
-        let sect_start_line = sfb_offset[sections.sect_start[i] as usize] as usize;
-        let sect_end_line = sfb_offset[sections.sect_end[i] as usize] as usize;
+        let sect_start_line =
+            sfb_offset[(sections.sect_start[i] as usize).min(sect_extent)] as usize;
+        let sect_end_line =
+            sfb_offset[(sections.sect_end[i] as usize).min(sect_extent)] as usize;
         let mut k = sect_start_line;
         let mut tmp = [0i32; 4];
         while k < sect_end_line {
             let cb_idx = huff_decode(br, hcb.len, hcb.cw)?;
             split_qspec(hcb, cb_idx, &mut tmp);
             let step = dim as usize;
-            for t in 0..step {
-                let mut q = tmp[t];
-                if unsig && q != 0 {
-                    let s = br.read_u32(1)?;
-                    if s == 1 {
-                        q = -q;
+            // Table 40 bit order: the codeword is followed by *all* of
+            // its sign bits (one per non-zero line, in line order), and
+            // only then by the HCB11 extension codes (one per line with
+            // preliminary magnitude 16, in line order). Interleaving
+            // sign/ext per line desyncs whenever line 0 escapes and a
+            // later line is non-zero.
+            if unsig {
+                for q in tmp.iter_mut().take(step) {
+                    if *q != 0 {
+                        let s = br.read_u32(1)?;
+                        if s == 1 {
+                            *q = -*q;
+                        }
                     }
                 }
+            }
+            for t in 0..step {
+                let mut q = tmp[t];
                 if cb == 11 && q.unsigned_abs() == 16 {
                     let ext = ext_decode(br)?;
-                    // sign was already applied if unsigned; re-apply
-                    // sign via sign of q.
                     q = if q.is_negative() {
                         -(ext as i32)
                     } else {
@@ -191,8 +275,8 @@ pub fn parse_asf_spectral_data(
             k += step;
         }
     }
-    // Compute max_quant_idx per sfb.
-    for sfb in 0..max_sfb as usize {
+    // Compute max_quant_idx per sfb (over the sections' full extent).
+    for sfb in 0..sect_extent {
         let a = sfb_offset[sfb] as usize;
         let b = sfb_offset[sfb + 1] as usize;
         let mut m: u32 = 0;
@@ -235,9 +319,37 @@ pub fn parse_asf_scalefac_data(
             first_scf_found = true;
         }
         // sf_gain[sfb] = 2^((scale_factor - 100) / 4).
+        // AC4_SF_INVERT=1: experimental inverted semantics
+        // 2^((100 - sf)/4) — probing whether sf is a quantizer-step
+        // exponent (bigger = quieter); real streams carry sf up to
+        // ~246 for near-silent channels, which explodes under the
+        // spec-literal reading (round 407 experiment).
         let sf = scale_factor;
-        let exp = (sf as f32 - 100.0) * 0.25;
-        sf_gain[sfb] = 2.0_f32.powf(exp);
+        let exp = if std::env::var_os("AC4_SF_LEGACY_UNSIGNED").is_some() {
+            (sf as f32 - 100.0) * 0.25
+        } else if std::env::var_os("AC4_SF_INVERT").is_some() {
+            // Synthesis-war probe: inverted semantics — sf is a
+            // quantizer-step exponent (bigger = quieter). Frame-0
+            // evidence: near-silent LFE ref=246, loud bodies 70-134.
+            (100.0 - sf as f32) * 0.25
+        } else if std::env::var_os("AC4_SF_REL").is_some() {
+            // Synthesis-war probe: sf relative to the body's
+            // reference_scale_factor. Round 411b: clamp the relative
+            // exponent to +-10 bits (+-40 sf steps) — real chains stay
+            // within ~+-30 steps of ref; runaway DPCM in untruncated
+            // bodies otherwise reaches sf-ref ~ +50 (amps ~2e9, the
+            // add1 'blaster' class).
+            ((sf - reference_scale_factor as i32) as f32 * 0.25).clamp(-10.0, 10.0)
+        } else {
+            // Round 407: signed 8-bit scale factors (see the grouped
+            // variant above for the full story).
+            let s8 = ((sf + 128) & 0xFF) - 128;
+            (s8 as f32 - 100.0) * 0.25
+        };
+        sf_gain[sfb] = 2.0_f32.powf(exp + sf_gain_bits());
+        if std::env::var_os("AC4_DUMP_SF").is_some() {
+            eprintln!("SFDUMP ref={reference_scale_factor} sfb={sfb} sf={sf} cb={}", sections.sfb_cb.get(sfb).copied().unwrap_or(255));
+        }
     }
     Ok(sf_gain)
 }
@@ -397,8 +509,26 @@ pub fn parse_asf_scalefac_data_grouped(
                 first_scf_found = true;
             }
             let sf = scale_factor;
-            let exp = (sf as f32 - 100.0) * 0.25;
-            sf_gain[sfb] = 2.0_f32.powf(exp);
+            let exp = if std::env::var_os("AC4_SF_LEGACY_UNSIGNED").is_some() {
+                (sf as f32 - 100.0) * 0.25
+            } else if std::env::var_os("AC4_SF_INVERT").is_some() {
+                // Synthesis-war probe: inverted semantics — see the
+                // non-grouped variant.
+                (100.0 - sf as f32) * 0.25
+            } else if std::env::var_os("AC4_SF_REL").is_some() {
+                // Synthesis-war probe: see non-grouped variant
+                // (round 411b: same +-10-bit clamp).
+                ((sf - reference_scale_factor as i32) as f32 * 0.25).clamp(-10.0, 10.0)
+            } else {
+                // Round 407: scale factors are SIGNED 8-bit — real streams
+                // carry ref values like 246 (= -10) on near-silent
+                // channels, which read as 2^36.5 hot under the spec's
+                // literal unsigned formula (the root cause of the
+                // full-scale-noise output). Wrap into [-128, 127].
+                let s8 = ((sf + 128) & 0xFF) - 128;
+                (s8 as f32 - 100.0) * 0.25
+            };
+            sf_gain[sfb] = 2.0_f32.powf(exp + sf_gain_bits());
         }
         out.push(sf_gain);
     }
@@ -504,6 +634,10 @@ pub fn inject_snf_noise(
     max_sfb: u32,
     rng_state: &mut u32,
 ) {
+    // Synthesis-war kill switch: no noise fill.
+    if std::env::var_os("AC4_NO_SNF").is_some() {
+        return;
+    }
     for sfb in 0..max_sfb as usize {
         let idx = match snf_data.get(sfb) {
             Some(&v) if v > 0 => v as u32,

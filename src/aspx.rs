@@ -1564,6 +1564,146 @@ pub struct AspxHfgenIwc2Ch {
     pub tic_used_in_slot: [Vec<bool>; 2],
 }
 
+/// Table 194 `tab_border` — FIXFIX A-SPX time-slot-group borders.
+fn fixfix_tab_border(nats: u32, n: u32) -> Option<Vec<i32>> {
+    let b: &[i32] = match (nats, n) {
+        (6, 1) => &[0, 6],
+        (6, 2) => &[0, 3, 6],
+        (6, 4) => &[0, 2, 3, 4, 6],
+        (8, 1) => &[0, 8],
+        (8, 2) => &[0, 4, 8],
+        (8, 4) => &[0, 2, 4, 6, 8],
+        (12, 1) => &[0, 12],
+        (12, 2) => &[0, 6, 12],
+        (12, 4) => &[0, 3, 6, 9, 12],
+        (15, 1) => &[0, 15],
+        (15, 2) => &[0, 8, 15],
+        (15, 4) => &[0, 4, 8, 12, 15],
+        (16, 1) => &[0, 16],
+        (16, 2) => &[0, 8, 16],
+        (16, 4) => &[0, 4, 8, 12, 16],
+        _ => return None,
+    };
+    Some(b.to_vec())
+}
+
+/// §5.7.6.3.3.1 — derive the signal-envelope time-slot-group borders
+/// `atsg_sig` from a parsed framing. `previous_stop_pos` feeds the
+/// VARFIX/VARVAR non-I-frame left border (spec initialization:
+/// `num_aspx_timeslots`). The stored `rel_bord_*` raw fields map to
+/// slot offsets as `2*raw + 2`.
+pub fn derive_atsg_sig(
+    framing: &AspxFraming,
+    nats: u32,
+    b_iframe: bool,
+    previous_stop_pos: i32,
+) -> Option<Vec<i32>> {
+    let n = framing.num_env as usize;
+    match framing.int_class {
+        AspxIntClass::FixFix => fixfix_tab_border(nats, framing.num_env),
+        AspxIntClass::FixVar => {
+            let mut sig = vec![0i32; n + 1];
+            sig[0] = 0;
+            sig[n] = i32::from(framing.var_bord_right.unwrap_or(0)) + nats as i32;
+            for (tsg, &raw) in framing.rel_bord_right.iter().enumerate() {
+                if n >= tsg + 2 {
+                    sig[n - tsg - 1] = sig[n - tsg] - (2 * i32::from(raw) + 2);
+                }
+            }
+            Some(sig)
+        }
+        AspxIntClass::VarFix => {
+            let mut sig = vec![0i32; n + 1];
+            sig[0] = if b_iframe {
+                i32::from(framing.var_bord_left.unwrap_or(0))
+            } else {
+                previous_stop_pos - nats as i32
+            };
+            sig[n] = nats as i32;
+            for (tsg, &raw) in framing.rel_bord_left.iter().enumerate() {
+                if tsg + 1 < n + 1 {
+                    sig[tsg + 1] = sig[tsg] + (2 * i32::from(raw) + 2);
+                }
+            }
+            Some(sig)
+        }
+        AspxIntClass::VarVar => {
+            let mut sig = vec![0i32; n + 1];
+            sig[0] = if b_iframe {
+                i32::from(framing.var_bord_left.unwrap_or(0))
+            } else {
+                previous_stop_pos - nats as i32
+            };
+            for (tsg, &raw) in framing.rel_bord_left.iter().enumerate() {
+                if tsg + 1 < n + 1 {
+                    sig[tsg + 1] = sig[tsg] + (2 * i32::from(raw) + 2);
+                }
+            }
+            sig[n] = i32::from(framing.var_bord_right.unwrap_or(0)) + nats as i32;
+            for (tsg, &raw) in framing.rel_bord_right.iter().enumerate() {
+                if n >= tsg + 2 {
+                    sig[n - tsg - 1] = sig[n - tsg] - (2 * i32::from(raw) + 2);
+                }
+            }
+            Some(sig)
+        }
+    }
+}
+
+/// Pseudocode 77 — per-envelope frequency resolution. Round 407f: the
+/// parser previously defaulted every unsignalled envelope to HIGH
+/// resolution, over-reading ~3 codewords per short envelope in
+/// `aspx_freq_res_mode == 2` (duration-dependent) streams — the
+/// 31-bit I-frame trailer drift that corrupted the sticky xover
+/// slots. An envelope is HIGH only when it precedes the tsg pointer
+/// (nats > 8) or spans more than `nats/6 + 3.25` time slots.
+pub fn derive_freq_res_vec(
+    framing: &AspxFraming,
+    cfg: &AspxConfig,
+    nats: u32,
+    b_iframe: bool,
+    previous_stop_pos: i32,
+) -> Vec<bool> {
+    let n = framing.num_env as usize;
+    match cfg.freq_res_mode {
+        AspxFreqResMode::Signalled => {
+            // FIXFIX signals one value for all envelopes; the other
+            // classes signal per envelope. Fill missing with the last.
+            let mut v = framing.freq_res.clone();
+            let last = v.last().copied().unwrap_or(true);
+            v.resize(n, last);
+            v
+        }
+        AspxFreqResMode::Low => vec![false; n],
+        AspxFreqResMode::High => vec![true; n],
+        AspxFreqResMode::DurationDependent => {
+            // Gated until the remaining 2ch-trailer delta is found:
+            // with this derivation ON, the proven 1ch/final anchors
+            // still validate but no 2ch parse lands on the proven
+            // boundary 17574 yet — a second discrepancy hides in the
+            // 2ch path (candidate suspects: tsg_ptr off-by-one
+            // mapping, FIXVAR border arithmetic, or an hfgen/dirs
+            // detail). Enable with AC4_FRES_DERIVED=1 for the
+            // backchain experiments.
+            if std::env::var_os("AC4_FRES_DERIVED").is_none() {
+                return vec![true; n];
+            }
+            let Some(sig) = derive_atsg_sig(framing, nats, b_iframe, previous_stop_pos) else {
+                return vec![true; n];
+            };
+            let thresh = nats as f32 / 6.0 + 3.25;
+            // aspx_tsg_ptr is coded off-by-one: stored value 0 = "-1".
+            let ptr = framing.tsg_ptr.map(|p| i32::from(p) - 1).unwrap_or(-1);
+            (0..n)
+                .map(|atsg| {
+                    (atsg as i32) < ptr && nats > 8
+                        || (sig[atsg + 1] - sig[atsg]) as f32 > thresh
+                })
+                .collect()
+        }
+    }
+}
+
 /// Parse `aspx_hfgen_iwc_2ch(aspx_balance)` at the current bit-reader
 /// position per ETSI TS 103 190-1 Table 56 (§4.2.12.7).
 pub fn parse_aspx_hfgen_iwc_2ch(
@@ -1810,6 +1950,24 @@ pub struct AspxHuffEnv {
 ///
 /// `data_type`, `quant_mode`, `stereo_mode` drive `get_aspx_hcb()`
 /// selection.
+/// Round-407j: per-trailer F0 coding mode. Frame-0's fully-gated
+/// unique closure proves the first-envelope values of SOME trailers
+/// are fixed-width raw fields while others are Table-58 Huffman —
+/// the selector rule is unknown, so the trailer walker searches the
+/// per-trailer mode combination against the wall/slot gates and sets
+/// this flag around each parse. Not thread-isolated: the decoder is
+/// single-threaded per substream.
+static F0_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the F0 coding mode for subsequent `aspx_huff_data` parses.
+pub fn set_f0_raw_mode(raw: bool) {
+    F0_RAW_MODE.store(raw, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn f0_raw_mode() -> bool {
+    F0_RAW_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn parse_aspx_huff_data(
     br: &mut BitReader<'_>,
     data_type: AspxDataType,
@@ -1820,15 +1978,33 @@ pub fn parse_aspx_huff_data(
 ) -> Result<AspxHuffEnv> {
     let mut out = Vec::with_capacity(num_sbg as usize);
     if !direction {
-        // FREQ — F0 for index 0, DF for the rest.
-        let hcb_f0 = lookup_aspx_hcb(get_aspx_hcb(
-            data_type,
-            quant_mode,
-            stereo_mode,
-            AspxHcbType::F0,
-        ));
+        // FREQ — first value, then DF deltas.
+        //
+        // Round 407h: exhaustive backchaining on the pinned frame-0
+        // trailer pair proves the FIRST value is a FIXED-WIDTH RAW
+        // field on real content, not the Table-58 Huffman F0 read
+        // (no Huffman-F0 parametrization closes the anchors; raw-F0
+        // closes them unanimously). Widths are being pinned via a
+        // second I-frame anchor; until then the raw path is env-gated:
+        // AC4_F0_SIG_BITS / AC4_F0_NOISE_BITS.
         if num_sbg >= 1 {
-            out.push(hcb_f0.decode_delta(br)?);
+            let hcb_f0 = lookup_aspx_hcb(get_aspx_hcb(
+                data_type,
+                quant_mode,
+                stereo_mode,
+                AspxHcbType::F0,
+            ));
+            if f0_raw_mode() {
+                // Raw width = ceil(log2(alphabet)) of the F0 codebook.
+                let n = hcb_f0.len.len() as u32;
+                let mut w = 0u32;
+                while (1u32 << w) < n {
+                    w += 1;
+                }
+                out.push(br.read_u32(w)? as i32);
+            } else {
+                out.push(hcb_f0.decode_delta(br)?);
+            }
         }
         if num_sbg >= 2 {
             let hcb_df = lookup_aspx_hcb(get_aspx_hcb(
