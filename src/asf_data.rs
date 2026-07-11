@@ -334,9 +334,12 @@ pub fn parse_asf_scalefac_data(
             (100.0 - sf as f32) * 0.25
         } else if std::env::var_os("AC4_SF_REL").is_some() {
             // Synthesis-war probe: sf relative to the body's
-            // reference_scale_factor (per-body level comes from
-            // elsewhere — SAP gains / global normalization).
-            (sf - reference_scale_factor as i32) as f32 * 0.25
+            // reference_scale_factor. Round 411b: clamp the relative
+            // exponent to +-10 bits (+-40 sf steps) — real chains stay
+            // within ~+-30 steps of ref; runaway DPCM in untruncated
+            // bodies otherwise reaches sf-ref ~ +50 (amps ~2e9, the
+            // add1 'blaster' class).
+            ((sf - reference_scale_factor as i32) as f32 * 0.25).clamp(-10.0, 10.0)
         } else {
             // Round 407: signed 8-bit scale factors (see the grouped
             // variant above for the full story).
@@ -513,8 +516,9 @@ pub fn parse_asf_scalefac_data_grouped(
                 // non-grouped variant.
                 (100.0 - sf as f32) * 0.25
             } else if std::env::var_os("AC4_SF_REL").is_some() {
-                // Synthesis-war probe: see non-grouped variant.
-                (sf - reference_scale_factor as i32) as f32 * 0.25
+                // Synthesis-war probe: see non-grouped variant
+                // (round 411b: same +-10-bit clamp).
+                ((sf - reference_scale_factor as i32) as f32 * 0.25).clamp(-10.0, 10.0)
             } else {
                 // Round 407: scale factors are SIGNED 8-bit — real streams
                 // carry ref values like 246 (= -10) on near-silent
