@@ -2244,6 +2244,9 @@ fn resync_7x_front(
             }
         }
     }
+    if std::env::var_os("AC4_T").is_some() {
+        eprintln!("FRONT-CANDS n={} at gate {gate}", last2.len());
+    }
     for (s2, d2, sap) in &last2 {
         // Cfg1: three_channel_data ends at the 2ch start.
         for start in lo..*s2 as usize {
@@ -2253,7 +2256,19 @@ fn resync_7x_front(
                 continue;
             }
             if let Ok(d3) = parse_three_channel_data(&mut br, frame_len_base) {
-                if br.bit_position() == *s2 {
+                // Round 411: alias rejection. Real 3ch fronts on this
+                // content class carry m0 in the 40s-50s, legal matsel
+                // (<=11) and long single-group frames; bounded-Huffman
+                // aliases exact-ending on the gate read m0=0..24,
+                // matsel up to 15, ng up to 9 (220-frame survey) and
+                // fed garbage to the matrix on 14/17 recovered frames.
+                let sane3 = d3
+                    .psy_info
+                    .as_ref()
+                    .map(|p| p.max_sfb_0 >= 40 && p.num_window_groups == 1)
+                    .unwrap_or(false)
+                    && d3.info.as_ref().map(|i| i.chel_matsel <= 11).unwrap_or(false);
+                if sane3 && br.bit_position() == *s2 {
                     if let Some(ti) = d3.transform_info.as_ref() {
                         let tl = ti.transform_length_0;
                         *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
@@ -2269,7 +2284,12 @@ fn resync_7x_front(
                         tools.seven_x_add_chparam_info = Some(cps.clone());
                     }
                     if std::env::var_os("AC4_T").is_some() {
-                        eprintln!("FRONT-RESYNC cfg1: 3ch@{start} 2ch@{s2} gate@{gate}");
+                        let (m0, ms, ng) = (
+                            tools.three_channel_data.as_ref().and_then(|d| d.psy_info.as_ref()).map(|p| p.max_sfb_0).unwrap_or(0),
+                            tools.three_channel_data.as_ref().and_then(|d| d.info.as_ref()).map(|i| i.chel_matsel).unwrap_or(99),
+                            tools.three_channel_data.as_ref().and_then(|d| d.psy_info.as_ref()).map(|p| p.num_window_groups).unwrap_or(0),
+                        );
+                        eprintln!("FRONT-RESYNC cfg1: 3ch@{start} 2ch@{s2} gate@{gate} m0={m0} matsel={ms} ng={ng}");
                     }
                     return Some(FiveXCodingConfig::Cfg1ThreeStereo);
                 }
@@ -2321,7 +2341,12 @@ fn resync_7x_front(
                         && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
                         && gb.bit_position() == head - 1
                 });
-            if ok4 {
+            let sane4 = d4
+                .psy_info
+                .as_ref()
+                .map(|p| p.max_sfb_0 >= 40 && p.num_window_groups == 1)
+                .unwrap_or(false);
+            if ok4 && sane4 {
                 if let Some(ti) = d4.transform_info.as_ref() {
                     let tl = ti.transform_length_0;
                     *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
@@ -2347,7 +2372,12 @@ fn resync_7x_front(
                         && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
                         && gb.bit_position() == head - 1
                 });
-            if ok5 {
+            let sane5 = d5
+                .psy_info
+                .as_ref()
+                .map(|p| p.max_sfb_0 >= 40 && p.num_window_groups == 1)
+                .unwrap_or(false);
+            if ok5 && sane5 {
                 if let Some(ti) = d5.transform_info.as_ref() {
                     let tl = ti.transform_length_0;
                     *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
