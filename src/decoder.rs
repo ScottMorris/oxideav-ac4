@@ -1453,8 +1453,9 @@ impl Ac4Decoder {
             .filter(|&n| n != 0 && n == samples);
         if let Some(n_a) = n_a {
             if tcd_a.scaled_spec_per_channel.len() >= 2 {
+                let pair_a = Self::tcd_spectra_pair(tcd_a);
                 for (ch_in, &slot) in slot_map_a.iter().enumerate() {
-                    let Some(scaled) = tcd_a.scaled_spec_per_channel[ch_in].as_ref() else {
+                    let Some(scaled) = pair_a[ch_in].as_ref() else {
                         continue;
                     };
                     let pcm_f = self.imdct_channel_f32(slot, scaled, n_a);
@@ -1473,8 +1474,9 @@ impl Ac4Decoder {
             .filter(|&n| n != 0 && n == samples);
         if let Some(n_b) = n_b {
             if tcd_b.scaled_spec_per_channel.len() >= 2 {
+                let pair_b = Self::tcd_spectra_pair(tcd_b);
                 for (ch_in, &slot) in slot_map_b.iter().enumerate() {
-                    let Some(scaled) = tcd_b.scaled_spec_per_channel[ch_in].as_ref() else {
+                    let Some(scaled) = pair_b[ch_in].as_ref() else {
                         continue;
                     };
                     let pcm_f = self.imdct_channel_f32(slot, scaled, n_b);
@@ -1672,33 +1674,12 @@ impl Ac4Decoder {
             if let Some(Some(t0)) = tcd.scaled_spec_per_channel.get(0) { dump_role_spec("c1_tcd0", t0); }
             if let Some(Some(t1)) = tcd.scaled_spec_per_channel.get(1) { dump_role_spec("c1_tcd1", t1); }
             let n2 = samples;
-            // §5.3.3.2: bmsp=1 pairs need the per-band 2x2 unmix
-            // (Round 409 — was skipped; pair rode in prediction domain).
-            let mut unmixed: Option<[Vec<f32>; 2]> = None;
-            if tcd.b_enable_mdct_stereo_proc {
-                if let (Some(Some(t0)), Some(Some(t1)), Some(cp), Some(ti)) = (
-                    tcd.scaled_spec_per_channel.get(0),
-                    tcd.scaled_spec_per_channel.get(1),
-                    tcd.chparam.as_ref(),
-                    tcd.transform_info.as_ref(),
-                ) {
-                    let mut u0 = t0.clone();
-                    let mut u1 = t1.clone();
-                    Self::apply_two_channel_matrix(&mut u0, &mut u1, cp, ti.transform_length_0);
-                    unmixed = Some([u0, u1]);
-                }
-            }
+            // §5.3.3.2: bmsp=1 pairs get the per-band 2x2 unmix.
+            let pair = Self::tcd_spectra_pair(tcd);
             const TWO_SLOTS: [usize; 2] = [3, 4];
             for (ch_in, &slot) in TWO_SLOTS.iter().enumerate() {
-                let owned;
-                let scaled: &Vec<f32> = if let Some(u) = unmixed.as_ref() {
-                    &u[ch_in]
-                } else {
-                    let Some(sc) = tcd.scaled_spec_per_channel[ch_in].as_ref() else {
-                        continue;
-                    };
-                    owned = sc;
-                    owned
+                let Some(scaled) = pair[ch_in].as_ref() else {
+                    continue;
                 };
                 let pcm_f = self.imdct_channel_f32(slot, scaled, n2);
                 entries.push((
@@ -1730,6 +1711,29 @@ impl Ac4Decoder {
     /// Per-band a/b/c/d come from Pseudocode 59 (sap_mode 0 identity;
     /// 2 or 1-with-ms_used the M/S butterfly; 3 = full SAP, applied
     /// as identity until alpha gains are wired).
+
+
+    /// Round 410b: produce the (possibly §5.3.3.2-unmixed) spectra pair
+    /// for a two_channel_data element. bmsp=1 pairs get the per-band
+    /// [[a,b],[c,d]] unmix; independent pairs pass through.
+    fn tcd_spectra_pair(
+        tcd: &crate::mch::TwoChannelData,
+    ) -> [Option<Vec<f32>>; 2] {
+        let raw0 = tcd.scaled_spec_per_channel.get(0).cloned().flatten();
+        let raw1 = tcd.scaled_spec_per_channel.get(1).cloned().flatten();
+        if tcd.b_enable_mdct_stereo_proc {
+            if let (Some(mut u0), Some(mut u1), Some(cp), Some(ti)) = (
+                raw0.clone(),
+                raw1.clone(),
+                tcd.chparam.as_ref(),
+                tcd.transform_info.as_ref(),
+            ) {
+                Self::apply_two_channel_matrix(&mut u0, &mut u1, cp, ti.transform_length_0);
+                return [Some(u0), Some(u1)];
+            }
+        }
+        [raw0, raw1]
+    }
 
     /// §5.3.3.2 EXACT: per-band 2x2 unmix for a two_channel_data pair
     /// coded with b_enable_mdct_stereo_proc == 1. O = [[a,b],[c,d]] * I

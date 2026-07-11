@@ -2222,7 +2222,7 @@ fn resync_7x_front(
             let e = br.bit_position();
             if e == gate {
                 last2.push((start as u64, d2, None));
-            } else if e + 16 <= gate && e + 170 >= gate {
+            } else if e + 16 <= gate && e + 480 >= gate {
                 // sap=1 candidate: gap must parse as '1' + 2 chparams
                 // ending exactly at head-1.
                 if matches!(br.read_bit(), Ok(true)) {
@@ -2312,7 +2312,16 @@ fn resync_7x_front(
             continue;
         }
         if let Ok(d4) = parse_four_channel_data(&mut br, frame_len_base) {
-            if br.bit_position() == gate {
+            let e4 = br.bit_position();
+            let ok4 = e4 == gate
+                || (e4 + 16 <= gate && e4 + 480 >= gate && {
+                    let mut gb = br;
+                    matches!(gb.read_bit(), Ok(true))
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && gb.bit_position() == head - 1
+                });
+            if ok4 {
                 if let Some(ti) = d4.transform_info.as_ref() {
                     let tl = ti.transform_length_0;
                     *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
@@ -2329,7 +2338,16 @@ fn resync_7x_front(
             continue;
         }
         if let Ok(d5) = parse_five_channel_data(&mut br, frame_len_base) {
-            if br.bit_position() == gate {
+            let e5 = br.bit_position();
+            let ok5 = e5 == gate
+                || (e5 + 16 <= gate && e5 + 480 >= gate && {
+                    let mut gb = br;
+                    matches!(gb.read_bit(), Ok(true))
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && parse_chparam_info(&mut gb, &[ms_bands]).is_ok()
+                        && gb.bit_position() == head - 1
+                });
+            if ok5 {
                 if let Some(ti) = d5.transform_info.as_ref() {
                     let tl = ti.transform_length_0;
                     *largest_tl = Some(largest_tl.map_or(tl, |c| c.max(tl)));
@@ -2634,6 +2652,18 @@ pub fn parse_7x_audio_data_outer(
                     // 2-bit gate); chain backwards per coding_config
                     // shape and OVERWRITE the garbage front parses.
                     if std::env::var_os("AC4_NO_FRONT_RESYNC").is_none() {
+                        // Round 410c: the forward-walk front data on a
+                        // resynced frame is garbage by definition (the
+                        // walk desynced in the pre-cc region). Clear it
+                        // FIRST: if recovery fails the dispatch renders
+                        // silence for the front slots instead of noise
+                        // that OLA-smears into neighbouring frames.
+                        tools.three_channel_data = None;
+                        tools.two_channel_data.clear();
+                        tools.four_channel_data = None;
+                        tools.five_channel_data = None;
+                        tools.cfg0_centre_mono = None;
+                        tools.cfg2_back_mono = None;
                         if let Some(cfg_found) = resync_7x_front(
                             switch_floor,
                             head.bit_position().saturating_sub(2),
