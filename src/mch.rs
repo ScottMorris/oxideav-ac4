@@ -461,7 +461,7 @@ pub fn parse_two_channel_data(
 /// backchaining on two independent tracks (ms bits = 50 with
 /// max_sfb = 54 on one and max_sfb = 44 on the other; both
 /// aspx start_freq=7/HighRes ⇒ sba=40 ⇒ line 1280 ⇒ 50 bands).
-pub(crate) fn aspx_core_band_count(cfg: &crate::aspx::AspxConfig, tl: u32) -> Option<u32> {
+pub fn aspx_core_band_count(cfg: &crate::aspx::AspxConfig, tl: u32) -> Option<u32> {
     let (_master, _n, sba, _sbz) = crate::aspx::derive_master_sbg_table(cfg);
     let sb_width = tl / 64;
     let line = sba * sb_width;

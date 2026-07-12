@@ -107,6 +107,57 @@ fn main() {
         br.align_to_byte();
         let wall = br.bit_position() + audio_size as u64 * 8;
 
+        // AC4_IMM_TAILSCAN=1: instead of a forward walk, scan backward
+        // from the wall for [aspx2ch x3][aspx1ch][acpl x4] tail chains
+        // that close at the wall — pins the true aspx start per frame.
+        if std::env::var_os("AC4_IMM_TAILSCAN").is_some()
+            && sticky.aspx.is_some()
+            && sticky.acpl.is_some()
+        {
+            let cfg = sticky.aspx.clone().unwrap();
+            let ac = sticky.acpl.clone().unwrap();
+            let mut hits: Vec<(u64, i64)> = Vec::new();
+            let lo = wall.saturating_sub(4000).max(br.bit_position());
+            for cand in lo..wall.saturating_sub(150) {
+                let mut b2 = BitReader::new(sb);
+                if b2.skip(cand as u32).is_err() {
+                    break;
+                }
+                let mut st2 = sticky.clone();
+                let ok = (|| -> Result<(), oxideav_core::Error> {
+                    aspx2(&mut b2, &cfg, b_iframe, &mut st2)?;
+                    aspx2(&mut b2, &cfg, b_iframe, &mut st2)?;
+                    aspx2(&mut b2, &cfg, b_iframe, &mut st2)?;
+                    aspx1(&mut b2, &cfg, b_iframe, &mut st2)?;
+                    for _ in 0..4 {
+                        let _ = parse_acpl_data_1ch(&mut b2, ac.num_param_bands, 0, ac.quant_mode)?;
+                    }
+                    Ok(())
+                })();
+                if ok.is_ok() {
+                    let res = wall as i64 - b2.bit_position() as i64;
+                    if (-8..=64).contains(&res) {
+                        hits.push((cand, res));
+                    }
+                }
+            }
+            let show: Vec<String> = hits
+                .iter()
+                .take(12)
+                .map(|(c, r)| format!("{c}(r{r})"))
+                .collect();
+            println!(
+                "frame {i} ifr={} wall@{wall} tail_hits={} [{}]",
+                u8::from(b_iframe),
+                hits.len(),
+                show.join(" ")
+            );
+            if b_iframe {
+                // Refresh sticky configs via a quiet forward walk.
+            } else {
+                continue;
+            }
+        }
         let r = (|| -> Result<String, oxideav_core::Error> {
             // immersive_codec_mode_code: 1 bit, 0 -> 2 more.
             // AC4_IMM_P_NOCODE=1: P-frames do NOT carry the code —
@@ -119,7 +170,26 @@ fn main() {
                 .ok()
                 .and_then(|v| v.parse().ok());
             static mut STICKY_MODE: u32 = 3;
-            let mode = if !b_iframe && p_skip.is_some() {
+            // AC4_IMM_MODE2=1: deviation-#14 head model — the mode code
+            // is a flat 2-bit field on EVERY frame ('01' on this
+            // stream), the aspx_config sits at bit 18 on I-frames (the
+            // sba=40 master-table alignment), and a 4-bit sticky field
+            // ('0111') follows the config on I-frames / the mode on
+            // P-frames. Treated as ACPL_2-equivalent structure.
+            let mode2 = std::env::var_os("AC4_IMM_MODE2").is_some();
+            let mode = if mode2 {
+                let _code = br.read_u32(2)?;
+                if b_iframe {
+                    sticky.aspx = Some(parse_aspx_config(&mut br)?);
+                }
+                let _field4 = br.read_u32(4)?;
+                if b_iframe && sticky.acpl.is_none() {
+                    // No separately coded acpl cfg under this model —
+                    // synthesize from the 4-bit field later; default
+                    // 7 bands / coarse for now via a fake parse below.
+                }
+                3
+            } else if !b_iframe && p_skip.is_some() {
                 br.skip(p_skip.unwrap())?;
                 unsafe { STICKY_MODE }
             } else if !b_iframe && p_nocode {
@@ -140,7 +210,16 @@ fn main() {
             }
             let seven_ch_static = mode <= 3;
             let mut log = format!("mode={mode} ");
-            if b_iframe {
+            if mode2 {
+                if sticky.acpl.is_none() {
+                    sticky.acpl = Some(AcplConfig1ch {
+                        num_param_bands_id: 3,
+                        num_param_bands: 7,
+                        quant_mode: oxideav_ac4::acpl::AcplQuantMode::Fine,
+                        qmf_band: 0,
+                    });
+                }
+            } else if b_iframe {
                 if mode != 0 {
                     sticky.aspx = Some(parse_aspx_config(&mut br)?);
                 }
@@ -160,6 +239,24 @@ fn main() {
             );
             if mode == 4 {
                 let _ = parse_companding_control(&mut br, 5)?;
+            }
+            // AC4_IMM_ASPX_FIRST=1: unified-layout hypothesis — the
+            // four A-SPX elements sit right after the LFE (the war's
+            // P-frame "region"), not after the add pair. Frame 0 is
+            // blind to the order (its aspx is ~empty).
+            let aspx_first = std::env::var_os("AC4_IMM_ASPX_FIRST").is_some();
+            if aspx_first && mode >= 2 && mode != 4 {
+                let cfg = sticky
+                    .aspx
+                    .clone()
+                    .ok_or_else(|| oxideav_core::Error::invalid("no sticky aspx cfg"))?;
+                aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                if mode <= 3 {
+                    aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                }
+                aspx1(&mut br, &cfg, b_iframe, &mut sticky)?;
+                log += &format!("aspxF_end@{} ", br.bit_position());
             }
             let grouping = br.read_u32(2)?;
             log += &format!("grp={grouping} ");
@@ -254,7 +351,23 @@ fn main() {
             if seven_ch_static {
                 let b_use_sap_add_ch = br.read_bit()?;
                 if b_use_sap_add_ch {
-                    let m = core_m0.max(1);
+                    // Round-406 war rule: add-channel chparam ms loops
+                    // run over the A-SPX core band count, not max_sfb.
+                    // AC4_IMM_CHPARAM=core|msfb selects.
+                    let use_core = std::env::var("AC4_IMM_CHPARAM")
+                        .map(|v| v != "msfb")
+                        .unwrap_or(true);
+                    let m = if use_core {
+                        sticky
+                            .aspx
+                            .as_ref()
+                            .and_then(|c| {
+                                oxideav_ac4::mch::aspx_core_band_count(c, TL)
+                            })
+                            .unwrap_or(core_m0.max(1))
+                    } else {
+                        core_m0.max(1)
+                    };
                     let _ = parse_chparam_info(&mut br, &[m])?;
                     let _ = parse_chparam_info(&mut br, &[m])?;
                 }
@@ -287,7 +400,7 @@ fn main() {
                 for _ in 0..2 {
                     aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
                 }
-            } else if mode >= 2 {
+            } else if mode >= 2 && !aspx_first {
                 aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
                 aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
                 if seven_ch_static {
@@ -325,15 +438,28 @@ fn main() {
                     .acpl
                     .clone()
                     .ok_or_else(|| oxideav_core::Error::invalid("no sticky acpl cfg"))?;
-                for _ in 0..4 {
-                    let _ = parse_acpl_data_1ch(
-                        &mut br,
-                        ac.num_param_bands,
-                        0,
-                        ac.quant_mode,
-                    )?;
+                let nb: u32 = std::env::var("AC4_IMM_ACPL_BANDS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(ac.num_param_bands);
+                let n_acpl: u32 = std::env::var("AC4_IMM_ACPL_N")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4);
+                let verbose = std::env::var_os("AC4_IMM_ACPL_TRACE").is_some();
+                for a in 0..n_acpl {
+                    let p0 = br.bit_position();
+                    let d = parse_acpl_data_1ch(&mut br, nb, 0, ac.quant_mode)?;
+                    if verbose {
+                        log += &format!(
+                            "acpl{a}[{}..{} nps={}] ",
+                            p0,
+                            br.bit_position(),
+                            d.framing.num_param_sets
+                        );
+                    }
                 }
-                log += &format!("acpl_end@{} ", br.bit_position());
+                log += &format!("acpl_end@{} nb={nb} ", br.bit_position());
             }
             log += &format!(
                 "END@{} residue={}",
