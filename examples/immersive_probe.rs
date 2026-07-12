@@ -126,7 +126,11 @@ fn strict_walk(
             }
         }
     }
-    if !all {
+    // AC4_IMM_LAX=1: drop the body-decode strictness (P-frame front
+    // bodies routinely fail strict decode — war reality) and rely on
+    // the additional-pair + trailer chain as the oracle.
+    let lax = std::env::var_os("AC4_IMM_LAX").is_some();
+    if !all && !lax {
         return None;
     }
     let _ = (ac, st);
@@ -143,11 +147,13 @@ fn strict_walk(
     // War §4: the additional-pair grammar (untruncated sections,
     // body0 bound discovery, core-band ms).
     let p = oxideav_ac4::mch::parse_two_channel_data_additional(&mut br, TL, Some(cfg)).ok()?;
-    for c in 0..2 {
-        if !(p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
-            || p.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some()))
-        {
-            return None;
+    if !lax {
+        for c in 0..2 {
+            if !(p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                || p.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some()))
+            {
+                return None;
+            }
         }
     }
     let add_end = br.bit_position();
