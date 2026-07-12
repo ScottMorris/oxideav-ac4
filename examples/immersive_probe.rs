@@ -66,6 +66,94 @@ fn aspx1(
     Ok(())
 }
 
+/// Strict post-region walk for the region-extent scanner:
+/// [grp(2)][core bodies — ALL must decode][sap + chparams][add pair —
+/// both channels must decode][aspx2 x3 + aspx1][acpl x4] → residue.
+#[allow(clippy::too_many_arguments)]
+fn strict_walk(
+    mut br: BitReader<'_>,
+    cfg: &AspxConfig,
+    ac: &AcplConfig1ch,
+    st: &Sticky,
+    wall: u64,
+) -> Option<(i64, u32, u64)> {
+    let grp = br.read_u32(2).ok()?;
+    let mut core_m0 = 1u32;
+    let mut all = true;
+    match grp {
+        0 => {
+            let _ = br.read_bit().ok()?;
+            for _ in 0..2 {
+                let p = parse_two_channel_data(&mut br, TL).ok()?;
+                core_m0 = p.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(core_m0);
+                for c in 0..2 {
+                    all &= p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                        || p.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some());
+                }
+            }
+            let m = parse_mono_data(&mut br, false, TL).ok()?;
+            all &= m.scaled_spec.is_some() || m.scaled_spec_windows.is_some();
+        }
+        1 => {
+            let t = parse_three_channel_data(&mut br, TL).ok()?;
+            core_m0 = t.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(1);
+            for c in 0..3 {
+                all &= t.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                    || t.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some());
+            }
+            let p = parse_two_channel_data(&mut br, TL).ok()?;
+            for c in 0..2 {
+                all &= p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                    || p.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some());
+            }
+        }
+        2 => {
+            let f = parse_four_channel_data(&mut br, TL).ok()?;
+            core_m0 = f.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(1);
+            for c in 0..4 {
+                all &= f.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                    || f.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some());
+            }
+            let m = parse_mono_data(&mut br, false, TL).ok()?;
+            all &= m.scaled_spec.is_some() || m.scaled_spec_windows.is_some();
+        }
+        _ => {
+            let f = parse_five_channel_data(&mut br, TL).ok()?;
+            core_m0 = f.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(1);
+            for c in 0..5 {
+                all &= f.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                    || f.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some());
+            }
+        }
+    }
+    if !all {
+        return None;
+    }
+    let b_sap = br.read_bit().ok()?;
+    if b_sap {
+        let _ = parse_chparam_info(&mut br, &[core_m0.max(1)]).ok()?;
+        let _ = parse_chparam_info(&mut br, &[core_m0.max(1)]).ok()?;
+    }
+    let p = parse_two_channel_data(&mut br, TL).ok()?;
+    for c in 0..2 {
+        if !(p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+            || p.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some()))
+        {
+            return None;
+        }
+    }
+    let add_end = br.bit_position();
+    let mut st2 = st.clone();
+    for _ in 0..3 {
+        aspx2(&mut br, cfg, false, &mut st2).ok()?;
+    }
+    aspx1(&mut br, cfg, false, &mut st2).ok()?;
+    for _ in 0..4 {
+        let _ = parse_acpl_data_1ch(&mut br, ac.num_param_bands, 0, ac.quant_mode).ok()?;
+    }
+    Some((wall as i64 - br.bit_position() as i64, grp, add_end))
+}
+
 fn main() {
     let path = env::args().nth(1).expect("mp4");
     let max_frames: usize = env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(30);
@@ -239,6 +327,58 @@ fn main() {
             );
             if mode == 4 {
                 let _ = parse_companding_control(&mut br, 5)?;
+            }
+            // AC4_IMM_RL=<bits>: force a fixed post-LFE region skip on
+            // P-frames (content-validation runs at a scanner hit).
+            if !b_iframe {
+                if let Some(rl) = std::env::var("AC4_IMM_RL")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                {
+                    br.skip(rl)?;
+                }
+            }
+            // AC4_IMM_REGION_SCAN=1 (P-frames): sweep the region length
+            // after the LFE; accept only strict full-chain walks that
+            // land on the wall. Prints exact region extents.
+            let scan_from: usize = std::env::var("AC4_IMM_SCAN_FROM")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let scan_max: u32 = std::env::var("AC4_IMM_SCAN_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(9000);
+            if std::env::var_os("AC4_IMM_REGION_SCAN").is_some() && !b_iframe && i >= scan_from {
+                let cfg = sticky
+                    .aspx
+                    .clone()
+                    .ok_or_else(|| oxideav_core::Error::invalid("no sticky aspx"))?;
+                let ac = sticky
+                    .acpl
+                    .clone()
+                    .ok_or_else(|| oxideav_core::Error::invalid("no sticky acpl"))?;
+                let lfe_end = br.bit_position();
+                let max_len = (wall.saturating_sub(lfe_end + 600)) as u32;
+                let mut hits = 0u32;
+                for rl in 0..=max_len.min(scan_max) {
+                    let mut b2 = br;
+                    if rl > 0 && b2.skip(rl).is_err() {
+                        break;
+                    }
+                    if let Some((res, grp, add_end)) =
+                        strict_walk(b2, &cfg, &ac, &sticky, wall)
+                    {
+                        if (-8..=80).contains(&res) {
+                            println!(
+                                "REGION f={i} lfe_end={lfe_end} rl={rl} grp={grp} add_end={add_end} res={res}"
+                            );
+                            hits += 1;
+                        }
+                    }
+                }
+                println!("frame {i}: region scan done, {hits} hits (lfe_end={lfe_end} wall={wall})");
+                return Ok(String::new());
             }
             // AC4_IMM_ASPX_FIRST=1: unified-layout hypothesis — the
             // four A-SPX elements sit right after the LFE (the war's

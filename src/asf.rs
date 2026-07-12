@@ -3254,8 +3254,12 @@ pub(crate) fn dump_body_scaled(scaled: &[f32], tl: u32, max_sfb: u32) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static BODY_N: AtomicU32 = AtomicU32::new(0);
         let k = BODY_N.fetch_add(1, Ordering::Relaxed);
-        if k < 512 {
-            let p = std::path::Path::new(&dir).join(format!("body{k:03}_tl{tl}_m{max_sfb}.f32"));
+        let cap = std::env::var("AC4_DUMP_BODY_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512u32);
+        if k < cap {
+            let p = std::path::Path::new(&dir).join(format!("body{k:05}_tl{tl}_m{max_sfb}.f32"));
             let bytes: Vec<u8> = scaled.iter().flat_map(|v| v.to_le_bytes()).collect();
             let _ = std::fs::write(p, bytes);
         }
