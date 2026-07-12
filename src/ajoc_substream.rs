@@ -311,6 +311,22 @@ pub fn parse_audio_data_ajoc(
     frame_len_base: u32,
     ajoc_state: &mut AjocDiffState,
 ) -> Result<AudioDataAjoc> {
+    parse_audio_data_ajoc_sticky(br, params, b_iframe, b_alternative, frame_len_base, ajoc_state, None)
+}
+
+/// [`parse_audio_data_ajoc`] with I-frame-sticky A-SPX state for the
+/// var_channel_element on dependent frames (round 414: object P-frames
+/// reuse the last I-frame's aspx_config + xover per Tables 51/52).
+#[allow(clippy::too_many_arguments)]
+pub fn parse_audio_data_ajoc_sticky(
+    br: &mut BitReader<'_>,
+    params: &AjocBodyParams,
+    b_iframe: bool,
+    b_alternative: bool,
+    frame_len_base: u32,
+    ajoc_state: &mut AjocDiffState,
+    sticky_aspx: Option<(&AspxConfig, u8)>,
+) -> Result<AudioDataAjoc> {
     let mut static_chan_tools = None;
     let mut dmx_active_signals_mask = None;
     let mut var_element = None;
@@ -342,7 +358,7 @@ pub fn parse_audio_data_ajoc(
             params.n_fullband_dmx_signals,
             params.b_lfe,
             frame_len_base,
-            None,
+            sticky_aspx,
         )?);
         if br.read_bit()? {
             // b_dmx_timing.
@@ -473,6 +489,9 @@ pub struct AjocSubstreamDecoder {
     /// `metadata()` — needed to parse `dialog_enhancement()` on
     /// dependent frames.
     prev_de: Option<crate::de::DeConfig>,
+    /// Round 414: I-frame-sticky var_channel_element A-SPX state
+    /// (config + xover) for dependent-frame parses.
+    sticky_aspx: Option<(AspxConfig, u8)>,
 }
 
 impl AjocSubstreamDecoder {
@@ -495,6 +514,7 @@ impl AjocSubstreamDecoder {
             num_dmx,
             num_umx,
             prev_de: None,
+            sticky_aspx: None,
         }
     }
 
@@ -659,14 +679,28 @@ impl AjocSubstreamDecoder {
         }
         br.align_to_byte();
         let audio_start = br.byte_position();
-        let ajoc = parse_audio_data_ajoc(
+        let sticky = self.sticky_aspx.as_ref().map(|(c, x)| (c, *x));
+        let ajoc = parse_audio_data_ajoc_sticky(
             &mut br,
             params,
             b_iframe,
             b_alternative,
             frame_len_base,
             &mut self.diff_state,
+            sticky,
         )?;
+        if b_iframe {
+            if let Some(ve) = ajoc.var_element.as_ref() {
+                let xo = ve
+                    .aspx_pair_tools
+                    .first()
+                    .and_then(|t| t.aspx_xover_subband_offset)
+                    .or_else(|| ve.aspx_odd_tools.as_ref().and_then(|t| t.aspx_xover_subband_offset));
+                if let (Some(cfg), Some(x)) = (ve.aspx_config.clone(), xo) {
+                    self.sticky_aspx = Some((cfg, x));
+                }
+            }
+        }
         // The walk must stay inside the announced audio_size envelope
         // (the remainder up to it is fill_bits + byte_align).
         let consumed = br.bit_position().div_ceil(8) - audio_start as u64;
