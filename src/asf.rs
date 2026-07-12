@@ -1976,7 +1976,7 @@ pub fn parse_mono_audio_data_outer_stateful(
 /// at the start of `aspx_data_1ch()`. Used by both the mono ASPX path
 /// (§4.2.6.1) and the stereo `ASPX_ACPL_{1,2}` paths (§4.2.6.3) — both
 /// follow exactly the Table-51 layout.
-pub(crate) fn parse_aspx_data_1ch_body(
+pub fn parse_aspx_data_1ch_body(
     br: &mut BitReader<'_>,
     tools: &mut SubstreamTools,
     cfg: &aspx::AspxConfig,
@@ -2079,7 +2079,7 @@ pub(crate) fn parse_aspx_data_1ch_body(
 /// The caller is responsible for arranging that the bitreader is
 /// sitting at the start of `aspx_data_2ch()`. `cfg` is the active
 /// `aspx_config()` (drives quant_mode_env + num_noise_sbgroups).
-pub(crate) fn parse_aspx_data_2ch_body(
+pub fn parse_aspx_data_2ch_body(
     br: &mut BitReader<'_>,
     tools: &mut SubstreamTools,
     cfg: &aspx::AspxConfig,
@@ -2168,6 +2168,15 @@ pub(crate) fn parse_aspx_data_2ch_body(
     // §5.7.6.3.1 derivation feeds aspx_hfgen_iwc_2ch() (Table 56)
     // then four aspx_ec_data() calls (ch0/ch1 SIGNAL, ch0/ch1
     // NOISE) per Table 52.
+    if std::env::var_os("AC4_T").is_some() {
+        if let Err(e) = aspx::derive_aspx_frequency_tables(cfg, xover as u32) {
+            let (m, n, sba, sbz) = aspx::derive_master_sbg_table(cfg);
+            eprintln!(
+                "A2 DERIVE-FAIL xover={xover} num_sbg_master={n} sba={sba} sbz={sbz} master={m:?} err={e:?} @{}",
+                br.bit_position()
+            );
+        }
+    }
     if let Ok(tables) = aspx::derive_aspx_frequency_tables(cfg, xover as u32) {
         let _t = std::env::var_os("AC4_T").is_some();
         if _t {

@@ -124,6 +124,47 @@ impl VarChannelElement {
         out
     }
 
+    /// Per-window de-grouped spectra in signal order (LFE excluded) —
+    /// the short/grouped-frame counterpart of
+    /// [`Self::fullband_spectra`]. A channel has `Some` here exactly
+    /// when its body decoded as a grouped/short frame.
+    pub fn fullband_windows(&self) -> Vec<Option<&[crate::mch::WindowSpectrum]>> {
+        let mut out: Vec<Option<&[crate::mch::WindowSpectrum]>> = Vec::new();
+        for pair in &self.pairs {
+            for ch in 0..2 {
+                out.push(
+                    pair.scaled_spec_windows_per_channel
+                        .get(ch)
+                        .and_then(|s| s.as_deref()),
+                );
+            }
+        }
+        match self.odd_tail.as_deref() {
+            None => {}
+            Some(VarOddTail::Mono(m)) => out.push(m.scaled_spec_windows.as_deref()),
+            Some(VarOddTail::PairPlusMono { pair, mono }) => {
+                for ch in 0..2 {
+                    out.push(
+                        pair.scaled_spec_windows_per_channel
+                            .get(ch)
+                            .and_then(|s| s.as_deref()),
+                    );
+                }
+                out.push(mono.scaled_spec_windows.as_deref());
+            }
+            Some(VarOddTail::Three(t)) => {
+                for ch in 0..3 {
+                    out.push(
+                        t.scaled_spec_windows_per_channel
+                            .get(ch)
+                            .and_then(|s| s.as_deref()),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     /// Decoded LFE spectrum, when present and decodable.
     pub fn lfe_spectrum(&self) -> Option<&[f32]> {
         self.lfe.as_ref().and_then(|m| m.scaled_spec.as_deref())
@@ -146,6 +187,7 @@ pub fn parse_var_channel_element(
     frame_len_base: u32,
     sticky_aspx: Option<(&AspxConfig, u8)>,
 ) -> Result<VarChannelElement> {
+    let trace = std::env::var_os("AC4_AJOC_TRACE").is_some();
     let mut out = VarChannelElement {
         aspx_mode: br.read_bit()?,
         ..Default::default()
@@ -154,14 +196,45 @@ pub fn parse_var_channel_element(
     let n_pairs = n_fb_signals / 2;
     if out.aspx_mode {
         if b_iframe {
+            let p0 = br.bit_position();
             out.aspx_config = Some(parse_aspx_config(br)?);
+            if trace {
+                eprintln!(
+                    "  VCE aspx_cfg@{}..{} {:?}",
+                    p0,
+                    br.bit_position(),
+                    out.aspx_config.as_ref().unwrap()
+                );
+            }
         }
         if n_fb_signals <= 5 {
             out.companding = Some(parse_companding_control(br, n_fb_signals)?);
         }
     }
+    if trace {
+        eprintln!(
+            "  VCE aspx_mode={} head_end@{}",
+            u8::from(out.aspx_mode),
+            br.bit_position()
+        );
+    }
     if b_has_lfe {
         out.lfe = Some(parse_mono_data(br, true, frame_len_base)?);
+        if trace {
+            eprintln!(
+                "  VCE lfe_end@{} decoded={}",
+                br.bit_position(),
+                out.lfe.as_ref().is_some_and(|m| m.scaled_spec.is_some())
+            );
+        }
+    }
+    // AC4_AJOC_SKEW=<bits>: research instrument — skip N bits after the
+    // LFE to probe post-LFE alignment against the wall oracle.
+    if let Some(s) = std::env::var("AC4_AJOC_SKEW")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        br.skip(s)?;
     }
     if b_isodd {
         if n_fb_signals == 1 {
@@ -177,13 +250,39 @@ pub fn parse_var_channel_element(
             let var_coding_config = br.read_bit()?;
             if !var_coding_config {
                 let pair = parse_two_channel_data(br, frame_len_base)?;
+                if trace {
+                    eprintln!(
+                        "  VCE vcc=0 pair_end@{} decoded={:?}",
+                        br.bit_position(),
+                        pair.scaled_spec_per_channel
+                            .iter()
+                            .map(|s| s.is_some())
+                            .collect::<Vec<_>>()
+                    );
+                }
                 let mono = parse_mono_data(br, false, frame_len_base)?;
+                if trace {
+                    eprintln!(
+                        "  VCE mono_end@{} decoded={}",
+                        br.bit_position(),
+                        mono.scaled_spec.is_some() || mono.scaled_spec_windows.is_some()
+                    );
+                }
                 out.odd_tail = Some(Box::new(VarOddTail::PairPlusMono { pair, mono }));
             } else {
-                out.odd_tail = Some(Box::new(VarOddTail::Three(parse_three_channel_data(
-                    br,
-                    frame_len_base,
-                )?)));
+                let three = parse_three_channel_data(br, frame_len_base)?;
+                if trace {
+                    eprintln!(
+                        "  VCE vcc=1 three_end@{} decoded={:?}",
+                        br.bit_position(),
+                        three
+                            .scaled_spec_per_channel
+                            .iter()
+                            .map(|s| s.is_some())
+                            .collect::<Vec<_>>()
+                    );
+                }
+                out.odd_tail = Some(Box::new(VarOddTail::Three(three)));
             }
         }
     } else {
@@ -207,6 +306,9 @@ pub fn parse_var_channel_element(
                 tools.aspx_xover_subband_offset = Some(x);
             }
             crate::asf::parse_aspx_data_2ch_body(br, &mut tools, cfg, b_iframe, frame_len_base)?;
+            if trace {
+                eprintln!("  VCE aspx2ch_end@{}", br.bit_position());
+            }
             out.aspx_pair_tools.push(tools);
         }
         if b_isodd {
@@ -215,6 +317,9 @@ pub fn parse_var_channel_element(
                 tools.aspx_xover_subband_offset = Some(x);
             }
             crate::asf::parse_aspx_data_1ch_body(br, &mut tools, cfg, b_iframe, frame_len_base)?;
+            if trace {
+                eprintln!("  VCE aspx1ch_end@{}", br.bit_position());
+            }
             out.aspx_odd_tools = Some(tools);
         }
     }
@@ -330,8 +435,6 @@ pub fn parse_audio_data_ajoc_sticky(
     let mut static_chan_tools = None;
     let mut dmx_active_signals_mask = None;
     let mut var_element = None;
-    let mut dmx_timing = None;
-    let mut dmx_dyndata = None;
     if params.b_static_dmx {
         // audio_data_chan(b_lfe ? 5.1 : 5.0, b_iframe).
         let mut tools = Box::new(SubstreamTools {
@@ -347,7 +450,6 @@ pub fn parse_audio_data_ajoc_sticky(
         )?;
         static_chan_tools = Some(tools);
     } else {
-        let n_dmx_signals = params.n_fullband_dmx_signals + u32::from(params.b_lfe);
         if br.read_bit()? {
             // b_some_signals_inactive.
             dmx_active_signals_mask = Some(br.read_u32(params.n_fullband_dmx_signals)?);
@@ -360,6 +462,44 @@ pub fn parse_audio_data_ajoc_sticky(
             frame_len_base,
             sticky_aspx,
         )?);
+        let trace = std::env::var_os("AC4_AJOC_TRACE").is_some();
+        if trace {
+            eprintln!("  ADA vce_end@{}", br.bit_position());
+        }
+    }
+    parse_audio_data_ajoc_tail(
+        br,
+        params,
+        b_iframe,
+        b_alternative,
+        ajoc_state,
+        static_chan_tools,
+        dmx_active_signals_mask,
+        var_element,
+    )
+}
+
+/// Post-`var_channel_element` remainder of `audio_data_ajoc()` — the
+/// core-decode OAMD (`b_dmx_timing` + dyndata, dynamic form only)
+/// through the full-decode OAMD dyndata. Split out (round 415) so the
+/// resync probe can re-run the tail from candidate body-end positions
+/// against the audio_size wall oracle.
+#[allow(clippy::too_many_arguments)]
+pub fn parse_audio_data_ajoc_tail(
+    br: &mut BitReader<'_>,
+    params: &AjocBodyParams,
+    b_iframe: bool,
+    b_alternative: bool,
+    ajoc_state: &mut AjocDiffState,
+    static_chan_tools: Option<Box<SubstreamTools>>,
+    dmx_active_signals_mask: Option<u32>,
+    var_element: Option<VarChannelElement>,
+) -> Result<AudioDataAjoc> {
+    let trace = std::env::var_os("AC4_AJOC_TRACE").is_some();
+    let mut dmx_timing = None;
+    let mut dmx_dyndata = None;
+    if !params.b_static_dmx {
+        let n_dmx_signals = params.n_fullband_dmx_signals + u32::from(params.b_lfe);
         if br.read_bit()? {
             // b_dmx_timing.
             dmx_timing = Some(parse_oamd_timing_data(br)?);
@@ -380,6 +520,9 @@ pub fn parse_audio_data_ajoc_sticky(
             &params.obj_type_dmx,
             &is_lfe,
         )?);
+        if trace {
+            eprintln!("  ADA dmx_dyn_end@{}", br.bit_position());
+        }
     }
     // b_oamd_extension_present — the envelope embeds ajoc_bed_info().
     let oamd_extension = if !params.b_static_dmx && br.read_bit()? {
@@ -400,19 +543,48 @@ pub fn parse_audio_data_ajoc_sticky(
     } else {
         None
     };
+    if trace {
+        eprintln!("  ADA pre_ajoc@{}", br.bit_position());
+    }
+    // AC4_AJOC_DATA_LAST=1: research probe — parse only ajoc_ctrl_info
+    // here and defer the ajoc_data() Huffman payload (the dry/wet
+    // matrices) to AFTER the full-decode OAMD, testing the hypothesis
+    // that the matrix payload sits at the element's end on real
+    // content (frame 0 is blind to the order — silent objects carry
+    // ~0 matrix bits).
+    let data_last = std::env::var_os("AC4_AJOC_DATA_LAST").is_some();
+    let mut deferred_ctrl = None;
     // ajoc(n_fb_dmx_signals, n_fb_upmix_signals).
-    let ajoc_frame = decode_ajoc(
-        br,
-        params.n_fullband_dmx_signals,
-        params.n_fullband_upmix_signals,
-        ajoc_state,
-    )?;
+    let ajoc_frame = if data_last {
+        let num_decorr = br.read_u32(3)?;
+        let ctrl = crate::ajoc::parse_ajoc_ctrl_info(
+            br,
+            params.n_fullband_dmx_signals,
+            num_decorr,
+            params.n_fullband_upmix_signals,
+        )?;
+        deferred_ctrl = Some((num_decorr, ctrl));
+        None
+    } else {
+        Some(decode_ajoc(
+            br,
+            params.n_fullband_dmx_signals,
+            params.n_fullband_upmix_signals,
+            ajoc_state,
+        )?)
+    };
+    if trace {
+        eprintln!("  ADA ajoc_end@{}", br.bit_position());
+    }
     // ajoc_dmx_de_data(n_fb_dmx_signals, n_fb_upmix_signals).
     let dmx_de = parse_ajoc_dmx_de_data(
         br,
         params.n_fullband_dmx_signals,
         params.n_fullband_upmix_signals,
     )?;
+    if trace {
+        eprintln!("  ADA dmx_de_end@{}", br.bit_position());
+    }
     // Full-decode timing + dyndata.
     let mut umx_timing = None;
     let mut b_derive_timing_from_dmx = None;
@@ -439,6 +611,37 @@ pub fn parse_audio_data_ajoc_sticky(
         &params.obj_type_umx,
         &is_lfe_umx,
     )?;
+    if trace {
+        eprintln!("  ADA umx_end@{}", br.bit_position());
+    }
+    let ajoc_frame = match (ajoc_frame, deferred_ctrl) {
+        (Some(f), _) => f,
+        (None, Some((num_decorr, ctrl))) => {
+            let data = crate::ajoc_data::parse_ajoc_data(
+                br,
+                &ctrl,
+                params.n_fullband_dmx_signals,
+                num_decorr,
+            )?;
+            let matrices = crate::ajoc_data::dequantize_ajoc_frame(
+                &ctrl,
+                &data,
+                params.n_fullband_dmx_signals,
+                num_decorr,
+                ajoc_state,
+            )?;
+            if trace {
+                eprintln!("  ADA ajoc_data_end@{}", br.bit_position());
+            }
+            AjocFrame {
+                num_decorr,
+                ctrl,
+                data,
+                matrices,
+            }
+        }
+        (None, None) => unreachable!("deferred ctrl always set when data_last"),
+    };
     Ok(AudioDataAjoc {
         static_chan_tools,
         dmx_active_signals_mask,
@@ -459,13 +662,15 @@ pub fn parse_audio_data_ajoc_sticky(
 // =====================================================================
 
 /// Reconstructed A-JOC PCM: the `num_umx` fullband objects
-/// (`[o][samples]`) plus the decoded LFE PCM when the substream
-/// carries one.
-pub type AjocObjectPcm = (Vec<Vec<f32>>, Option<Vec<f32>>);
+/// (`[o][samples]`), the `num_dmx` decoded downmix-channel PCMs (the
+/// coded bed the spatial reconstruction upmixes from), and the decoded
+/// LFE PCM when the substream carries one.
+pub type AjocObjectPcm = (Vec<Vec<f32>>, Vec<Vec<f32>>, Option<Vec<f32>>);
 
 /// [`AjocObjectPcm`] plus the parsed `audio_data_ajoc()` body and the
 /// post-audio `metadata(…, sus_ver = 1)` element (§6.2.2.2).
 pub type AjocSubstreamDecode = (
+    Vec<Vec<f32>>,
     Vec<Vec<f32>>,
     Option<Vec<f32>>,
     AudioDataAjoc,
@@ -479,8 +684,8 @@ pub type AjocSubstreamDecode = (
 pub struct AjocSubstreamDecoder {
     diff_state: AjocDiffState,
     recon: Option<(crate::ajoc::AjocGeometry, crate::ajoc::AjocReconState)>,
-    overlap: Vec<Vec<f32>>,
-    prev_transform_length: u32,
+    ola: Vec<crate::mdct::BlockSwitchOla>,
+    cur_frame_samples: usize,
     analysis: Vec<crate::qmf::QmfAnalysisBank>,
     synthesis: Vec<crate::qmf::QmfSynthesisBank>,
     num_dmx: usize,
@@ -503,8 +708,8 @@ impl AjocSubstreamDecoder {
             // state to its maximum so any frame fits.
             diff_state: crate::ajoc_data::new_ajoc_diff_state(num_umx, num_dmx, 7),
             recon: None,
-            overlap: Vec::new(),
-            prev_transform_length: 0,
+            ola: Vec::new(),
+            cur_frame_samples: 0,
             analysis: (0..num_dmx)
                 .map(|_| crate::qmf::QmfAnalysisBank::new())
                 .collect(),
@@ -525,22 +730,44 @@ impl AjocSubstreamDecoder {
     }
 
     fn imdct_channel_f32(&mut self, ch: usize, scaled: &[f32], n: usize) -> Vec<f32> {
-        if self.prev_transform_length != n as u32 {
-            self.overlap.clear();
-            self.prev_transform_length = n as u32;
+        // §5.5.3 full-block grid: short blocks are centred within the
+        // frame length when they subdivide it evenly (mirrors
+        // `Ac4Decoder::imdct_channel_f32`).
+        let n_full = if self.cur_frame_samples >= n && self.cur_frame_samples % n.max(1) == 0 {
+            self.cur_frame_samples
+        } else {
+            n
+        };
+        while self.ola.len() <= ch {
+            self.ola.push(crate::mdct::BlockSwitchOla::new(n_full));
         }
-        while self.overlap.len() <= ch {
-            self.overlap.push(vec![0.0f32; n]);
-        }
-        if self.overlap[ch].len() != n {
-            self.overlap[ch] = vec![0.0f32; n];
+        if self.ola[ch].n_full() != n_full {
+            self.ola[ch] = crate::mdct::BlockSwitchOla::new(n_full);
         }
         let mut x = vec![0.0f32; n];
         let copy = scaled.len().min(n);
         x[..copy].copy_from_slice(&scaled[..copy]);
         let y = crate::mdct::imdct(&x);
-        let window = crate::mdct::kbd_window(n as u32);
-        crate::mdct::imdct_olap_symmetric(&y, &window, &mut self.overlap[ch])
+        self.ola[ch].process_block(&y)
+    }
+
+    /// IMDCT a sequence of already-ungrouped per-window spectra into a
+    /// single frame's PCM, advancing the channel's overlap-add state
+    /// window by window (short/grouped-frame counterpart of
+    /// [`Self::imdct_channel_f32`]).
+    fn imdct_grouped_channel_f32(
+        &mut self,
+        ch: usize,
+        windows: &[crate::mch::WindowSpectrum],
+        frame_samples: usize,
+    ) -> Vec<f32> {
+        let mut pcm_out: Vec<f32> = Vec::with_capacity(frame_samples);
+        for (tl, spec) in windows {
+            let block = self.imdct_channel_f32(ch, spec, *tl as usize);
+            pcm_out.extend_from_slice(&block);
+        }
+        pcm_out.resize(frame_samples, 0.0);
+        pcm_out
     }
 
     /// Decode one parsed `audio_data_ajoc()` frame to reconstructed
@@ -566,7 +793,9 @@ impl AjocSubstreamDecoder {
         if spectra.len() != self.num_dmx {
             return Err(Error::invalid("ac4: downmix channel count mismatch"));
         }
+        let windows = elem.fullband_windows();
         let n = frame_len_base as usize;
+        self.cur_frame_samples = n;
         // 0. The LFE channel (when present) is carried directly as a
         // long-frame ASF mono body: IMDCT it on its dedicated overlap
         // slot (index num_dmx). An undecodable LFE body degrades to
@@ -583,12 +812,24 @@ impl AjocSubstreamDecoder {
             }
             _ => None,
         };
-        // 1. IMDCT each downmix channel.
+        // 1. IMDCT each downmix channel — long-frame spectrum or
+        // short/grouped per-window spectra, whichever the body decoded
+        // as.
+        // AC4_AJOC_NO_GROUPED=1: research instrument — treat grouped
+        // bodies as undecodable to isolate long-frame-only quality.
+        let no_grouped = std::env::var_os("AC4_AJOC_NO_GROUPED").is_some();
         let mut pcm_dmx: Vec<Vec<f32>> = Vec::with_capacity(self.num_dmx);
-        for (ch, spec) in spectra.iter().enumerate() {
-            let spec =
-                spec.ok_or_else(|| Error::unsupported("ac4: undecodable downmix channel body"))?;
-            pcm_dmx.push(self.imdct_channel_f32(ch, spec, n));
+        for ch in 0..self.num_dmx {
+            let pcm = match (spectra[ch], windows.get(ch).copied().flatten()) {
+                (Some(spec), _) => self.imdct_channel_f32(ch, spec, n),
+                (None, Some(w)) if !w.is_empty() && !no_grouped => {
+                    self.imdct_grouped_channel_f32(ch, w, n)
+                }
+                _ => {
+                    return Err(Error::unsupported("ac4: undecodable downmix channel body"));
+                }
+            };
+            pcm_dmx.push(pcm);
         }
         // 2. QMF-analyse each channel into x[ts][sb][ch].
         let num_sb = crate::qmf::NUM_QMF_SUBBANDS;
@@ -645,7 +886,7 @@ impl AjocSubstreamDecoder {
             }
             out.push(pcm);
         }
-        Ok((out, lfe_pcm))
+        Ok((out, pcm_dmx, lfe_pcm))
     }
 
     /// Parse + decode one complete part-2 `ac4_substream()` body
@@ -703,6 +944,30 @@ impl AjocSubstreamDecoder {
         }
         // The walk must stay inside the announced audio_size envelope
         // (the remainder up to it is fill_bits + byte_align).
+        if std::env::var_os("AC4_AJOC_TRACE").is_some() {
+            let end_bits = (audio_start as u64 + audio_size as u64) * 8;
+            let long_chs = ajoc
+                .var_element
+                .as_ref()
+                .map(|ve| {
+                    let s = ve.fullband_spectra();
+                    let w = ve.fullband_windows();
+                    (
+                        s.iter().filter(|x| x.is_some()).count(),
+                        w.iter().filter(|x| x.is_some()).count(),
+                        s.len(),
+                    )
+                })
+                .unwrap_or((0, 0, 0));
+            eprintln!(
+                "AJOC-TRACE iframe={} wall_residue_bits={} long={} grouped={} of {}",
+                u8::from(b_iframe),
+                end_bits as i64 - br.bit_position() as i64,
+                long_chs.0,
+                long_chs.1,
+                long_chs.2,
+            );
+        }
         let consumed = br.bit_position().div_ceil(8) - audio_start as u64;
         if consumed > audio_size as u64 {
             return Err(Error::invalid(
@@ -728,8 +993,8 @@ impl AjocSubstreamDecoder {
         } else {
             None
         };
-        let (pcm, lfe) = self.decode_frame_pcm(&ajoc, frame_len_base)?;
-        Ok((pcm, lfe, ajoc, metadata))
+        let (pcm, dmx, lfe) = self.decode_frame_pcm(&ajoc, frame_len_base)?;
+        Ok((pcm, dmx, lfe, ajoc, metadata))
     }
 }
 
@@ -1499,7 +1764,7 @@ mod tests {
                 &mut enc_state,
             )
             .unwrap();
-            let (objects, _lfe, parsed, metadata) = dec
+            let (objects, _dmx, _lfe, parsed, metadata) = dec
                 .decode_substream_pcm(&bytes, &params, true, false, TL)
                 .unwrap();
             // The §6.2.2.2 post-audio metadata(…, sus_ver = 1) tail

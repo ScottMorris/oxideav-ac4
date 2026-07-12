@@ -304,7 +304,9 @@ pub fn parse_asf_scalefac_data(
     let reference_scale_factor = br.read_u32(8)?;
     let mut sf_gain = vec![0.0_f32; max_sfb as usize];
     let mut scale_factor: i32 = reference_scale_factor as i32;
-    let mut first_scf_found = false;
+    // AC4_SF_ALL=1: research probe — read a dpcm code for every coded
+    // band including the first (no first_scf_found skip).
+    let mut first_scf_found = std::env::var_os("AC4_SF_ALL").is_some();
     let max_sfb_eff = max_sfb.min(num_sfb_lsf);
     for sfb in 0..max_sfb_eff as usize {
         let cb = sections.sfb_cb[sfb];
@@ -368,17 +370,24 @@ pub fn parse_asf_snf_data(
     max_sfb: u32,
     transform_length: u32,
 ) -> Result<Option<Vec<i32>>> {
-    let b_snf_data_exists = br.read_bit()?;
+    let mut b_snf_data_exists = br.read_bit()?;
+    // AC4_SNF_INVERT=1: research probe — inverted flag polarity.
+    if std::env::var_os("AC4_SNF_INVERT").is_some() {
+        b_snf_data_exists = !b_snf_data_exists;
+    }
     if !b_snf_data_exists {
         return Ok(None);
     }
+    // AC4_SNF_ALL_BANDS=1: research probe — read a code for every band
+    // regardless of the cb/mqi gates.
+    let all_bands = std::env::var_os("AC4_SNF_ALL_BANDS").is_some();
     let num_sfb_lsf =
         num_sfb_48(transform_length).ok_or_else(|| Error::invalid("ac4: snf: bad tl"))?;
     let mut dpcm_snf = vec![0i32; max_sfb as usize];
     let max_sfb_eff = max_sfb.min(num_sfb_lsf);
     for sfb in 0..max_sfb_eff as usize {
         let cb = sections.sfb_cb[sfb];
-        if cb == 0 || max_quant_idx[sfb] == 0 {
+        if all_bands || cb == 0 || max_quant_idx[sfb] == 0 {
             let idx = huff_decode(br, HCB_SNF_LEN, HCB_SNF_CW)?;
             dpcm_snf[sfb] = idx as i32;
         }
@@ -486,7 +495,8 @@ pub fn parse_asf_scalefac_data_grouped(
     }
     let reference_scale_factor = br.read_u32(8)?;
     let mut scale_factor: i32 = reference_scale_factor as i32;
-    let mut first_scf_found = false;
+    // AC4_SF_ALL=1: research probe — see the non-grouped variant.
+    let mut first_scf_found = std::env::var_os("AC4_SF_ALL").is_some();
     let mut out = Vec::with_capacity(n);
     for g in 0..n {
         let max_sfb = max_sfb_per_group[g];
@@ -555,10 +565,14 @@ pub fn parse_asf_snf_data_grouped(
             "ac4: asf_snf_data_grouped: inconsistent per-group slice lengths",
         ));
     }
-    let b_snf_data_exists = br.read_bit()?;
+    let mut b_snf_data_exists = br.read_bit()?;
+    if std::env::var_os("AC4_SNF_INVERT").is_some() {
+        b_snf_data_exists = !b_snf_data_exists;
+    }
     if !b_snf_data_exists {
         return Ok(None);
     }
+    let all_bands = std::env::var_os("AC4_SNF_ALL_BANDS").is_some();
     let mut out = Vec::with_capacity(n);
     for g in 0..n {
         let max_sfb = max_sfb_per_group[g];
@@ -571,7 +585,7 @@ pub fn parse_asf_snf_data_grouped(
         let mut dpcm_snf = vec![0i32; max_sfb as usize];
         for sfb in 0..max_sfb_eff as usize {
             let cb = sections.sfb_cb[sfb];
-            if cb == 0 || mqi[sfb] == 0 {
+            if all_bands || cb == 0 || mqi[sfb] == 0 {
                 let idx = huff_decode(br, HCB_SNF_LEN, HCB_SNF_CW)?;
                 dpcm_snf[sfb] = idx as i32;
             }
