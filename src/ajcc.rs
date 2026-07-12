@@ -283,12 +283,24 @@ pub struct AjccFramingData {
 
 /// Walk `ajcc_framing_data()` (§6.2.6.2).
 pub fn parse_ajcc_framing_data(br: &mut BitReader<'_>) -> Result<AjccFramingData> {
+    // Research knobs (round 417 anchor sweeps): AJCC_NPS_BITS (default
+    // 1), AJCC_TS_BITS (default 5), AJCC_TS_FLAT=1 reads timeslots when
+    // steep == 0 instead of steep == 1.
+    let nps_bits: u32 = std::env::var("AJCC_NPS_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let ts_bits: u32 = std::env::var("AJCC_TS_BITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let ts_flat = std::env::var_os("AJCC_TS_FLAT").is_some();
     let steep = br.read_bit()?;
-    let num_param_sets = br.read_u32(1)? + 1;
+    let num_param_sets = br.read_u32(nps_bits)? + 1;
     let mut param_timeslot = Vec::new();
-    if steep {
+    if steep != ts_flat {
         for _ in 0..num_param_sets {
-            param_timeslot.push(br.read_u32(5)?);
+            param_timeslot.push(br.read_u32(ts_bits)?);
         }
     }
     Ok(AjccFramingData {
@@ -465,14 +477,38 @@ pub fn parse_ajcc_data(br: &mut BitReader<'_>, b_5fronts: bool) -> Result<AjccDa
         data.qm_dw = AcplQuantMode::from_bit(br.read_bit()?);
     }
 
+    let trace = std::env::var_os("AC4_AJCC_TRACE").is_some();
+    if trace {
+        eprintln!(
+            "AJCC no_dt={} bands_id={} nb={} core_mode={} qm_ab={:?} qm_dw={:?} @{}",
+            u8::from(b_no_dt),
+            num_param_bands_id,
+            nb,
+            u8::from(data.core_mode),
+            data.qm_ab,
+            data.qm_dw,
+            br.bit_position()
+        );
+    }
     let num_framing = if b_5fronts { 4 } else { 2 };
-    for _ in 0..num_framing {
+    for f in 0..num_framing {
         data.framing.push(parse_ajcc_framing_data(br)?);
+        if trace {
+            let fd = data.framing.last().unwrap();
+            eprintln!(
+                "  frm{f} steep={} nps={} ts={:?} @{}",
+                u8::from(fd.steep),
+                fd.num_param_sets,
+                fd.param_timeslot,
+                br.bit_position()
+            );
+        }
     }
     let nps = |idx: usize| data.framing[idx].num_param_sets;
 
     let plan = ajcc_plan(b_5fronts);
     for &fi in plan.ab {
+        let p0 = br.bit_position();
         data.alpha.push(parse_ajced(
             br,
             AjccDataType::Alpha,
@@ -481,8 +517,12 @@ pub fn parse_ajcc_data(br: &mut BitReader<'_>, b_5fronts: bool) -> Result<AjccDa
             b_no_dt,
             nps(fi),
         )?);
+        if trace {
+            eprintln!("  alpha fi={fi} [{}..{}]", p0, br.bit_position());
+        }
     }
     for &fi in plan.ab {
+        let p0 = br.bit_position();
         data.beta.push(parse_ajced(
             br,
             AjccDataType::Beta,
@@ -491,9 +531,13 @@ pub fn parse_ajcc_data(br: &mut BitReader<'_>, b_5fronts: bool) -> Result<AjccDa
             b_no_dt,
             nps(fi),
         )?);
+        if trace {
+            eprintln!("  beta fi={fi} [{}..{}]", p0, br.bit_position());
+        }
     }
     for &fi in plan.dry {
         let qm = dry_wet_qm(&data, fi);
+        let p0 = br.bit_position();
         data.dry.push(parse_ajced(
             br,
             AjccDataType::Dry,
@@ -502,9 +546,13 @@ pub fn parse_ajcc_data(br: &mut BitReader<'_>, b_5fronts: bool) -> Result<AjccDa
             b_no_dt,
             nps(fi),
         )?);
+        if trace {
+            eprintln!("  dry fi={fi} [{}..{}]", p0, br.bit_position());
+        }
     }
     for &fi in plan.wet {
         let qm = dry_wet_qm(&data, fi);
+        let p0 = br.bit_position();
         data.wet.push(parse_ajced(
             br,
             AjccDataType::Wet,
@@ -513,6 +561,9 @@ pub fn parse_ajcc_data(br: &mut BitReader<'_>, b_5fronts: bool) -> Result<AjccDa
             b_no_dt,
             nps(fi),
         )?);
+        if trace {
+            eprintln!("  wet fi={fi} [{}..{}]", p0, br.bit_position());
+        }
     }
     Ok(data)
 }
