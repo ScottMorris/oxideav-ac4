@@ -10,6 +10,8 @@ fn main() {
     let n_umx: u32 = env::args().nth(3).and_then(|v| v.parse().ok()).unwrap_or(1);
     let static_dmx: bool = env::args().nth(4).map(|v| v == "1").unwrap_or(true);
     let n_dmx: u32 = env::args().nth(5).and_then(|v| v.parse().ok()).unwrap_or(5);
+    let wall: i64 = env::args().nth(6).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let b_lfe_arg: bool = env::args().nth(7).map(|v| v != "0").unwrap_or(true);
     let data = fs::read(&path).expect("read");
     // header: audio_size(15) + b_more_bits(1) [+ variable_bits], byte-align
     let mut hr = BitReader::new(&data);
@@ -27,21 +29,25 @@ fn main() {
     // Params from upstream's TOC read of frame 0, first ajoc descriptor:
     // b_lfe=true, b_static_dmx=true, n_dmx=5, n_umx=1 (isf_config=4).
     let params = AjocBodyParams {
-        b_lfe: true,
+        b_lfe: b_lfe_arg,
         b_static_dmx: static_dmx,
         n_fullband_dmx_signals: n_dmx,
         n_fullband_upmix_signals: n_umx,
         obj_type_dmx: std::iter::once(ObjType::Dyn).chain(std::iter::repeat(ObjType::Bed).take(n_dmx as usize)).collect(),
         obj_type_umx: std::iter::once(ObjType::Dyn).chain(std::iter::repeat(ObjType::Isf).take(n_umx as usize)).collect(),
     };
-    let mut state = AjocDiffState::new((n_umx as usize)+2, (n_dmx as usize)+2, 4, 16);
+    let mut state = AjocDiffState::new(64, 64, 16, 64);
     let mut br = BitReader::with_position(&data, body_off);
     let total_bits = data.len() as u64 * 8;
     match parse_audio_data_ajoc(&mut br, &params, b_iframe, false, 2048, &mut state) {
         Ok(_) => {
-            let end = br.bit_position();
-            println!("AJOC-OK body[{}..{}] of {} bits (slack {} bits)",
-                body_off*8, end, total_bits, total_bits as i64 - end as i64);
+            let end = br.bit_position() as i64;
+            let sl = if wall>0 { wall - end } else { total_bits as i64 - end };
+            if wall>0 && sl.abs()<=8 {
+                println!("AJOC-WALL-HIT end={} wall={} slack={}", end, wall, sl);
+            } else {
+                println!("AJOC-OK end={} slack-to-wall={}", end, sl);
+            }
         }
         Err(e) => println!("AJOC-ERR {:?} @ bit {} of {}", e, br.bit_position(), total_bits),
     }
