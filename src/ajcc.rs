@@ -203,7 +203,16 @@ pub fn ajcc_huff_data(
         AjocDiffType::Freq => {
             if data_bands > 0 {
                 let hcb = get_ajcc_hcb(data_type, quant_mode, AcplHcbType::F0);
-                a_huff_data.push(huff_decode(br, hcb.len, hcb.cw)? as i32);
+                // AJCC_F0_RAW=1: research probe — the aspx war's
+                // deviation #5 (raw fixed-width F0 instead of
+                // Huffman); width = ceil(log2(alphabet)).
+                if std::env::var_os("AJCC_F0_RAW").is_some() {
+                    let n = hcb.len.len().max(2);
+                    let w = 32 - (n as u32 - 1).leading_zeros();
+                    a_huff_data.push(br.read_u32(w)? as i32);
+                } else {
+                    a_huff_data.push(huff_decode(br, hcb.len, hcb.cw)? as i32);
+                }
                 let hcb = get_ajcc_hcb(data_type, quant_mode, AcplHcbType::Df);
                 for _ in 1..data_bands {
                     a_huff_data.push(huff_decode(br, hcb.len, hcb.cw)? as i32 - hcb.cb_off);

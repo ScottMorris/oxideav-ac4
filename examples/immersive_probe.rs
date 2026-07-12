@@ -129,12 +129,20 @@ fn strict_walk(
     if !all {
         return None;
     }
+    let _ = (ac, st);
+    // War reality §3: 2-bit pre-add-pair gate (sap bit + one
+    // unattributed bit); sap=1 brings two chparam_infos over the
+    // A-SPX core band count (round-406 rule).
     let b_sap = br.read_bit().ok()?;
+    let _gate2 = br.read_bit().ok()?;
     if b_sap {
-        let _ = parse_chparam_info(&mut br, &[core_m0.max(1)]).ok()?;
-        let _ = parse_chparam_info(&mut br, &[core_m0.max(1)]).ok()?;
+        let m = oxideav_ac4::mch::aspx_core_band_count(cfg, TL).unwrap_or(core_m0.max(1));
+        let _ = parse_chparam_info(&mut br, &[m]).ok()?;
+        let _ = parse_chparam_info(&mut br, &[m]).ok()?;
     }
-    let p = parse_two_channel_data(&mut br, TL).ok()?;
+    // War §4: the additional-pair grammar (untruncated sections,
+    // body0 bound discovery, core-band ms).
+    let p = oxideav_ac4::mch::parse_two_channel_data_additional(&mut br, TL, Some(cfg)).ok()?;
     for c in 0..2 {
         if !(p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
             || p.scaled_spec_windows_per_channel.get(c).map_or(false, |s| s.is_some()))
@@ -143,13 +151,17 @@ fn strict_walk(
         }
     }
     let add_end = br.bit_position();
-    let mut st2 = st.clone();
-    for _ in 0..3 {
-        aspx2(&mut br, cfg, false, &mut st2).ok()?;
-    }
-    aspx1(&mut br, cfg, false, &mut st2).ok()?;
-    for _ in 0..4 {
-        let _ = parse_acpl_data_1ch(&mut br, ac.num_param_bands, 0, ac.quant_mode).ok()?;
+    // War §5: four trailers (2ch, 2ch, 1ch, 2ch), sticky slot xovers
+    // [0, 0, 0, 4].
+    for (kind, xo) in [(2u8, 0u8), (2, 0), (1, 0), (2, 4)] {
+        let mut t = Box::<SubstreamTools>::default();
+        t.aspx_xover_subband_offset = Some(xo);
+        let r = if kind == 2 {
+            parse_aspx_data_2ch_body(&mut br, &mut t, cfg, false, TL)
+        } else {
+            parse_aspx_data_1ch_body(&mut br, &mut t, cfg, false, TL)
+        };
+        r.ok()?;
     }
     Some((wall as i64 - br.bit_position() as i64, grp, add_end))
 }
@@ -369,7 +381,7 @@ fn main() {
                     if let Some((res, grp, add_end)) =
                         strict_walk(b2, &cfg, &ac, &sticky, wall)
                     {
-                        if (-8..=80).contains(&res) {
+                        if (0..=8).contains(&res) {
                             println!(
                                 "REGION f={i} lfe_end={lfe_end} rl={rl} grp={grp} add_end={add_end} res={res}"
                             );
