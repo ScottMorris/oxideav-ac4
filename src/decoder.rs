@@ -2424,21 +2424,30 @@ impl Decoder for Ac4Decoder {
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.five_x_coding_config);
+        // Round 412b: the 7_X extension amplifies quiet cores to e14-e18
+        // (uncalibrated envelope gains — same disease as the sf law, new
+        // organ). Opt-in via AC4_ASPX_EXT=1 until the envelope dequant
+        // is reference-calibrated.
+        let sx_ext_on = std::env::var_os("AC4_ASPX_EXT").is_some();
         let sx_aspx_cfg = self
             .last_substream
             .as_ref()
+            .filter(|_| sx_ext_on)
             .and_then(|sub| sub.tools.aspx_config.clone());
         let sx_aspx_lr = self
             .last_substream
             .as_ref()
+            .filter(|_| sx_ext_on)
             .and_then(|sub| sub.tools.seven_x_aspx_lr.clone());
         let sx_aspx_ls_rs = self
             .last_substream
             .as_ref()
+            .filter(|_| sx_ext_on)
             .and_then(|sub| sub.tools.seven_x_aspx_ls_rs.clone());
         let sx_aspx_centre = self
             .last_substream
             .as_ref()
+            .filter(|_| sx_ext_on)
             .and_then(|sub| sub.tools.seven_x_aspx_centre.clone());
         let cfg2_four_channel_data = self
             .last_substream
