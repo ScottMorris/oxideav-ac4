@@ -4013,6 +4013,99 @@ pub fn walk_ac4_substream_sticky(
     })
 }
 
+
+/// THE KEY HUNT (round 413): mono-body grammar-variant sweep against
+/// P-frame region fences. specs_arg = "file:start:target,...".
+pub fn debug_region_variant_sweep(specs_arg: &str) {
+    let specs_env = specs_arg.to_string();
+let specs: Vec<(String, u64, u64)> = specs_env
+            .split(',')
+            .map(|s| {
+                let p: Vec<&str> = s.split(':').collect();
+                (p[0].to_string(), p[1].parse().unwrap(), p[2].parse().unwrap())
+            })
+            .collect();
+        let datas: Vec<Vec<u8>> = specs.iter().map(|(f, _, _)| std::fs::read(f).expect("read")).collect();
+        let mut winners: Vec<(u32, usize)> = Vec::new();
+        // variant bits: [hdr:2][ref:1][dpcm:1][snf:2][trunc:1] = 7 bits = 128 combos
+        for v in 0u32..128 {
+            let hdr = v & 3;          // 0=3-bit msfb, 1=6-bit msfb, 2=ti+psy(1b long + 6b msfb), 3=NO header
+            let no_ref = (v >> 2) & 1 == 1;   // skip reference_scale_factor byte
+            let dpcm_all = (v >> 3) & 1 == 1; // first_scf_found=true entering (all bands huffman)
+            let snf_mode = (v >> 4) & 3;      // 0=normal, 1=absent, 2=always-read-flag-only
+            let no_trunc = (v >> 6) & 1 == 1;
+            let mut hits = 0usize;
+            for (i, (_f, start, target)) in specs.iter().enumerate() {
+                let data = &datas[i];
+                let mut br = BitReader::with_position(data, 0);
+                if br.skip(*start as u32).is_err() { continue; }
+                // header
+                let max_sfb = match hdr {
+                    0 => br.read_u32(3).unwrap_or(0),
+                    1 => br.read_u32(6).unwrap_or(0),
+                    2 => {
+                        let _long = br.read_bit().unwrap_or(false);
+                        br.read_u32(6).unwrap_or(0)
+                    }
+                    _ => 63,
+                };
+                if max_sfb == 0 { continue; }
+                let tl = 2048u32;
+                let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else { continue };
+                let cap = crate::tables::num_sfb_48(tl).unwrap_or(63);
+                let m = max_sfb.min(cap);
+                // sections
+                let Ok(sections) = crate::asf_data::parse_asf_section_data_ext(&mut br, 3, tl, m, no_trunc) else { continue };
+                // spectral
+                let Ok((_q, mqi)) = crate::asf_data::parse_asf_spectral_data(&mut br, &sections, sfbo, m) else { continue };
+                // scalefac (variant-aware, inline)
+                let mut ok = true;
+                if !no_ref {
+                    if br.read_u32(8).is_err() { continue; }
+                }
+                let mut first = dpcm_all;
+                for sfb in 0..m as usize {
+                    let cb = sections.sfb_cb.get(sfb).copied().unwrap_or(0);
+                    if cb == 0 || mqi.get(sfb).copied().unwrap_or(0) == 0 { continue; }
+                    if first {
+                        if crate::huffman::huff_decode(&mut br, crate::huffman::HCB_SCALEFAC_LEN, crate::huffman::HCB_SCALEFAC_CW).is_err() { ok = false; break; }
+                    } else {
+                        first = true;
+                    }
+                }
+                if !ok { continue; }
+                // snf
+                match snf_mode {
+                    0 => {
+                        if let Ok(b) = br.read_bit() {
+                            if b {
+                                for sfb in 0..m as usize {
+                                    let cb = sections.sfb_cb.get(sfb).copied().unwrap_or(0);
+                                    if cb == 0 || mqi.get(sfb).copied().unwrap_or(0) == 0 {
+                                        if crate::huffman::huff_decode(&mut br, crate::huffman::HCB_SNF_LEN, crate::huffman::HCB_SNF_CW).is_err() { ok = false; break; }
+                                    }
+                                }
+                            }
+                        } else { ok = false; }
+                    }
+                    1 => {}
+                    _ => { let _ = br.read_bit(); }
+                }
+                if !ok { continue; }
+                let e = br.bit_position();
+                if e + 2 >= *target && e <= *target + 2 {
+                    hits += 1;
+                }
+            }
+            if hits >= 2 {
+                winners.push((v, hits));
+                eprintln!("VARIANT-HIT v={v:07b} hdr={} no_ref={} dpcm_all={} snf={} no_trunc={} hits={hits}",
+                    v&3, (v>>2)&1, (v>>3)&1, (v>>4)&3, (v>>6)&1);
+            }
+        }
+        eprintln!("variant sweep done, {} winners", winners.len());
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -5463,6 +5556,103 @@ mod tests {
             }
         }
         eprintln!("region aspx scan done, {hits} hits");
+    }
+
+    #[test]
+    #[ignore]
+    fn debug_scan_region_grammar_variants() {
+        // THE KEY HUNT: sweep mono-body grammar variants against the
+        // P-frame region fences. A variant that exact-ends on the cc
+        // position across MULTIPLE frames is the region grammar.
+        // Env: AC4_SCAN_SPECS = "file:start:target,file:start:target,.."
+        use oxideav_core::bits::BitReader;
+        let specs_env = std::env::var("AC4_SCAN_SPECS").expect("AC4_SCAN_SPECS");
+        let specs: Vec<(String, u64, u64)> = specs_env
+            .split(',')
+            .map(|s| {
+                let p: Vec<&str> = s.split(':').collect();
+                (p[0].to_string(), p[1].parse().unwrap(), p[2].parse().unwrap())
+            })
+            .collect();
+        let datas: Vec<Vec<u8>> = specs.iter().map(|(f, _, _)| std::fs::read(f).expect("read")).collect();
+        let mut winners: Vec<(u32, usize)> = Vec::new();
+        // variant bits: [hdr:2][ref:1][dpcm:1][snf:2][trunc:1] = 7 bits = 128 combos
+        for v in 0u32..128 {
+            let hdr = v & 3;          // 0=3-bit msfb, 1=6-bit msfb, 2=ti+psy(1b long + 6b msfb), 3=NO header
+            let no_ref = (v >> 2) & 1 == 1;   // skip reference_scale_factor byte
+            let dpcm_all = (v >> 3) & 1 == 1; // first_scf_found=true entering (all bands huffman)
+            let snf_mode = (v >> 4) & 3;      // 0=normal, 1=absent, 2=always-read-flag-only
+            let no_trunc = (v >> 6) & 1 == 1;
+            let mut hits = 0usize;
+            for (i, (_f, start, target)) in specs.iter().enumerate() {
+                let data = &datas[i];
+                let mut br = BitReader::with_position(data, 0);
+                if br.skip(*start as u32).is_err() { continue; }
+                // header
+                let max_sfb = match hdr {
+                    0 => br.read_u32(3).unwrap_or(0),
+                    1 => br.read_u32(6).unwrap_or(0),
+                    2 => {
+                        let _long = br.read_bit().unwrap_or(false);
+                        br.read_u32(6).unwrap_or(0)
+                    }
+                    _ => 63,
+                };
+                if max_sfb == 0 { continue; }
+                let tl = 2048u32;
+                let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else { continue };
+                let cap = crate::tables::num_sfb_48(tl).unwrap_or(63);
+                let m = max_sfb.min(cap);
+                // sections
+                let Ok(sections) = crate::asf_data::parse_asf_section_data_ext(&mut br, 3, tl, m, no_trunc) else { continue };
+                // spectral
+                let Ok((_q, mqi)) = crate::asf_data::parse_asf_spectral_data(&mut br, &sections, sfbo, m) else { continue };
+                // scalefac (variant-aware, inline)
+                let mut ok = true;
+                if !no_ref {
+                    if br.read_u32(8).is_err() { continue; }
+                }
+                let mut first = dpcm_all;
+                for sfb in 0..m as usize {
+                    let cb = sections.sfb_cb.get(sfb).copied().unwrap_or(0);
+                    if cb == 0 || mqi.get(sfb).copied().unwrap_or(0) == 0 { continue; }
+                    if first {
+                        if crate::huffman::huff_decode(&mut br, crate::huffman::HCB_SCALEFAC_LEN, crate::huffman::HCB_SCALEFAC_CW).is_err() { ok = false; break; }
+                    } else {
+                        first = true;
+                    }
+                }
+                if !ok { continue; }
+                // snf
+                match snf_mode {
+                    0 => {
+                        if let Ok(b) = br.read_bit() {
+                            if b {
+                                for sfb in 0..m as usize {
+                                    let cb = sections.sfb_cb.get(sfb).copied().unwrap_or(0);
+                                    if cb == 0 || mqi.get(sfb).copied().unwrap_or(0) == 0 {
+                                        if crate::huffman::huff_decode(&mut br, crate::huffman::HCB_SNF_LEN, crate::huffman::HCB_SNF_CW).is_err() { ok = false; break; }
+                                    }
+                                }
+                            }
+                        } else { ok = false; }
+                    }
+                    1 => {}
+                    _ => { let _ = br.read_bit(); }
+                }
+                if !ok { continue; }
+                let e = br.bit_position();
+                if e + 2 >= *target && e <= *target + 2 {
+                    hits += 1;
+                }
+            }
+            if hits >= 2 {
+                winners.push((v, hits));
+                eprintln!("VARIANT-HIT v={v:07b} hdr={} no_ref={} dpcm_all={} snf={} no_trunc={} hits={hits}",
+                    v&3, (v>>2)&1, (v>>3)&1, (v>>4)&3, (v>>6)&1);
+            }
+        }
+        eprintln!("variant sweep done, {} winners", winners.len());
     }
 
     fn debug_parse_7x_front_at() {
