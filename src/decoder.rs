@@ -3720,6 +3720,7 @@ impl Decoder for Ac4Decoder {
                         .or(fallback.as_ref())
                         .and_then(|p| p.get(i).copied())
                         .unwrap_or(0.0);
+                    let sample_f = if sample_f.is_finite() { sample_f } else { 0.0 };
                     if let Some(fb) = f32buf.as_mut() {
                         fb.push(sample_f);
                     }
