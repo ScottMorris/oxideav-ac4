@@ -1,0 +1,350 @@
+//! Round 415: parse the audio substream as part-2 §6.2.4.1
+//! immersive_channel_element(b_lfe=1, b_5fronts=0, b_iframe) — the
+//! 7.1.4 container — and meter every frame against the audio_size
+//! wall. The A-JOC (3+LFE) reading and this one converge at the LFE
+//! on I-frames, which is why the LFE always decoded; the SCPL/A-CPL
+//! tail here is the candidate for the 0.7-13 kbit per-frame deficit
+//! the round-415 wall meter exposed.
+use oxideav_ac4::acpl::{parse_acpl_config_1ch, parse_acpl_data_1ch, Acpl1chMode, AcplConfig1ch};
+use oxideav_ac4::asf::{parse_aspx_data_1ch_body, parse_aspx_data_2ch_body, SubstreamTools};
+use oxideav_ac4::aspx::{parse_aspx_config, parse_companding_control, AspxConfig};
+use oxideav_ac4::asf::parse_chparam_info;
+use oxideav_ac4::mch::{
+    parse_five_channel_data, parse_four_channel_data, parse_mono_data, parse_three_channel_data,
+    parse_two_channel_data,
+};
+use oxideav_ac4::toc;
+use oxideav_core::bits::BitReader;
+use std::{env, fs};
+
+include!("mp4_helper.rs");
+
+const TL: u32 = 2048;
+
+#[derive(Default, Clone)]
+struct Sticky {
+    aspx: Option<AspxConfig>,
+    xover: Option<u8>,
+    acpl: Option<AcplConfig1ch>,
+}
+
+fn aspx2(
+    br: &mut BitReader<'_>,
+    cfg: &AspxConfig,
+    b_iframe: bool,
+    st: &mut Sticky,
+) -> Result<(), oxideav_core::Error> {
+    let mut tools = Box::<SubstreamTools>::default();
+    if let Some(x) = st.xover {
+        tools.aspx_xover_subband_offset = Some(x);
+    }
+    parse_aspx_data_2ch_body(br, &mut tools, cfg, b_iframe, TL)?;
+    if b_iframe {
+        if let Some(x) = tools.aspx_xover_subband_offset {
+            st.xover = Some(x);
+        }
+    }
+    Ok(())
+}
+
+fn aspx1(
+    br: &mut BitReader<'_>,
+    cfg: &AspxConfig,
+    b_iframe: bool,
+    st: &mut Sticky,
+) -> Result<(), oxideav_core::Error> {
+    let mut tools = Box::<SubstreamTools>::default();
+    if let Some(x) = st.xover {
+        tools.aspx_xover_subband_offset = Some(x);
+    }
+    parse_aspx_data_1ch_body(br, &mut tools, cfg, b_iframe, TL)?;
+    if b_iframe {
+        if let Some(x) = tools.aspx_xover_subband_offset {
+            st.xover = Some(x);
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    let path = env::args().nth(1).expect("mp4");
+    let max_frames: usize = env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(30);
+    let force_mode: Option<u32> = env::args().nth(3).and_then(|v| v.parse().ok());
+    let data = fs::read(&path).expect("read");
+    let frames = mp4::extract_ac4_samples(&data).expect("mp4");
+    let mut sticky = Sticky::default();
+
+    for (i, payload) in frames.iter().enumerate().take(max_frames) {
+        let Ok(info) = toc::parse_ac4_toc(payload) else { continue };
+        let b_iframe = info
+            .presentations
+            .first()
+            .map(|p| p.b_iframe)
+            .unwrap_or(info.b_iframe_global);
+        let base = (info.toc_size + info.payload_base) as usize;
+        let idx = info.substream_index.unwrap_or(0) as usize;
+        let start = base
+            + info
+                .substream_sizes
+                .iter()
+                .take(idx)
+                .map(|&s| s as usize)
+                .sum::<usize>();
+        let end = info
+            .substream_sizes
+            .get(idx)
+            .map(|&s| (start + s as usize).min(payload.len()))
+            .unwrap_or(payload.len());
+        if start >= payload.len() {
+            continue;
+        }
+        let sb = &payload[start..end];
+        let mut br = BitReader::new(sb);
+        let mut audio_size = br.read_u32(15).unwrap();
+        if br.read_bit().unwrap() {
+            audio_size += oxideav_ac4::toc::variable_bits(&mut br, 7).unwrap() << 15;
+        }
+        br.align_to_byte();
+        let wall = br.bit_position() + audio_size as u64 * 8;
+
+        let r = (|| -> Result<String, oxideav_core::Error> {
+            // immersive_codec_mode_code: 1 bit, 0 -> 2 more.
+            // AC4_IMM_P_NOCODE=1: P-frames do NOT carry the code —
+            // reuse the I-frame's mode and consume nothing.
+            let p_nocode = std::env::var_os("AC4_IMM_P_NOCODE").is_some();
+            // AC4_IMM_P_SKIP=<bits>: P-frames carry a fixed-size prefix
+            // (observed constant '010111' on this stream) — skip it and
+            // reuse the sticky I-frame mode.
+            let p_skip: Option<u32> = std::env::var("AC4_IMM_P_SKIP")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            static mut STICKY_MODE: u32 = 3;
+            let mode = if !b_iframe && p_skip.is_some() {
+                br.skip(p_skip.unwrap())?;
+                unsafe { STICKY_MODE }
+            } else if !b_iframe && p_nocode {
+                unsafe { STICKY_MODE }
+            } else if let Some(m) = force_mode {
+                // Still consume the real code bits.
+                if !br.read_bit()? {
+                    let _ = br.read_u32(2)?;
+                }
+                m
+            } else if br.read_bit()? {
+                4
+            } else {
+                br.read_u32(2)?
+            };
+            if b_iframe {
+                unsafe { STICKY_MODE = mode };
+            }
+            let seven_ch_static = mode <= 3;
+            let mut log = format!("mode={mode} ");
+            if b_iframe {
+                if mode != 0 {
+                    sticky.aspx = Some(parse_aspx_config(&mut br)?);
+                }
+                if mode == 2 {
+                    sticky.acpl = Some(parse_acpl_config_1ch(&mut br, Acpl1chMode::Partial)?);
+                }
+                if mode == 3 {
+                    sticky.acpl = Some(parse_acpl_config_1ch(&mut br, Acpl1chMode::Full)?);
+                }
+            }
+            // LFE.
+            let lfe = parse_mono_data(&mut br, true, TL)?;
+            log += &format!(
+                "lfe_end@{} ok={} ",
+                br.bit_position(),
+                lfe.scaled_spec.is_some()
+            );
+            if mode == 4 {
+                let _ = parse_companding_control(&mut br, 5)?;
+            }
+            let grouping = br.read_u32(2)?;
+            log += &format!("grp={grouping} ");
+            let mut core_m0 = 0u32;
+            let mut bodies_ok = 0usize;
+            let mut bodies_n = 0usize;
+            let mut count = |ok: bool, n: &mut usize, k: &mut usize| {
+                *n += 1;
+                if ok {
+                    *k += 1;
+                }
+            };
+            match grouping {
+                0 => {
+                    let _two_ch_mode = br.read_bit()?;
+                    for _ in 0..2 {
+                        let p = parse_two_channel_data(&mut br, TL)?;
+                        core_m0 = p.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(core_m0);
+                        for c in 0..2 {
+                            count(
+                                p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                                    || p.scaled_spec_windows_per_channel
+                                        .get(c)
+                                        .map_or(false, |s| s.is_some()),
+                                &mut bodies_n,
+                                &mut bodies_ok,
+                            );
+                        }
+                    }
+                    let m = parse_mono_data(&mut br, false, TL)?;
+                    count(
+                        m.scaled_spec.is_some() || m.scaled_spec_windows.is_some(),
+                        &mut bodies_n,
+                        &mut bodies_ok,
+                    );
+                }
+                1 => {
+                    let t = parse_three_channel_data(&mut br, TL)?;
+                    core_m0 = t.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(0);
+                    for c in 0..3 {
+                        count(
+                            t.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                                || t.scaled_spec_windows_per_channel
+                                    .get(c)
+                                    .map_or(false, |s| s.is_some()),
+                            &mut bodies_n,
+                            &mut bodies_ok,
+                        );
+                    }
+                    let p = parse_two_channel_data(&mut br, TL)?;
+                    for c in 0..2 {
+                        count(
+                            p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                                || p.scaled_spec_windows_per_channel
+                                    .get(c)
+                                    .map_or(false, |s| s.is_some()),
+                            &mut bodies_n,
+                            &mut bodies_ok,
+                        );
+                    }
+                }
+                2 => {
+                    let f = parse_four_channel_data(&mut br, TL)?;
+                    core_m0 = f.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(0);
+                    for c in 0..4 {
+                        count(
+                            f.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some()),
+                            &mut bodies_n,
+                            &mut bodies_ok,
+                        );
+                    }
+                    let m = parse_mono_data(&mut br, false, TL)?;
+                    count(
+                        m.scaled_spec.is_some() || m.scaled_spec_windows.is_some(),
+                        &mut bodies_n,
+                        &mut bodies_ok,
+                    );
+                }
+                _ => {
+                    let f = parse_five_channel_data(&mut br, TL)?;
+                    core_m0 = f.psy_info.as_ref().map(|x| x.max_sfb_0).unwrap_or(0);
+                    for c in 0..5 {
+                        count(
+                            f.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some()),
+                            &mut bodies_n,
+                            &mut bodies_ok,
+                        );
+                    }
+                }
+            }
+            log += &format!("core_end@{} bodies={bodies_ok}/{bodies_n} ", br.bit_position());
+            if seven_ch_static {
+                let b_use_sap_add_ch = br.read_bit()?;
+                if b_use_sap_add_ch {
+                    let m = core_m0.max(1);
+                    let _ = parse_chparam_info(&mut br, &[m])?;
+                    let _ = parse_chparam_info(&mut br, &[m])?;
+                }
+                let p = parse_two_channel_data(&mut br, TL)?;
+                let addok = (0..2)
+                    .filter(|&c| {
+                        p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                            || p.scaled_spec_windows_per_channel
+                                .get(c)
+                                .map_or(false, |s| s.is_some())
+                    })
+                    .count();
+                log += &format!(
+                    "sap={} addpair_end@{} addok={addok} ",
+                    u8::from(b_use_sap_add_ch),
+                    br.bit_position()
+                );
+            }
+            let cfg = sticky
+                .aspx
+                .clone()
+                .ok_or_else(|| oxideav_core::Error::invalid("no sticky aspx cfg"))?;
+            if mode == 1 {
+                for _ in 0..3 {
+                    aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                }
+                aspx1(&mut br, &cfg, b_iframe, &mut sticky)?;
+                // reading Table literally: [2ch 2ch 1ch] (b_5fronts=0 ->
+                // one more 2ch) then 2ch 2ch — total 6x 2ch + 1x 1ch.
+                for _ in 0..2 {
+                    aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                }
+            } else if mode >= 2 {
+                aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                if seven_ch_static {
+                    aspx2(&mut br, &cfg, b_iframe, &mut sticky)?;
+                }
+                aspx1(&mut br, &cfg, b_iframe, &mut sticky)?;
+            }
+            log += &format!("aspx_end@{} ", br.bit_position());
+            if mode == 4 {
+                let _ = oxideav_ac4::ajcc::parse_ajcc_data(&mut br, false)?;
+                log += &format!("ajcc_end@{} ", br.bit_position());
+            }
+            if mode <= 2 {
+                // SCPL pairs (Tfl/Tfr, Tbl/Tbr) + 4x chparam.
+                let mut scplok = 0;
+                for _ in 0..2 {
+                    let p = parse_two_channel_data(&mut br, TL)?;
+                    scplok += (0..2)
+                        .filter(|&c| {
+                            p.scaled_spec_per_channel.get(c).map_or(false, |s| s.is_some())
+                                || p.scaled_spec_windows_per_channel
+                                    .get(c)
+                                    .map_or(false, |s| s.is_some())
+                        })
+                        .count();
+                }
+                let m = core_m0.max(1);
+                for _ in 0..4 {
+                    let _ = parse_chparam_info(&mut br, &[m])?;
+                }
+                log += &format!("scpl_end@{} scplok={scplok} ", br.bit_position());
+            }
+            if mode == 2 || mode == 3 {
+                let ac = sticky
+                    .acpl
+                    .clone()
+                    .ok_or_else(|| oxideav_core::Error::invalid("no sticky acpl cfg"))?;
+                for _ in 0..4 {
+                    let _ = parse_acpl_data_1ch(
+                        &mut br,
+                        ac.num_param_bands,
+                        0,
+                        ac.quant_mode,
+                    )?;
+                }
+                log += &format!("acpl_end@{} ", br.bit_position());
+            }
+            log += &format!(
+                "END@{} residue={}",
+                br.bit_position(),
+                wall as i64 - br.bit_position() as i64
+            );
+            Ok(log)
+        })();
+        match r {
+            Ok(log) => println!("frame {i} ifr={} wall@{wall} {log}", u8::from(b_iframe)),
+            Err(e) => println!("frame {i} ifr={} ERR {e:?}", u8::from(b_iframe)),
+        }
+    }
+}

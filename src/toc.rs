@@ -454,10 +454,31 @@ pub fn parse_ac4_toc(bytes: &[u8]) -> Result<Ac4FrameInfo> {
         // back-fill, and the top-level `ajoc_info`/`channel_coded`, still
         // reflect the first group specifically, for single-group frames
         // (the overwhelmingly common case) where that's the whole story.
+        let toc_trace = std::env::var_os("AC4_TOC_TRACE").is_some();
+        if toc_trace {
+            eprintln!(
+                "TOC v={bitstream_version} seq={sequence_counter} fs={fs_index} fri={frame_rate_index} ifg={} npres={n_presentations} groups={total_n_substream_groups} groups_start@{}",
+                u8::from(b_iframe_global),
+                br.bit_position()
+            );
+        }
         let mut groups: Vec<SubstreamGroupSummary> = Vec::with_capacity(total_n_substream_groups as usize);
-        for _ in 0..total_n_substream_groups {
+        for gi in 0..total_n_substream_groups {
             let g =
                 parse_substream_group_info(&mut br, bitstream_version, fs_index, frame_rate_index)?;
+            if toc_trace {
+                eprintln!(
+                    "TOC group[{gi}] end@{} chan_coded={} channels={} mode={:?} sub_idx={:?} ajoc={} objs={} oamd={}",
+                    br.bit_position(),
+                    g.channel_coded,
+                    g.channels,
+                    g.channel_mode,
+                    g.substream_index,
+                    g.ajoc.len(),
+                    g.objs.len(),
+                    g.oamd.len()
+                );
+            }
             ajoc_substreams.extend(g.ajoc.clone());
             obj_substreams.extend(g.objs.clone());
             oamd_substreams.extend(g.oamd.clone());

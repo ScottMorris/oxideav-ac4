@@ -99,7 +99,7 @@ fn main() {
                 break;
             }
             let mut st2 = new_ajoc_diff_state(1, 3, 7);
-            if oxideav_ac4::ajoc_substream::parse_audio_data_ajoc_tail(
+            if let Ok(tail) = oxideav_ac4::ajoc_substream::parse_audio_data_ajoc_tail(
                 &mut b2,
                 &params,
                 b_iframe,
@@ -108,25 +108,33 @@ fn main() {
                 None,
                 None,
                 Some(Default::default()),
-            )
-            .is_ok()
-            {
+            ) {
                 let res = wall as i64 - b2.bit_position() as i64;
                 if (0..=96).contains(&res) {
+                    let ctrl = &tail.ajoc_frame.ctrl;
+                    let objpres: String = ctrl
+                        .object_present
+                        .iter()
+                        .map(|&p| if p { '1' } else { '0' })
+                        .collect();
+                    let ndp = ctrl.data_point_info.num_dpoints;
+                    let nbc: Vec<u8> = ctrl.num_bands_code.clone();
+                    println!(
+                        "TAIL f={i} cand={cand} len={} res={res} ndec={} ndp={ndp} objpres={objpres} nbc={:?} dmxT={} umxT={} oamdx={}",
+                        wall - cand,
+                        tail.ajoc_frame.num_decorr,
+                        nbc,
+                        u8::from(tail.dmx_timing.is_some()),
+                        u8::from(tail.umx_timing.is_some()),
+                        u8::from(tail.oamd_extension.is_some()),
+                    );
                     hits.push((cand, res));
                 }
             }
         }
-        let n = hits.len();
-        let show: Vec<String> = hits
-            .iter()
-            .take(10)
-            .map(|(c, r)| format!("{}({}bits r{})", c, wall - c, r))
-            .collect();
         println!(
-            "frame {i}: deficit {deficit} our_tail@{end1} wall@{wall} tail_hits={n} [{}]{}",
-            show.join(" "),
-            if n > 10 { " ..." } else { "" }
+            "frame {i}: deficit {deficit} our_tail@{end1} wall@{wall} tail_hits={}",
+            hits.len()
         );
     }
 }
