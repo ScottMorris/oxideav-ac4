@@ -2921,14 +2921,15 @@ pub fn parse_7x_audio_data_outer(
     if !matches!(mode, SevenXCodecMode::Simple) {
         crate::aspx::set_f0_raw_mode(f0_combo & 1 == 1);
         let _t0 = br.bit_position();
-        if let Err(e) =
-            crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+        if crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base)
+            .is_err()
         {
             if std::env::var_os("AC4_T").is_some() {
-                eprintln!("BAIL aspx-2ch#1 @{} err={e:?}", br.bit_position());
+                eprintln!("BAIL aspx-2ch#1 @{}", br.bit_position());
             }
             return Ok(());
         }
+        tools.seven_x_aspx_lr = crate::asf::harvest_aspx_2ch_trailer(tools);
         if _ttr {
             eprintln!("TRL#1 2ch [{_t0}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
@@ -2941,6 +2942,7 @@ pub fn parse_7x_audio_data_outer(
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-2ch#2 @{}", br.bit_position()); }
             return Ok(());
         }
+        tools.seven_x_aspx_ls_rs = crate::asf::harvest_aspx_2ch_trailer(tools);
         if _ttr {
             eprintln!("TRL#2 2ch [{_t1}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
@@ -2953,6 +2955,7 @@ pub fn parse_7x_audio_data_outer(
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-1ch @{}", br.bit_position()); }
             return Ok(());
         }
+        tools.seven_x_aspx_centre = crate::asf::harvest_aspx_1ch_trailer(tools);
         if _ttr {
             eprintln!("TRL#3 1ch [{_t2}..{}) slots={:?}", br.bit_position(), &tools.aspx_xover_slots[..4]);
         }
@@ -2964,6 +2967,9 @@ pub fn parse_7x_audio_data_outer(
     if matches!(mode, SevenXCodecMode::Aspx) {
         crate::aspx::set_f0_raw_mode((f0_combo >> 3) & 1 == 1);
         let r = crate::asf::parse_aspx_data_2ch_body(br, tools, &aspx_cfg, b_iframe, frame_len_base);
+        if r.is_ok() {
+            tools.seven_x_aspx_add = crate::asf::harvest_aspx_2ch_trailer(tools);
+        }
         crate::aspx::set_f0_raw_mode(false);
         if r.is_err() {
             if std::env::var_os("AC4_T").is_some() { eprintln!("BAIL aspx-extra @{}", br.bit_position()); }

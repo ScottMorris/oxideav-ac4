@@ -1593,6 +1593,13 @@ pub struct SubstreamTools {
     /// `three_channel_data[2]` (the third channel of the
     /// three_channel_data shell).
     pub cfg1_aspx_centre: Option<aspx::FiveXAspxTrailer>,
+    /// Round 412: captured 7_X ASPX trailers (walk order: 2ch front
+    /// pair, 2ch surround pair, 1ch centre, 2ch additional pair) —
+    /// feed the same per-slot HF extension the 5_X path uses.
+    pub seven_x_aspx_lr: Option<aspx::FiveXAspxTrailer>,
+    pub seven_x_aspx_ls_rs: Option<aspx::FiveXAspxTrailer>,
+    pub seven_x_aspx_centre: Option<aspx::FiveXAspxTrailer>,
+    pub seven_x_aspx_add: Option<aspx::FiveXAspxTrailer>,
     /// 5_X SIMPLE/ASPX cfg3 ASPX trailer for the front L/R pair —
     /// extracted from `five_channel_data[0..1]`.
     pub cfg3_aspx_lr: Option<aspx::FiveXAspxTrailer>,
@@ -2319,6 +2326,109 @@ impl AspxTrailerSnapshot {
 ///
 /// Returns `None` when `parse_aspx_data_2ch_body` bails or when the
 /// frequency-table derivation didn't fire (the trailer is then
+
+/// Round 412: harvest a 2ch trailer from the CURRENT tools state
+/// (after a successful parse_aspx_data_2ch_body) without snapshot
+/// restore — the 7_X walk keeps its mutations.
+pub(crate) fn harvest_aspx_2ch_trailer(tools: &SubstreamTools) -> Option<aspx::FiveXAspxTrailer> {
+
+        let xover = tools.aspx_xover_subband_offset?;
+        let frequency_tables = tools.aspx_frequency_tables.clone()?;
+        let framing_pri = tools.aspx_framing_primary.clone()?;
+        let qmode_pri = tools.aspx_qmode_env_primary?;
+        let delta_dir_pri = tools.aspx_delta_dir_primary.clone()?;
+        let sig_pri = tools.aspx_data_sig_primary.clone().unwrap_or_default();
+        let noise_pri = tools.aspx_data_noise_primary.clone().unwrap_or_default();
+        // hfgen_2ch carries per-channel `add_harmonic` + `tna_mode`
+        // arrays. When absent (xover too high to leave any sig
+        // sbgroups, etc.) we treat the channel as having no harmonic /
+        // TNS info — the extender then falls back to the noise-only
+        // path inside aspx_extend_pcm.
+        let hfgen = tools.aspx_hfgen_iwc_2ch.clone();
+        let (ah_pri, tna_pri, ah_sec, tna_sec) = if let Some(h) = hfgen.as_ref() {
+            let ah_pri = h.add_harmonic.first().cloned();
+            let ah_sec = h.add_harmonic.get(1).cloned();
+            let tna_pri = h.tna_mode.first().cloned();
+            let tna_sec = h.tna_mode.get(1).cloned();
+            (ah_pri, tna_pri, ah_sec, tna_sec)
+        } else {
+            (None, None, None, None)
+        };
+        let primary = aspx::FiveXAspxChannelTrailer {
+            framing: framing_pri.clone(),
+            qmode_env: qmode_pri,
+            delta_dir: delta_dir_pri,
+            data_sig: sig_pri,
+            data_noise: noise_pri,
+            add_harmonic: ah_pri,
+            tna_mode: tna_pri,
+        };
+        // Secondary channel: framing reuses the primary's when
+        // `aspx_balance == 1` (no aspx_framing(1) in the bitstream);
+        // delta-dir / sig / noise are always present per Table 52.
+        let framing_sec = tools
+            .aspx_framing_secondary
+            .clone()
+            .unwrap_or_else(|| framing_pri.clone());
+        let qmode_sec = tools.aspx_qmode_env_secondary.unwrap_or(qmode_pri);
+        let delta_dir_sec = tools
+            .aspx_delta_dir_secondary
+            .clone()
+            .unwrap_or_else(|| tools.aspx_delta_dir_primary.clone().unwrap_or_default());
+        let sig_sec = tools.aspx_data_sig_secondary.clone().unwrap_or_default();
+        let noise_sec = tools.aspx_data_noise_secondary.clone().unwrap_or_default();
+        let secondary = aspx::FiveXAspxChannelTrailer {
+            framing: framing_sec,
+            qmode_env: qmode_sec,
+            delta_dir: delta_dir_sec,
+            data_sig: sig_sec,
+            data_noise: noise_sec,
+            add_harmonic: ah_sec,
+            tna_mode: tna_sec,
+        };
+        Some(aspx::FiveXAspxTrailer {
+            xover,
+            frequency_tables,
+            primary,
+            secondary: Some(secondary),
+        })
+    
+}
+
+
+/// Round 412: 1ch variant of [`harvest_aspx_2ch_trailer`].
+pub(crate) fn harvest_aspx_1ch_trailer(tools: &SubstreamTools) -> Option<aspx::FiveXAspxTrailer> {
+
+        let xover = tools.aspx_xover_subband_offset?;
+        let frequency_tables = tools.aspx_frequency_tables.clone()?;
+        let framing = tools.aspx_framing_primary.clone()?;
+        let qmode = tools.aspx_qmode_env_primary?;
+        let delta_dir = tools.aspx_delta_dir_primary.clone()?;
+        let data_sig = tools.aspx_data_sig_primary.clone().unwrap_or_default();
+        let data_noise = tools.aspx_data_noise_primary.clone().unwrap_or_default();
+        let hfgen = tools.aspx_hfgen_iwc_1ch.clone();
+        let (add_harmonic, tna_mode) = if let Some(h) = hfgen.as_ref() {
+            (Some(h.add_harmonic.clone()), Some(h.tna_mode.clone()))
+        } else {
+            (None, None)
+        };
+        Some(aspx::FiveXAspxTrailer {
+            xover,
+            frequency_tables,
+            primary: aspx::FiveXAspxChannelTrailer {
+                framing,
+                qmode_env: qmode,
+                delta_dir,
+                data_sig,
+                data_noise,
+                add_harmonic,
+                tna_mode,
+            },
+            secondary: None,
+        })
+    
+}
+
 /// considered unusable for bandwidth-extension).
 pub(crate) fn capture_aspx_data_2ch_trailer(
     br: &mut BitReader<'_>,

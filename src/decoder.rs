@@ -2424,6 +2424,22 @@ impl Decoder for Ac4Decoder {
             .last_substream
             .as_ref()
             .and_then(|sub| sub.tools.five_x_coding_config);
+        let sx_aspx_cfg = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.aspx_config.clone());
+        let sx_aspx_lr = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.seven_x_aspx_lr.clone());
+        let sx_aspx_ls_rs = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.seven_x_aspx_ls_rs.clone());
+        let sx_aspx_centre = self
+            .last_substream
+            .as_ref()
+            .and_then(|sub| sub.tools.seven_x_aspx_centre.clone());
         let cfg2_four_channel_data = self
             .last_substream
             .as_ref()
@@ -3367,10 +3383,10 @@ impl Decoder for Ac4Decoder {
                             &cfg_two_channel_data[1],
                             b_2ch,
                             cfg0_centre_mono.as_ref(),
-                            None,
-                            None,
-                            None,
-                            None,
+                            sx_aspx_lr.as_ref(),
+                            sx_aspx_ls_rs.as_ref(),
+                            sx_aspx_centre.as_ref(),
+                            sx_aspx_cfg.clone(),
                             None,
                             num_ts_in_ats,
                             samples as usize,
@@ -3428,10 +3444,10 @@ impl Decoder for Ac4Decoder {
                         self.dispatch_5x_cfg1_simple_aspx(
                             three,
                             tcd,
-                            None,
-                            None,
-                            None,
-                            None,
+                            sx_aspx_lr.as_ref(),
+                            sx_aspx_ls_rs.as_ref(),
+                            sx_aspx_centre.as_ref(),
+                            sx_aspx_cfg.clone(),
                             None,
                             num_ts_in_ats,
                             samples as usize,
@@ -3473,10 +3489,10 @@ impl Decoder for Ac4Decoder {
                         self.dispatch_5x_cfg2_simple_aspx(
                             four,
                             cfg2_back_mono.as_ref(),
-                            None,
-                            None,
-                            None,
-                            None,
+                            sx_aspx_lr.as_ref(),
+                            sx_aspx_ls_rs.as_ref(),
+                            sx_aspx_centre.as_ref(),
+                            sx_aspx_cfg.clone(),
                             None,
                             num_ts_in_ats,
                             samples as usize,
@@ -3517,10 +3533,10 @@ impl Decoder for Ac4Decoder {
                     {
                         self.dispatch_5x_cfg3_simple_aspx(
                             &five,
-                            None,
-                            None,
-                            None,
-                            None,
+                            sx_aspx_lr.as_ref(),
+                            sx_aspx_ls_rs.as_ref(),
+                            sx_aspx_centre.as_ref(),
+                            sx_aspx_cfg.clone(),
                             None,
                             num_ts_in_ats,
                             samples as usize,
