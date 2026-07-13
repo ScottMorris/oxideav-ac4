@@ -177,3 +177,25 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   freq res, dt dirs) such that the implied band-count x num_env
   codeword count EXACTLY spans [payload_start..token]; validate on
   the f29/f259 identical-prefix pair first.
+
+## Round 422 — the completeness theorem (read before ANY codeword claim)
+
+- **All 60 Huffman codebooks in the official tables are
+  Kraft-complete (sum 2^-len = 1.0)** — every book parses ANY bit
+  string without error. Consequences:
+  1. Parse-success chains can NEVER discriminate grammar (this
+     retroactively explains every lottery of the campaign, including
+     r421e's ENV_15_DT "landings" — hereby demoted to unproven).
+  2. Even decoded-value statistics are weakly discriminating: under
+     random bits, P(codeword) = 2^-len approximates the book's
+     design distribution (small deltas dominate either way).
+  3. The ONLY valid oracles: (a) exact count accounting (header
+     fields must imply the codeword count that exactly spans a
+     fenced region), (b) content validation vs the reference,
+     (c) CROSS-FRAME VALUE COHERENCE — dt-coded values accumulate
+     across consecutive frames into smooth per-band decay
+     trajectories on real data vs random walks on misparses.
+     Frames 679-683 (consecutive decay) are the trajectory corpus.
+- Payload identity of the one-element frames: OPEN again (was
+   "ENV_15_DT" — unproven). The param-header count-accounting +
+  trajectory oracle is the decisive instrument pair.
