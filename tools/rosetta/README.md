@@ -59,3 +59,33 @@ Next rungs: diff the sub029/259 and 345/347 pairs bit-by-bit to
 fence flag fields vs payload; then correlate flag bits across all
 skeletons with WHICH payloads follow (sizes known); then climb into
 the labeled single-channel frames.
+
+## Round 420c findings (head semantics + skeleton anatomy)
+
+- **The head flag bank follows the mix** (999-frame bit/label heat
+  map): audio bits 3-4 ≈ 1 on front-channel frames (L/R/C 0.82-0.95)
+  and ≈ 0 on surround frames (0.11); bit 10 ≈ 0.92 on surrounds vs
+  0.32 fronts. Companding-control-shaped (compressors engage where
+  the announcement is). Kraftwerk's constant '010111' P-head = the
+  fronts-always-active configuration of the same flag bank.
+- Common prefixes per (label, head) class end at ~10-13 bits —
+  content begins immediately after the head; downstream fields are
+  variable-length (heat-map smearing).
+- Skeleton anatomy (f1 = 56-bit audio): ones at bits 1,5,6,7 (head
+  '01000111'), then 16,18 ('1010'), 25,27 ('0101'), 39-42 ('1111');
+  bits 43-55 are zeros = fill → the real element ends by ~bit 43.
+  Note the shifted repetition 1010/0101 nine bits apart — two
+  similar empty sub-elements?
+- **f2's single differing bit (14) leaves audio_size unchanged (7B)**
+  — it gates the post-wall metadata block (f2 carries ~45B of
+  metadata vs f1's 2B). Grammar constraint: a standalone
+  metadata-presence-like flag lives at audio bit 14 in the silent
+  configuration.
+- Only 2 pure skeletons exist in this track (f1,f2); next rungs are
+  the 34-50-byte audio class (~14 frames, one small element each).
+
+Next: the skeleton enumerator — parametrized grammar search over
+f1's 43 real bits with hard constraints (field boundary at bit 14
+with both values legal and no length change; '000' at 3-5 = all
+groups silent; cross-validate every candidate on f2 and the
+34-50B class where one element turns on).
