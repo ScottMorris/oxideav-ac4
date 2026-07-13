@@ -35,3 +35,27 @@ bits (exact closure, fill < 8); validate against 029/259/031; then
 climb: each next size class adds ONE element with content — its
 grammar is isolated by the delta. The full per-frame size histogram
 of the track spans 11..~2000 bytes: hundreds of rungs.
+
+## Round 420b findings (the ladder's first rungs)
+
+- All 12 skeleton frames (<60 bytes) share a **10-bit head
+  `0100011100`**, then diverge — the post-head region is the flag /
+  small-field layer.
+- **`sub001` (11B) vs `sub002` (54B): identical through the entire
+  56-bit skeleton EXCEPT audio bit 14 (`0` vs `1`) — and sub002's
+  extra ~46 bytes sit AFTER the skeleton.** Presence-flag →
+  payload-appended architecture, proven by a single-bit diff.
+- sub029/sub259 differ only near their tails (same announcement,
+  different frame phase); sub345/sub347 are another near-pair.
+- f1 set bits at audio positions: 1,5,6,7 (head), 16,18,25,27
+  (flags), 39-42 ('1111' run).
+- 5.1-reference channel-activity labels per AC-4 frame (2048-sample
+  grid): spk-activity.npy (numpy, [nframes x 6] RMS; channels
+  L R C LFE Ls Rs). Single-channel announcement segments mapped;
+  P-frame sizes correlate with the active channel (L/R median
+  ~1200B, C ~940B, Ls/Rs ~715B, silence 213B).
+
+Next rungs: diff the sub029/259 and 345/347 pairs bit-by-bit to
+fence flag fields vs payload; then correlate flag bits across all
+skeletons with WHICH payloads follow (sizes known); then climb into
+the labeled single-channel frames.
