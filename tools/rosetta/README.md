@@ -89,3 +89,34 @@ f1's 43 real bits with hard constraints (field boundary at bit 14
 with both values legal and no length change; '000' at 3-5 = all
 groups silent; cross-validate every candidate on f2 and the
 34-50B class where one element turns on).
+
+## Round 421 — THE UNIFIED P-FRAME HEAD GRAMMAR (measured on two streams)
+
+Strict-parse position scans (spec-exact python, no saturation):
+
+- **Deviation #15: LFE section-length width is 3 bits, not 5**
+  (rosetta: 147 w3 successes vs 3 w5).
+- The P-frame audio opens `['010'][run-flag field][LFE body]`:
+  observed head suffixes after '010' form two run families —
+  `1^b` (front-active: '', '111', '1111', '11111', '111111') and
+  `0 0 1^c` (surround-active: '0011', '00111', '001110/1') — total
+  head length 3-9 bits, then the LFE body IMMEDIATELY (m(3) +
+  w3 sections + spectra + scalefac + snf).
+- Head family tracks the announced channel deterministically
+  (C/R/L → '01011111'@8, Ls/Rs → '0100011'@7, quiet L/R → '010111'@6,
+  sparse → '010'@3).
+- **Kraftwerk validation: 178/191 P-frames lock a strict LFE under
+  this grammar** (positions 3-8 dominate; heads '010' x50,
+  '0101111' x34, ...). The war-era LFE-at-substream-22 was reading
+  3-19 bits INTO the true LFE body — every downstream element map
+  inherited that shift.
+- r419's "LFE at 75-199" content hits are hereby demoted (3-sigma
+  threshold x ~700 trials/frame = lottery); THIS measurement is
+  hundreds of strict+labeled frames on two streams.
+
+Next: (1) decode the run-flag semantics (likely per-group
+active/companding flags; enumerate against labels); (2) with the
+LFE pinned per frame, chain the NEXT element from lfe_end with the
+same strict+label method — the whole P-frame map re-derives
+outward; (3) port to Rust (sect width 3 for LFE + head runs),
+re-run the bed decoder with true LFE, re-meter at fixed lag.
