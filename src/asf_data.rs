@@ -118,7 +118,13 @@ pub fn parse_asf_section_data_ext(
     max_sfb: u32,
     no_trunc: bool,
 ) -> Result<AsfSections> {
-    let (n_sect_bits, sect_esc_val) = sect_len_bits(transform_length);
+    // AC4_SECT_W3=1 (research, round 421): force 3-bit section-length
+    // fields — the rosetta-measured width for LFE bodies (dev #15).
+    let (n_sect_bits, sect_esc_val) = if std::env::var_os("AC4_SECT_W3").is_some() {
+        (3, 7)
+    } else {
+        sect_len_bits(transform_length)
+    };
     let num_sfb = num_sfb_48(transform_length)
         .ok_or_else(|| Error::invalid("ac4: asf_section_data: unsupported transform_length"))?;
 
@@ -173,6 +179,12 @@ pub fn parse_asf_section_data_ext(
         // harnesses, which probe the alternate grammar some elements
         // (the additional-2ch bodies) appear to use.
         if sect_end > max_sfb && !no_trunc && std::env::var_os("AC4_SECT_NO_TRUNC").is_none() {
+            // AC4_SECT_STRICT=1 (round 421): reject instead of
+            // saturating — spec-strict mode for position scanning
+            // (the saturation rule has been masking misalignments).
+            if std::env::var_os("AC4_SECT_STRICT").is_some() {
+                return Err(Error::invalid("ac4: section exceeds max_sfb (strict)"));
+            }
             sect_end = max_sfb;
         }
         out.sect_cb.push(sect_cb);

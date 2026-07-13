@@ -106,6 +106,7 @@ fn main() {
         }
         br.align_to_byte();
         let wall = br.bit_position() + audio_size as u64 * 8;
+        let elem_start = br;
 
         // Head: 2-bit mode; I-frames carry the aspx_config; 4-bit field.
         let _ = br.read_u32(2);
@@ -116,32 +117,77 @@ fn main() {
         }
         let _ = br.read_u32(4);
 
-        // LFE.
-        if let Some(dir) = std::env::var_os("AC4_BED_SPEC_DIR") {
-            // Peek-dump the LFE scaled spectrum for spectral-domain
-            // scoring (reader copy — the real parse below).
-            let mut pk = br;
-            if let Ok(m) = parse_mono_data(&mut pk, true, TL) {
-                if let Some(s) = m.scaled_spec.as_deref() {
-                    let p = std::path::Path::new(&dir).join(format!("lfe{i:05}.f32"));
-                    let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let _ = fs::write(p, bytes);
+        // LFE — round 421: position-scanned, strict, 3-bit section
+        // widths (the rosetta grammar). AC4_BED_LFE_SCAN=1 enables;
+        // otherwise the legacy fixed-position parse runs.
+        let lfe_pcm = if std::env::var_os("AC4_BED_LFE_SCAN").is_some() {
+            std::env::set_var("AC4_SECT_W3", "1");
+            std::env::set_var("AC4_SECT_STRICT", "1");
+            let head_base = br;
+            let mut got: Option<(u32, Vec<f32>)> = None;
+            // audio position: br currently sits right after the head
+            // fields we consumed (mode+cfg+field4) — rewind logic:
+            // scan absolute audio offsets 1..14 from the element start
+            // instead. The element started at bit 16 of the substream;
+            // we captured no absolute reader, so scan forward from the
+            // current position minus nothing — use offsets 0..14
+            // relative to the POST-audio_size, pre-head reader saved
+            // below.
+            for sb in 1..14u32 {
+                let mut b2 = elem_start;
+                if b2.skip(sb).is_err() {
+                    break;
+                }
+                if let Ok(m) = parse_mono_data(&mut b2, true, TL) {
+                    if let Some(s) = m.scaled_spec.as_deref() {
+                        got = Some((sb, s.to_vec()));
+                        if let Some(dir) = std::env::var_os("AC4_BED_SPEC_DIR") {
+                            let p = std::path::Path::new(&dir)
+                                .join(format!("lfe{i:05}.f32"));
+                            let bytes: Vec<u8> =
+                                s.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            let _ = fs::write(p, bytes);
+                        }
+                        break;
+                    }
                 }
             }
-        }
-        let lfe_pcm = match parse_mono_data(&mut br, true, TL) {
-            Ok(m) => match (m.scaled_spec.as_deref(), m.scaled_spec_windows.as_deref()) {
-                (Some(s), _) => {
+            std::env::remove_var("AC4_SECT_W3");
+            std::env::remove_var("AC4_SECT_STRICT");
+            let _ = head_base;
+            match got {
+                Some((_sb, s)) => {
                     ok_lfe += 1;
-                    ola.long(2, s)
+                    ola.long(2, &s)
                 }
-                (None, Some(w)) if !w.is_empty() => {
-                    ok_lfe += 1;
-                    ola.grouped(2, w)
+                None => ola.silent(2),
+            }
+        } else {
+            if let Some(dir) = std::env::var_os("AC4_BED_SPEC_DIR") {
+                let mut pk = br;
+                if let Ok(m) = parse_mono_data(&mut pk, true, TL) {
+                    if let Some(s) = m.scaled_spec.as_deref() {
+                        let p = std::path::Path::new(&dir).join(format!("lfe{i:05}.f32"));
+                        let bytes: Vec<u8> =
+                            s.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let _ = fs::write(p, bytes);
+                    }
                 }
-                _ => ola.silent(2),
-            },
-            Err(_) => ola.silent(2),
+            }
+            match parse_mono_data(&mut br, true, TL) {
+                Ok(m) => match (m.scaled_spec.as_deref(), m.scaled_spec_windows.as_deref()) {
+                    (Some(s), _) => {
+                        ok_lfe += 1;
+                        ola.long(2, s)
+                    }
+                    (None, Some(w)) if !w.is_empty() => {
+                        ok_lfe += 1;
+                        ola.grouped(2, w)
+                    }
+                    _ => ola.silent(2),
+                },
+                Err(_) => ola.silent(2),
+            }
         };
 
         // Add-pair head via the war's production scanner.
