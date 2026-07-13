@@ -158,3 +158,22 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   shared) and the aspx-envelope hypothesis for the payload (official
   ASPX_HCB_ENV_* codebooks are loaded in ac4scan's T dict — chain
   candidate env codewords from ~63 to the tail token).
+
+## Round 421e — the payload is A-SPX dt-coded envelope data
+
+- Chaining official ASPX_HCB_ENV_LEVEL_15_DT codewords through the
+  one-element frames lands EXACTLY on the tail token in 14/14
+  token-bearing frames (from any start phase 16-23 — the codebook
+  self-synchronizes, so phase isn't pinned yet, but the token
+  boundary is codeword-aligned with an ENV_15_DT stream).
+- Physical fit: announcement-decay frames = envelope levels ramping
+  down = delta-TIME coding, no spectral core. Matches the no-ASF-
+  body theorem (r421d).
+- Element picture: [head+flags][param header ~to bit 63][ENV_15_DT
+  envelope payload][14-bit tail token (codeword-aligned; likely the
+  final envelope codewords or a noise/end field)][end bits][fill].
+- To pin the phase/start exactly: enumerate the [16..63) param
+  header against known A-SPX header fields (framing class, num_env,
+  freq res, dt dirs) such that the implied band-count x num_env
+  codeword count EXACTLY spans [payload_start..token]; validate on
+  the f29/f259 identical-prefix pair first.
