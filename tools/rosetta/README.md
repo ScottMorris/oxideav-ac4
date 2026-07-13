@@ -120,3 +120,22 @@ LFE pinned per frame, chain the NEXT element from lfe_end with the
 same strict+label method — the whole P-frame map re-derives
 outward; (3) port to Rust (sect width 3 for LFE + head runs),
 re-run the bed decoder with true LFE, re-meter at fixed lag.
+
+## Round 421c — the tail token (end anchor)
+
+- A constant 14-bit token `11111001111101` closes 308/957 rosetta
+  P-frames, with its last occurrence tightly 17-26 bits before the
+  audio wall — the silent/near-silent form of the closing element
+  (on busy Kraftwerk frames it only appears as coincidence inside
+  Huffman bodies). Internal shape `11111-00-11111-01` = twin
+  substructures again (cf. f1's 1010/0101 pair 9 bits apart) —
+  pair-of-similar-elements motif recurs at both ends of the frame.
+- Combined per-frame anchor set now: head family (start), tail token
+  (end, quiet frames), audio wall (exact), channel labels, and the
+  one-element class for exact accounting.
+- r421b honesty note: the w3/position-scan LFE hypothesis FAILED the
+  content gate (no meter improvement) — strict-parse hit rates alone
+  cannot confirm grammar; every claim needs content or exact
+  accounting. The enumerator over the one-element class (17 frames,
+  264-400 content bits, head + one body + tail token + fill) is the
+  decisive next move: every bit explained, lottery impossible.
