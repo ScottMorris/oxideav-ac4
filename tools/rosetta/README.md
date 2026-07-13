@@ -139,3 +139,22 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   accounting. The enumerator over the one-element class (17 frames,
   264-400 content bits, head + one body + tail token + fill) is the
   decisive next move: every bit explained, lottery impossible.
+
+## Round 421d — the middle is NOT an ASF body
+
+- Exact-accounting enumeration over all 17 one-element frames: no
+  ASF sf_data body (LFE-shape or mono-shape, w3/w5, any start
+  10-44) fits the middle region on ANY frame. The ~230-330 content
+  bits are parametric, not spectral — consistent with announcement
+  DECAY frames physically being reverb/noise tails (A-SPX-style
+  envelopes / noise params, no tonal core).
+- f29/f259 (same phrase, repeated) share a 63-BIT common prefix —
+  the element's parameter header (static across repeats); the
+  divergence at bit 63 marks where time-varying (dt-coded) payload
+  begins. Frame anatomy so far:
+  [head 10+6][param header to ~bit 63][time-varying payload]
+  [tail token 14b][~8-25 end bits][zero fill]
+- Next enumeration target: the param header [16..63) (47 bits,
+  shared) and the aspx-envelope hypothesis for the payload (official
+  ASPX_HCB_ENV_* codebooks are loaded in ac4scan's T dict — chain
+  candidate env codewords from ~63 to the tail token).
