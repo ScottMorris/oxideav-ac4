@@ -348,7 +348,13 @@ pub fn parse_asf_scalefac_data(
             let s8 = ((sf + 128) & 0xFF) - 128;
             (s8 as f32 - 100.0) * 0.25
         };
-        sf_gain[sfb] = 2.0_f32.powf(exp + sf_gain_bits());
+        sf_gain[sfb] = if std::env::var_os("AC4_SF_FLAT").is_some() {
+            // Research probe: unity gain for every coded band —
+            // isolates coefficient correctness from the gain law.
+            1.0
+        } else {
+            2.0_f32.powf(exp + sf_gain_bits())
+        };
         if std::env::var_os("AC4_DUMP_SF").is_some() {
             eprintln!("SFDUMP ref={reference_scale_factor} sfb={sfb} sf={sf} cb={}", sections.sfb_cb.get(sfb).copied().unwrap_or(255));
         }

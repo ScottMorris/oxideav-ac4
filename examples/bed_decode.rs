@@ -117,6 +117,18 @@ fn main() {
         let _ = br.read_u32(4);
 
         // LFE.
+        if let Some(dir) = std::env::var_os("AC4_BED_SPEC_DIR") {
+            // Peek-dump the LFE scaled spectrum for spectral-domain
+            // scoring (reader copy — the real parse below).
+            let mut pk = br;
+            if let Ok(m) = parse_mono_data(&mut pk, true, TL) {
+                if let Some(s) = m.scaled_spec.as_deref() {
+                    let p = std::path::Path::new(&dir).join(format!("lfe{i:05}.f32"));
+                    let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let _ = fs::write(p, bytes);
+                }
+            }
+        }
         let lfe_pcm = match parse_mono_data(&mut br, true, TL) {
             Ok(m) => match (m.scaled_spec.as_deref(), m.scaled_spec_windows.as_deref()) {
                 (Some(s), _) => {
