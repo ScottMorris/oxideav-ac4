@@ -199,3 +199,24 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
 - Payload identity of the one-element frames: OPEN again (was
    "ENV_15_DT" — unproven). The param-header count-accounting +
   trajectory oracle is the decisive instrument pair.
+
+## Round 422b — first 5-sigma payload identification (trajectory oracle)
+
+- The cross-frame trajectory oracle (mean dt-delta z-score vs the
+  book's random-bit distribution) on consecutive decay frames
+  679-683: **ASPX_HCB_ENV_LEVEL_30_DT @ payload phase 20, ~4-5
+  bands: mean delta -1.5/frame, z = -4.8** — envelope levels
+  ramping down. Adjacent phases (19-22) and band counts (4-5)
+  cluster coherently. First statistically-proper payload content
+  identification of the campaign (survives the completeness
+  theorem: the oracle uses VALUE statistics vs the design
+  distribution, not parse success).
+- Implied anatomy refinement: header = audio bits [0..~20) (the
+  10-bit common head + ~10 flag/param bits), then ~4-5-band
+  fine-quant (30-level) envelope dt deltas.
+- Next: (1) verify decoded delta magnitudes against the 5.1
+  reference's actual decay slope (dB per frame — an absolute
+  physical check); (2) extend the oracle to joint layouts
+  (sig+noise, multiple envelopes) and exact count accounting to
+  the tail token; (3) decode absolute envelope values from an
+  I-frame (F0) start and reconstruct the first parametric audio.
