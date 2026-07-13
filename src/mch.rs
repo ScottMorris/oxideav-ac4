@@ -752,7 +752,7 @@ fn scan_iframe_tail_slots(
 /// elements whose per-body grammar is still ambiguous, so the
 /// additional pair + trailers + sticky configs parse on every frame.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn resync_7x_addpair<'a>(
+pub fn resync_7x_addpair<'a>(
     floor_br: BitReader<'a>,
     tools: &SubstreamTools,
     cfg: &crate::aspx::AspxConfig,
@@ -928,7 +928,7 @@ pub(crate) fn validate_7x_trailers(
 /// [0,0,0,4]; the I-frame trailer internals still need their own
 /// backchain) while the wall oracle over a whole trailer block is
 /// selective enough to recover the working vector per frame.
-pub(crate) fn validate_7x_trailers_slots(
+pub fn validate_7x_trailers_slots(
     vr: BitReader<'_>,
     tools: &SubstreamTools,
     cfg: &crate::aspx::AspxConfig,
@@ -942,7 +942,7 @@ pub(crate) fn validate_7x_trailers_slots(
 /// trailer walks — too expensive to run per rejected resync
 /// candidate; the resync loop grants it to the first candidate that
 /// reaches trailer validation and uses cheap checks after).
-pub(crate) fn validate_7x_trailers_slots_budgeted(
+pub fn validate_7x_trailers_slots_budgeted(
     vr: BitReader<'_>,
     tools: &SubstreamTools,
     cfg: &crate::aspx::AspxConfig,
@@ -1402,7 +1402,7 @@ pub fn parse_five_channel_data(
 /// sfb_offset_48(transform_length)[max_sfb]` — the same width a
 /// long-frame single-window channel would produce, ready for a
 /// straight per-window IMDCT.
-pub(crate) type WindowSpectrum = (u32, Vec<f32>);
+pub type WindowSpectrum = (u32, Vec<f32>);
 
 /// Round-407c discovery walk: decode `n_channels` long-frame bodies,
 /// discovering each body's scalefac/SNF bound via [`discover_body_bound`].

@@ -157,19 +157,24 @@ fn strict_walk(
         }
     }
     let add_end = br.bit_position();
-    // War §5: four trailers (2ch, 2ch, 1ch, 2ch), sticky slot xovers
-    // [0, 0, 0, 4].
-    for (kind, xo) in [(2u8, 0u8), (2, 0), (1, 0), (2, 4)] {
-        let mut t = Box::<SubstreamTools>::default();
-        t.aspx_xover_subband_offset = Some(xo);
-        let r = if kind == 2 {
-            parse_aspx_data_2ch_body(&mut br, &mut t, cfg, false, TL)
-        } else {
-            parse_aspx_data_1ch_body(&mut br, &mut t, cfg, false, TL)
-        };
-        r.ok()?;
-    }
-    Some((wall as i64 - br.bit_position() as i64, grp, add_end))
+    // War §5: the 99.5%-proven trailer validator — slot state
+    // [0,0,0,4] + the 16-combo mixed-F0 sweep, ends within 0..8 bits
+    // of the wall.
+    let mut tools = Box::<SubstreamTools>::default();
+    tools.wall_bits = Some(wall);
+    tools.aspx_xover_slots = [
+        Some(0),
+        Some(0),
+        Some(0),
+        Some(4),
+        None,
+        None,
+        None,
+        None,
+    ];
+    tools.aspx_xover_slots_good = Some(tools.aspx_xover_slots);
+    oxideav_ac4::mch::validate_7x_trailers_slots(br, &tools, cfg, false, TL)?;
+    Some((0, grp, add_end))
 }
 
 fn main() {
@@ -359,6 +364,98 @@ fn main() {
             // AC4_IMM_REGION_SCAN=1 (P-frames): sweep the region length
             // after the LFE; accept only strict full-chain walks that
             // land on the wall. Prints exact region extents.
+            // AC4_IMM_ANCHOR=1 (P-frames): the war's production
+            // add-pair head scan pins H per frame; then the core span
+            // [R..H-2] backfits R (region end), and the ajcc forward
+            // parse from lfe_end gives A. Prints (H, R candidates, A).
+            if std::env::var_os("AC4_IMM_ANCHOR").is_some() && !b_iframe {
+                let cfg = sticky
+                    .aspx
+                    .clone()
+                    .ok_or_else(|| oxideav_core::Error::invalid("no sticky aspx"))?;
+                let lfe_end = br.bit_position();
+                let mut tools = Box::<SubstreamTools>::default();
+                tools.wall_bits = Some(wall);
+                tools.aspx_xover_slots =
+                    [Some(0), Some(0), Some(0), Some(4), None, None, None, None];
+                tools.aspx_xover_slots_good = Some(tools.aspx_xover_slots);
+                let Some((head, _slots, _joint)) =
+                    oxideav_ac4::mch::resync_7x_addpair(br, &tools, &cfg, false, TL)
+                else {
+                    println!("ANCHOR f={i} lfe_end={lfe_end} wall={wall} NO-HEAD");
+                    return Ok(String::new());
+                };
+                let h = head.bit_position();
+                // Backfit R: [grp][core] must end exactly at h-2.
+                let target = h.saturating_sub(2);
+                let mut rs: Vec<(u64, u32)> = Vec::new();
+                for r in lfe_end..target.min(lfe_end + 9000) {
+                    let mut b2 = br;
+                    if b2.skip((r - lfe_end) as u32).is_err() {
+                        break;
+                    }
+                    let Ok(grp) = b2.read_u32(2) else { continue };
+                    // AC4_IMM_CORE_NT=1: core bodies use the
+                    // untruncated-section grammar (war frame-1 3ch
+                    // evidence) — scope the env to the core walk only.
+                    let core_nt = std::env::var_os("AC4_IMM_CORE_NT").is_some();
+                    if core_nt {
+                        std::env::set_var("AC4_SECT_NO_TRUNC", "1");
+                    }
+                    let ok = (|| -> Option<u64> {
+                        match grp {
+                            0 => {
+                                let _ = b2.read_bit().ok()?;
+                                for _ in 0..2 {
+                                    parse_two_channel_data(&mut b2, TL).ok()?;
+                                }
+                                parse_mono_data(&mut b2, false, TL).ok()?;
+                            }
+                            1 => {
+                                parse_three_channel_data(&mut b2, TL).ok()?;
+                                parse_two_channel_data(&mut b2, TL).ok()?;
+                            }
+                            2 => {
+                                parse_four_channel_data(&mut b2, TL).ok()?;
+                                parse_mono_data(&mut b2, false, TL).ok()?;
+                            }
+                            _ => {
+                                parse_five_channel_data(&mut b2, TL).ok()?;
+                            }
+                        }
+                        std::env::remove_var("AC4_SECT_NO_TRUNC");
+                        // War reality: [b_sap(1) + optional sap-gap of
+                        // two chparam_infos over the A-SPX core band
+                        // count][second gate bit] then the add head.
+                        let b_sap = b2.read_bit().ok()?;
+                        if b_sap {
+                            let m = oxideav_ac4::mch::aspx_core_band_count(&cfg, TL)
+                                .unwrap_or(50);
+                            parse_chparam_info(&mut b2, &[m]).ok()?;
+                            parse_chparam_info(&mut b2, &[m]).ok()?;
+                        }
+                        let _gate2 = b2.read_bit().ok()?;
+                        Some(b2.bit_position())
+                    })();
+                    std::env::remove_var("AC4_SECT_NO_TRUNC");
+                    if ok == Some(h) {
+                        rs.push((r, grp));
+                    }
+                }
+                // ajcc forward end from lfe_end.
+                let mut b3 = br;
+                let a = oxideav_ac4::ajcc::parse_ajcc_data(&mut b3, false)
+                    .ok()
+                    .map(|_| b3.bit_position());
+                let rshow: Vec<String> =
+                    rs.iter().map(|(r, g)| format!("{r}(g{g})")).collect();
+                println!(
+                    "ANCHOR f={i} lfe_end={lfe_end} H={h} target={target} R=[{}] ajccA={:?} wall={wall}",
+                    rshow.join(" "),
+                    a
+                );
+                return Ok(String::new());
+            }
             let scan_from: usize = std::env::var("AC4_IMM_SCAN_FROM")
                 .ok()
                 .and_then(|v| v.parse().ok())
