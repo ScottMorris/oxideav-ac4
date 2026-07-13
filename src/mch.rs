@@ -1208,8 +1208,19 @@ pub fn parse_two_channel_data_additional(
     // false accept essentially impossible.
     let m0 = discover_add_pair_body0_bound(*br, &ti, psy.max_sfb_0)
         .unwrap_or(ADD_PAIR_BODY0_SF_BOUND);
-    let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, m0, true);
-    let b1 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, psy.max_sfb_0, true);
+    // AC4_ADD_B0_GAINS=b1: round-418 probe for the open "body0 gains
+    // beyond band m0" question — body0's spectrum spans the full
+    // section extent but carries scalefacs only for m0 bands; extend
+    // its dequant gains with body1's scalefac chain (shared psy).
+    let extend_b0 = std::env::var("AC4_ADD_B0_GAINS").ok().as_deref() == Some("b1");
+    let (b0, b1) = if extend_b0 {
+        decode_add_pair_bodies_b1_gains(br, &ti, m0, psy.max_sfb_0)
+    } else {
+        let b0 = crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, m0, true);
+        let b1 =
+            crate::asf::decode_asf_long_mono_body_with_max_sfb_ext(br, &ti, psy.max_sfb_0, true);
+        (b0, b1)
+    };
     if _trace {
         eprintln!(
             "2CH-ADD shared m={} ms_bands={} b0={} b1={} out@{}",
@@ -1235,6 +1246,78 @@ pub fn parse_two_channel_data_additional(
         scaled_spec_per_channel: vec![b0, b1],
         scaled_spec_windows_per_channel: vec![None, None],
     })
+}
+
+/// Round-418 staged decode of the additional pair's two long bodies:
+/// body0's spectral lines are kept over the FULL section extent, with
+/// dequant gains = its own scalefacs for bands < m0 and body1's
+/// scalefac chain for bands >= m0 (probing the war's open "body0 gain
+/// semantics" question). Bitstream reads are unchanged (m0 scalefac
+/// codes for body0, max_sfb for body1).
+#[allow(clippy::type_complexity)]
+fn decode_add_pair_bodies_b1_gains(
+    br: &mut BitReader<'_>,
+    ti: &AsfTransformInfo,
+    m0: u32,
+    max_sfb_1: u32,
+) -> (Option<Vec<f32>>, Option<Vec<f32>>) {
+    use crate::asf_data;
+    let tl = ti.transform_length_0;
+    let tl_idx = ti.transf_length[0];
+    let Some(sfbo) = crate::sfb_offset::sfb_offset_48(tl) else {
+        return (None, None);
+    };
+    let Some(cap) = crate::tables::num_sfb_48(tl) else {
+        return (None, None);
+    };
+    let m0 = m0.min(cap);
+    let m1 = max_sfb_1.min(cap);
+    // Body 0 stages (untruncated sections).
+    let Ok(s0) = asf_data::parse_asf_section_data_ext(br, tl_idx, tl, m0, true) else {
+        return (None, None);
+    };
+    let Ok((q0, mqi0)) = asf_data::parse_asf_spectral_data(br, &s0, sfbo, m0) else {
+        return (None, None);
+    };
+    let Ok(g0) = asf_data::parse_asf_scalefac_data(br, &s0, &mqi0, m0, tl) else {
+        return (None, None);
+    };
+    if asf_data::parse_asf_snf_data(br, &s0, &mqi0, m0, tl).is_err() {
+        return (None, None);
+    }
+    // Body 1 stages.
+    let Ok(s1) = asf_data::parse_asf_section_data_ext(br, tl_idx, tl, m1, true) else {
+        return (None, None);
+    };
+    let Ok((q1, mqi1)) = asf_data::parse_asf_spectral_data(br, &s1, sfbo, m1) else {
+        return (None, None);
+    };
+    let Ok(g1) = asf_data::parse_asf_scalefac_data(br, &s1, &mqi1, m1, tl) else {
+        return (None, None);
+    };
+    if asf_data::parse_asf_snf_data(br, &s1, &mqi1, m1, tl).is_err() {
+        return (None, None);
+    }
+    // Extend body0's gains with body1's chain over [m0..extent0).
+    let extent0 = s0
+        .sect_end
+        .iter()
+        .map(|&e| e as u32)
+        .max()
+        .unwrap_or(m0)
+        .min(cap);
+    let mut gains0 = vec![0.0f32; extent0 as usize];
+    for (i, g) in g0.iter().enumerate().take(extent0 as usize) {
+        gains0[i] = *g;
+    }
+    for i in (m0 as usize)..(extent0 as usize) {
+        if gains0[i] == 0.0 {
+            gains0[i] = g1.get(i).copied().unwrap_or(0.0);
+        }
+    }
+    let scaled0 = asf_data::dequantise_and_scale(&q0, &gains0, sfbo, extent0);
+    let scaled1 = asf_data::dequantise_and_scale(&q1, &g1, sfbo, m1);
+    (Some(scaled0), Some(scaled1))
 }
 
 /// `three_channel_info()` per Table 30.

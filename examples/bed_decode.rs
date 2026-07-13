@@ -142,7 +142,30 @@ fn main() {
             tools.aspx_xover_slots_good = Some(tools.aspx_xover_slots);
             let (mut head, _slots, _joint) =
                 oxideav_ac4::mch::resync_7x_addpair(br, &tools, c, b_iframe, TL)?;
+            let hpos = head.bit_position();
             let p = parse_two_channel_data_additional(&mut head, TL, Some(c)).ok()?;
+            if std::env::var_os("AC4_BED_TRACE").is_some() {
+                let long0 = p.scaled_spec_per_channel.first().map_or(false, |s| s.is_some());
+                let long1 = p.scaled_spec_per_channel.get(1).map_or(false, |s| s.is_some());
+                let grp0 = p
+                    .scaled_spec_windows_per_channel
+                    .first()
+                    .map_or(false, |s| s.is_some());
+                let grp1 = p
+                    .scaled_spec_windows_per_channel
+                    .get(1)
+                    .map_or(false, |s| s.is_some());
+                eprintln!(
+                    "BED f={i} ifr={} H={hpos} end={} bmsp={} long=({},{}) grp=({},{}) wall={wall}",
+                    u8::from(b_iframe),
+                    head.bit_position(),
+                    u8::from(p.b_enable_mdct_stereo_proc),
+                    u8::from(long0),
+                    u8::from(long1),
+                    u8::from(grp0),
+                    u8::from(grp1),
+                );
+            }
             // §5.3.3.2 pair unmix (SAP a/b/c/d per band) for the
             // joint-MDCT-stereo long-frame case.
             if let (Some(Some(s0)), Some(Some(s1))) = (
