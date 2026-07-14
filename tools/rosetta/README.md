@@ -416,3 +416,24 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
 - NEXT: spec-exact element walker (stereo_data / 3ch / 5ch cases
   + companding_control + aspx/acpl) fitted against the 210-hit
   corpus; then sign law; then Rust port.
+
+## Round 430-431 — the ffmpeg AC-4 decoder: reference pipeline + Tidal deviance proven
+
+- Found and built the public ffmpeg AC-4 decoder (VideoLAN/Mahol
+  2020 patchset, community-maintained; never merged upstream).
+  Minimal docker build: decoder + mov/mpegts demux + wav out.
+- **ATSC 3.0 broadcast AC-4 decodes perfectly** (KDAF.ts: 5.1@48k,
+  zero errors, real audio) — the build and decoder are sound.
+- **Both Tidal test files crash it** (substream underread 430/1038
+  bits, assertions) — differential proof that the Tidal/Atmos
+  encoder deviates from the published spec AND the only public
+  implementation. The war's deviation catalog is real, not a
+  misreading.
+- ac4dec.c settles r429's open question: long frames use 5-bit
+  section widths (idx=4 path) — our proven w3-on-long IS another
+  Tidal encoder deviation (#11 confirmed).
+- New strategy: port the deviation catalog INTO ac4dec.c (it has
+  complete synthesis: windows/IMDCT/A-SPX/A-CPL/OLA, plus a
+  built-in wall-residue meter via its underread log) and iterate
+  until Tidal frames close. Public samples corpus banked
+  (KDAF.ts, atsc3-aspx-num-env.ts, believer.mp4 at underread 8).
