@@ -347,3 +347,32 @@ discriminating test for "remaining channels" hypotheses);
 SHORT-window channels (5+grouping bits) mixed with chparam;
 (c) once gap law falls: port to ffmpeg five_channel_data, align,
 re-meter, GATE.
+
+## Rounds 450-451 — THE IMS STEREO PAIR REFRAME
+
+- KW third witness (f1194): 7-body chain, gaps (25)6,6,6,17,4,24 —
+  monotone-decrease BROKEN => spk "monotone law" was path-selection
+  artifact (completeness theorem, again). Only anchors are proven.
+- CHAIN-CONSENSUS TEST (471 five-chains over 18 anchored speaker
+  frames, per-position correlation vs all ref channels):
+  positions 0-3 DEAD (|c| 0.01-0.10); position 4 (anchor) 0.49 vs
+  L AND 0.58 vs R. THE WAR BODIES ARE NOT BED CHANNELS:
+  ** anchor pair = ADDITIONAL STEREO PAIR (ssch5/6) = the IMS
+  stereo render ** — correlates with both L and R because it IS
+  the stereo mix. Bed channels are quiet on the speaker track.
+  This explains: exactly-two adjacent bodies everywhere; pair
+  gaps 0-25; mixed per-channel w3/w5 (own sf_infos in
+  two_channel_data).
+- INTERLEAVE HYPOTHESIS ([sf_info1] between the pair's sf_datas):
+  gap=1 cases fit 'long' 1-bit sf_info EXACTLY (f140 c0=0.928,
+  kw1104); full-corpus fit only 15/238 BUT war gaps/e0 ends are
+  unreliable (snf tail under-read suspected; war body1 positions
+  weak — f60 war body1 only 0.097 at fixed pos/lag).
+- NEXT (rounds 452+): (a) audit parse_snf tail against gap=0/1
+  ground truth (find the missing end bits); (b) interleaved
+  [sf_info][sf_data][sf_info][sf_data] two_channel layout knob in
+  ffmpeg (AC4_2CH_INTERLEAVE); (c) build BIG M-body corpus via
+  harness tail-region oracle (add pair sits just before the aspx
+  trailer whose position ffmpeg knows); (d) M/S stitch under
+  ffmpeg synthesis -> GATE attempt. The gate may not need the bed
+  at all — the IMS pair IS the stereo listening target!
