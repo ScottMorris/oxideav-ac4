@@ -437,3 +437,22 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   built-in wall-residue meter via its underread log) and iterate
   until Tidal frames close. Public samples corpus banked
   (KDAF.ts, atsc3-aspx-num-env.ts, believer.mp4 at underread 8).
+
+## Round 432 — ac4dec.c's 7X element is a stub; the war grammar is the missing piece
+
+- channel_element_7x in the public decoder: coding_config cases
+  0/1 are empty breaks; no SAP gate, no additional pair, no cc0/2
+  mono, no A-SPX trailers. The decoder was simply never finished
+  for 7.1 content — which is what ATSC never broadcasts but
+  Tidal/Atmos always uses. Broadcast 5.1 decodes clean because
+  those paths are complete.
+- Every primitive needed to finish it exists in the patch; the
+  war's bit-exact Kraftwerk 7X grammar is the blueprint. Next
+  session: implement the 7X body, then layer the Tidal deviation
+  catalog behind a flag, iterating the decoder's own underread
+  meter to zero per frame (believer.mp4 first at underread 8,
+  then the speaker track, then Kraftwerk).
+- If that lands, ac4dec.c's complete synthesis chain (windows,
+  IMDCT, A-SPX, A-CPL, OLA) produces the listening master for
+  free — and the Rust port becomes a translation job instead of
+  research.
