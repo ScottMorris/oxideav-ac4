@@ -297,3 +297,26 @@ and look for the field grammar; msfb/w choice may live IN the gap).
   The wall + downstream-structure constraints should collapse the
   ambiguity that killed greedy chaining. Validate on f33 (known
   anchors 1656/1878) before trusting.
+
+## Round 448 — f33 FIVE-BODY CHAIN RECOVERED (DAG search + anchor)
+
+Memoized DAG chain search (gaps 0-25, w in {3,5}, m=0 allowed)
+over speaker f33, validated by the war anchor:
+  ch0 body@218  w3 m=19 end=842   (lead gap from ~193)
+  ch1 body@865  w3 m=26 end=1255  (gap 23)
+  ch2 body@1273 w3 m=4  end=1338  (gap 18)
+  ch3 body@1349 w3 m=16 end=1647  (gap 11)  [alt: @1358 w5 m=22]
+  ch4 body@1656 w3 m=10 end=1869  (gap 9)   <- war anchor, corr .629
+Then gap 2-9 -> body@1871/1878 = ADDITIONAL PAIR (w5/w3) -> aspx.
+KEY READS: (1) body@1656 is ch4 (LAST of five), not ch3;
+(2) all five bed sf_datas parse w3 with leading 5-bit msfb;
+(3) inter-body gaps shrink monotonically (25,23,18,11,9) in this
+frame — gaps look like PER-CHANNEL PREFIX FIELDS (hypothesis:
+interleaved chparam/sap data before each sf_data — Tidal moves
+chparam_info from five_channel_info into each channel, or an
+unknown per-channel header). ffmpeg ch0 miss is small (~5 bits =
+per-channel msfb). NEXT: decode the 5 gap bit-strings of f33
+against chparam grammar ([2b sap_mode][ms_used m bits][sap_data]),
+try alignments; replicate chain on 2-3 more anchored frames
+(f60 speaker, kw strong frames) to confirm gap monotonicity is
+coincidence or structure. Then port resync/true grammar to ffmpeg.
