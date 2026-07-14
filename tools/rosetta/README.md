@@ -258,3 +258,31 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
 - WAR GRAMMAR LOCKS ON SPEAKER TRACK: bed_decode resync locks
   954/999 add-pairs, 972/999 LFE, 0 hard fails. Content
   validation vs the 5.1 reference in progress.
+
+## Round 424 — FIRST CONTENT-EXACT BODY DECODE (PCM corr 0.987)
+
+- Full speaker-track corpus dumped: spk4/ = all 2412 substreams
+  (examples/dump_subs.rs). Silent I-frames beyond 999: f1560,
+  f1704, f2112 (two E-chains: the noise block is a chain of
+  (00 + 5-bit floor-31) links, count varies by frame).
+- **The find**: python strict scan x PCM oracle on pure-L
+  announcement frames (dequant |q|^(4/3) x 2^(0.25 sf), IMDCT,
+  sine window): f60 body at bit 1602 (= resync H 1224 + 378)
+  scores **PCM corr +0.987 vs reference L at lag 1024** (the MDCT
+  half-frame delay). Grammar: [5-bit max_sfb=18][w3 sections
+  (cb 3,9,4)][spectra][8-bit ref_sf=233 (signed -23)][sf chain]
+  [snf] — the rosetta w3 grammar, on a core body.
+- body1 (S of the M/S pair) immediately follows: [1909..2128),
+  m=11, corr -0.53 vs L — M/S confirmed structurally.
+- H+200..700 single-body sweep: 9/17 L-frames |corr|>=0.42
+  (null ~0.1). But naive per-frame swept-lag stitching collapses
+  at a single global lag (mean +0.077) — most sub-0.55 hits are
+  the position lottery; only lag-1024-consistent hits are real.
+- Rust bed_decode on the speaker track: LFE band-energy corr
+  0.77 mean (89% of frames >0.5) = spectrum right, waveform
+  phase wrong; pair walk decodes different near-silent data
+  (bounds path diverges from the true body0 position).
+- Honest state: content-exact decode is PROVEN possible (0.987);
+  making it per-frame reliable needs the deterministic element
+  grammar (chparam block between H and body0, window-shape
+  handling for grouped frames), not more scanning.
