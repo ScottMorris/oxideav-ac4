@@ -92,3 +92,26 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
 - MINIMAL-BUILD TRAP: no null muxer — "-f null" dies at muxer
   init and error counts reflect the PROBE PHASE ONLY. Always
   decode to -f wav. (Counting-trap rule, incident #4.)
+
+## Round 436 — TABLE 33 HOLDS FOR TIDAL; speaker parse near-complete
+
+- MSFB5 is the master key for Tidal speaker frames through the
+  harness: without it 40/40 hard-fail; with it (+CB15) NO hard
+  sect failures — frames walk the FULL Table-33 structure.
+- THE WAR MYSTERY RESOLVED: the "pre-body parameter region" is
+  five_channel_data's chparam/sap_data chains + the first
+  channels' sf_datas. Our scanned "bodies" ARE the 5ch sf_datas
+  (f33: ffmpeg ch3 sect@1641 vs war body0@1664 = same region).
+  M/S pairs = sap_mode=1 channel pairs. No pre-body aspx block.
+- f33 walk: LFE 26..57 | cc=3 five_channel 59..2395 | add pair
+  2396..2784 | aspx tail 2784..~3040 (2ch 39b, 2ch 91b, 1ch 49b,
+  2ch ...) vs wall 3144 — remaining miss ~100-180 bits INSIDE
+  aspx_data (war F0 widths/sticky-xover apply here). underread
+  19 nonzero tail bytes on f33; many frames similar.
+- W3_LONG NOT needed for this walk (war w3-bodies observation vs
+  5-bit ffmpeg sections both "work" — unresolved, empiricism won).
+- Kraftwerk kw4 dumps: 40/40 fail immediately after codec_mode=1
+  on iframes — aspx_config divergence (music-class config).
+  NEXT: error logging inside aspx_config + war aspx deviations.
+- Packet offset in harness: demuxer strips sync; packet bit =
+  dump bit + 8 (flags byte).

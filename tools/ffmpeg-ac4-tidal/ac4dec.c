@@ -3307,6 +3307,7 @@ static int aspx_data_2ch(AC4DecodeContext *s, Substream *ss,
                          SubstreamChannel *ssch0, SubstreamChannel *ssch1,
                          int iframe)
 {
+    av_log(s->avctx, AV_LOG_TRACE, "POS aspx_data_2ch@%d\n", get_bits_count(&s->gbc));
     GetBitContext *gb = &s->gbc;
     int ret;
 
@@ -3419,6 +3420,7 @@ static int aspx_hfgen_iwc_1ch(AC4DecodeContext *s, Substream *ss,
 static int aspx_data_1ch(AC4DecodeContext *s, Substream *ss,
                          SubstreamChannel *ssch, int iframe)
 {
+    av_log(s->avctx, AV_LOG_TRACE, "POS aspx_data_1ch@%d\n", get_bits_count(&s->gbc));
     GetBitContext *gb = &s->gbc;
     int ret;
 
