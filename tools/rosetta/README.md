@@ -286,3 +286,23 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   making it per-frame reliable needs the deterministic element
   grammar (chparam block between H and body0, window-shape
   handling for grouped frames), not more scanning.
+
+## Round 424b — fixed-lag joint scan + stitch (session close)
+
+- Final scan (body0 at fixed lag 1024±32, body1 free-lag
+  structural confirm, select by |c0|): 28 joint hits across the
+  L (33-94) and R (108-165) announcements, lags clustering
+  992-1056.
+- Stitch: L 15/62 frames decoded, R 13/58; per-frame fixed-lag
+  |corr| mean 0.390 (L) / 0.429 (R); 73-77% of decoded frames
+  >0.3. Segment-level corr dilutes to ~0.05 (sparse coverage +
+  sign/TDAC interactions at coverage gaps).
+- The resistant frames are the LOUD mid-announcement stretch
+  (f42-57 class): denser spectra / grouped short windows — the
+  long-only strict parser cannot reach them. Deterministic
+  chparam grammar + grouped-window body support = the two
+  blockers between here and full-coverage decode.
+- Gate status: two channels decode with mean-of-decoded >0.3,
+  but only ~25% frame coverage — NOT the gate. No audio
+  delivered. stitch2_L.wav / stitch2_R.wav (decoded vs ref,
+  side-by-side) banked in the scratchpad for the record.
