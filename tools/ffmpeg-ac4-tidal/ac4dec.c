@@ -405,6 +405,7 @@ typedef struct AC4DecodeContext {
     GetBitContext   gbc;                    ///< bitstream reader
 
     int             target_presentation;
+    int aspx_slot;
 
     int             version;
     int             sequence_counter;
@@ -3330,9 +3331,14 @@ static int aspx_data_2ch(AC4DecodeContext *s, Substream *ss,
     int ret;
 
     if (iframe) {
-        ssch0->aspx_xover_subband_offset = get_bits(gb, 3);
+        if (getenv("AC4_XOVER_STICKY")) {
+            /* war law: no per-block xover field; fixed per slot [0,0,0,4] */
+            ssch0->aspx_xover_subband_offset = s->aspx_slot == 3 ? 4 : 0;
+        } else
+            ssch0->aspx_xover_subband_offset = get_bits(gb, 3);
         ssch1->aspx_xover_subband_offset = ssch0->aspx_xover_subband_offset;
     }
+    s->aspx_slot++;
 
     ret = aspx_elements(s, ss, ssch0, iframe);
     if (ret < 0)
@@ -3442,8 +3448,13 @@ static int aspx_data_1ch(AC4DecodeContext *s, Substream *ss,
     GetBitContext *gb = &s->gbc;
     int ret;
 
-    if (iframe)
-        ssch->aspx_xover_subband_offset = get_bits(gb, 3);
+    if (iframe) {
+        if (getenv("AC4_XOVER_STICKY"))
+            ssch->aspx_xover_subband_offset = s->aspx_slot == 3 ? 4 : 0;
+        else
+            ssch->aspx_xover_subband_offset = get_bits(gb, 3);
+    }
+    s->aspx_slot++;
 
     ssch->aspx_balance = 0;
 
@@ -4307,6 +4318,7 @@ static int single_channel_element(AC4DecodeContext *s, int iframe)
 
 static int audio_data(AC4DecodeContext *s, int channel_mode, int iframe)
 {
+    s->aspx_slot = 0;
     int ret = 0;
 
     av_log(s->avctx, AV_LOG_DEBUG, "channel_mode: %d\n", channel_mode);

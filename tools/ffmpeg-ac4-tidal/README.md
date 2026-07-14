@@ -148,3 +148,22 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
   two field-by-field, port as AC4_ASPX_CFG knob.
 - goto-fail LESSON: never insert av_log between a braceless if and
   its return (instrumentation script did; caught same run).
+
+## Round 439 — sticky xover confirmed; A-JOC reframe
+
+- AC4_XOVER_STICKY: war slots [0,0,0,4] — no per-block 3-bit xover
+  field on iframes; fixed per aspx slot (s->aspx_slot counter,
+  reset per frame). ALL Kraftwerk sbx=0 rejects eliminated.
+- KRAFTWERK REFRAME: bed walk ends ~4.9k bits; 60-80% of each
+  frame (10k+ bits) remains after the aspx trailers = A-JOC OBJECT
+  stream (music = bed + Atmos objects; war kwjoint bodies at high
+  offsets were object audio). Bed-only speaker track nearly
+  closes (best frames underread 19 bytes); Kraftwerk needs the
+  fork's ajoc.rs knowledge next.
+- Speaker loud frames still underread 1000+ bytes: aspx env
+  blocks consume ~100 bits vs real payloads — envelope grammar
+  (framing/num_env/freq_res or ec_data chains) still partly off.
+  Loud rejects: "invalid aspx num env 6-7 (class 3=VARVAR)" —
+  cap>5 may be Tidal-legal, check war VARVAR handling.
+- Shell trap: `env VARS cmd > log 2>&1` inside a for-loop gave
+  phantom 40/40 counts; `2> log` form counts correctly.
