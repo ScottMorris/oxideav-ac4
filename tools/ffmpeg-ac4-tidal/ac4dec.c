@@ -3048,6 +3048,17 @@ static int aspx_huff_data(AC4DecodeContext *s,
     int aspx_off;
 
     if (direction == 0) { // FREQ
+        if (getenv("AC4_F0_RAW")) {
+            /* war law (round 407h): first FREQ value is fixed-width
+             * raw, width = ceil(log2(F0 alphabet)). SIG lvl 30/15 =
+             * 6/7, SIG bal 30/15 = 4/5, NOISE lvl = 5, bal = 4. */
+            int w;
+            if (data_type == 0) /* SIG */
+                w = stereo_mode ? (quant_mode ? 4 : 5) : (quant_mode ? 6 : 7);
+            else
+                w = stereo_mode ? 4 : 5;
+            data[0] = get_bits(gb, w);
+        } else {
         aspx_cb = get_aspx_hcb(data_type, quant_mode, stereo_mode, F0);
         aspx_off = get_aspx_off(data_type, quant_mode, stereo_mode, F0);
         data[0] = get_vlc2(gb, aspx_cb->table, aspx_cb->bits, 3);
@@ -3056,6 +3067,7 @@ static int aspx_huff_data(AC4DecodeContext *s,
             return AVERROR_INVALIDDATA;
         }
         data[0] -= aspx_off;
+        }
         aspx_cb = get_aspx_hcb(data_type, quant_mode, stereo_mode, DF);
         aspx_off = get_aspx_off(data_type, quant_mode, stereo_mode, DF);
         for (int i = 1; i < num_sbg; i++) {
@@ -3144,6 +3156,8 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
     ssch->master_reset = ((ss->prev_aspx_start_freq != ss->aspx_start_freq) +
                           (ss->prev_aspx_stop_freq != ss->aspx_stop_freq) +
                           (ss->prev_aspx_master_freq_scale != ss->aspx_master_freq_scale)) * iframe;
+    if (ssch->num_sbg_master == 0)
+        ssch->master_reset = 1; /* tables never built for this channel */
     if (ssch->master_reset) {
         if (ss->aspx_master_freq_scale == 1) {
             ssch->num_sbg_master = 22 - 2 * ss->aspx_start_freq - 2 * ss->aspx_stop_freq;
@@ -3166,8 +3180,10 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
         ssch->sbg_sig_highres[sbg] = ssch->sbg_master[sbg + ssch->aspx_xover_subband_offset];
 
     ssch->sbx = ssch->sbg_sig_highres[0];
-    if (ssch->sbx <= 0)
+    if (ssch->sbx <= 0) {
+        av_log(s->avctx, AV_LOG_ERROR, "aspx sbx=0 pos=%d nsbgm=%d xover=%d sf=%d st=%d scale=%d\n", get_bits_count(&s->gbc), ssch->num_sbg_master, ssch->aspx_xover_subband_offset, ss->aspx_start_freq, ss->aspx_stop_freq, ss->aspx_master_freq_scale);
         return AVERROR_INVALIDDATA;
+    }
     ssch->num_sb_aspx = ssch->sbg_sig_highres[ssch->num_sbg_sig_highres] - ssch->sbx;
 
     ssch->num_sbg_sig_lowres = ssch->num_sbg_sig_highres - floorf(ssch->num_sbg_sig_highres / 2.);
@@ -3246,8 +3262,10 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
     if ((ssch->num_sbg_patches > 1) && (ssch->sbg_patch_num_sb[ssch->num_sbg_patches - 1] < 3))
         ssch->num_sbg_patches--;
 
-    if (ssch->num_sbg_patches > 6)
+    if (ssch->num_sbg_patches > 6) {
+        av_log(s->avctx, AV_LOG_ERROR, "aspx too many patches pos=%d\n", get_bits_count(&s->gbc));
         return AVERROR_INVALIDDATA;
+    }
 
     ssch->sbg_patches[0] = ssch->sbx;
     for (int i = 1; i <= ssch->num_sbg_patches; i++)

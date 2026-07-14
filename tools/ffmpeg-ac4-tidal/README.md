@@ -128,3 +128,23 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
   war deviations as knobs: mixed raw/huff F0 (LEVEL_30=6,
   LEVEL_15=7, BAL_30=4, BAL_15=5, NOISE=5, NBAL=4), sticky xover
   slots [0,0,0,4], P-frame FIXFIX+1env->Fine qmode override.
+
+## Round 438 — Kraftwerk aspx breakthrough + F0 raw knob
+
+- AC4_F0_RAW: war round-407h law — first FREQ value of each aspx
+  env chain is FIXED-WIDTH RAW (SIG lvl 15/30 = 7/6 bits, SIG bal
+  15/30 = 5/4, NOISE lvl 5, bal 4), not the Table-58 F0 huffman.
+  (quant_mode index 0 = 15-step in ffmpeg's vlc arrays.)
+- Master-table init fix: ffmpeg only built sbg_master when config
+  CHANGED on an iframe; channels whose first aspx parse followed
+  an unchanged config had empty tables -> sbx=0 rejects. Now
+  rebuilt whenever num_sbg_master==0. Kraftwerk 40/40 -> 25 fails
+  (15 frames parse to completion) on kw40 subset.
+- REMAINING KW WALL: aspx_config MISPARSE. All sbx=0 rejects show
+  start_freq=7 stop=1 scale=1 xover=7 (start_freq pegged at max =
+  garbage). ffmpeg reads 15 fixed bits; Tidal's aspx_config layout
+  deviates. ANSWER KEY: Rust fork parse_aspx_config (src/aspx.rs
+  ~L609, war-proven on these exact frames). NEXT ROUND: diff the
+  two field-by-field, port as AC4_ASPX_CFG knob.
+- goto-fail LESSON: never insert av_log between a braceless if and
+  its return (instrumentation script did; caught same run).
