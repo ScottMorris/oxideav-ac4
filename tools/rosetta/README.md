@@ -351,3 +351,24 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   Remaining to the gate: position determinism (the chparam/element
   grammar), the sign law, snf tail closure, noise-fill synthesis,
   then the Rust port.
+
+## Round 427 — inter-body field forensics (honest negatives)
+
+- Gap histogram across 89 confirmed adjacent-body pairs: 0-25
+  bits, mode ~0-11. Gap size does NOT correlate with any body0
+  internal (m, sections, zero-bands, snf gate/count) — the field
+  belongs to the NEXT body (sf_info/window header?) or is
+  optional per-body trailing data.
+- Tail-variant search (snf band-set x sf-first x pad): the
+  CURRENT tail grammar is the best of 24 variants (8/75 exact
+  adjacency) — the tail model is right; the gap is real structure.
+- Gaps >= 12 are NOT empty mini-bodies (0/24 exact-fit).
+- Greedy body-train chaining derails immediately after body0
+  (completeness: several false continuations per hop; f60's
+  18-body "train" contains exactly ONE content-real body).
+- Time-chaining by envelope continuity is insufficient (speech
+  envelopes too smooth: 8 candidates > 0.93 in f61, true body
+  not top-8). Reference-free walking NEEDS the deterministic
+  pre-body grammar — next session's target, fresh context.
+- Full-track Kraftwerk fixed-lag scan (all 1406 in-reference
+  frames) launched for the coverage stitch.
