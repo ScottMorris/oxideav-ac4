@@ -760,6 +760,8 @@ static int variable_bits(GetBitContext *gb, int bits)
     int read_more;
 
     do {
+        if (get_bits_left(gb) < bits + 1 || value > (1 << 24))
+            return value;
         value += get_bits(gb, bits);
         read_more = get_bits1(gb);
         if (read_more) {
@@ -879,6 +881,8 @@ static int emdf_info(AC4DecodeContext *s, EMDFInfo *e)
 {
     GetBitContext *gb = &s->gbc;
 
+    if (get_bits_left(gb) < 16)
+        return AVERROR_INVALIDDATA;
     e->version = get_bits(gb, 2);
     if (e->version == 3)
         e->version += variable_bits(gb, 2);
@@ -1430,8 +1434,14 @@ static int ac4_toc(AC4DecodeContext *s)
 
     av_log(s->avctx, AV_LOG_DEBUG, "presentations: %d\n", s->nb_presentations);
 
+    if (s->nb_presentations > FF_ARRAY_ELEMS(s->pinfo)) {
+        av_log(s->avctx, AV_LOG_ERROR, "too many presentations: %d\n", s->nb_presentations);
+        return AVERROR_INVALIDDATA;
+    }
     if (s->version <= 1) {
         for (int i = 0; i < s->nb_presentations; i++) {
+            if (get_bits_left(gb) < 8)
+                return AVERROR_INVALIDDATA;
             ret = ac4_presentation_info(s, &s->pinfo[i]);
             if (ret < 0)
                 return ret;
@@ -1445,13 +1455,21 @@ static int ac4_toc(AC4DecodeContext *s)
         }
 
         for (int i = 0; i < s->nb_presentations; i++) {
+            if (get_bits_left(gb) < 8)
+                return AVERROR_INVALIDDATA;
             ret = ac4_presentation_v1_info(s, &s->pinfo[i]);
             if (ret < 0)
                 return ret;
         }
 
         av_log(s->avctx, AV_LOG_DEBUG, "total_groups: %d\n", s->total_groups + 1);
+        if (s->total_groups + 1 > FF_ARRAY_ELEMS(s->ssgroup)) {
+            av_log(s->avctx, AV_LOG_ERROR, "too many groups: %d\n", s->total_groups + 1);
+            return AVERROR_INVALIDDATA;
+        }
         for (int i = 0; i <= s->total_groups; i++) {
+            if (get_bits_left(gb) < 8)
+                return AVERROR_INVALIDDATA;
             ret = ac4_substream_group_info(s, &s->ssgroup[i]);
             if (ret < 0)
                 return ret;
@@ -2325,7 +2343,7 @@ static int asf_section_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel
             int sect_len;
 
             ssch->sect_cb[g][i] = get_bits(gb, 4);
-            if (ssch->sect_cb[g][i] > 11) {
+            if (ssch->sect_cb[g][i] > 11 && !getenv("AC4_CB15")) {
                 av_log(s->avctx, AV_LOG_ERROR, "sect_cb[%d][%d] > 11\n", g, i);
                 return AVERROR_INVALIDDATA;
             }
@@ -2337,6 +2355,10 @@ static int asf_section_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel
             }
 
             sect_len += sect_len_incr;
+            if (k + sect_len > 127 || i > 125) {
+                av_log(s->avctx, AV_LOG_ERROR, "section overflow k=%d len=%d i=%d\n", k, sect_len, i);
+                return AVERROR_INVALIDDATA;
+            }
             ssch->sect_start[g][i] = k;
             ssch->sect_end[g][i] = k + sect_len;
 
@@ -2374,6 +2396,8 @@ static int ext_decode(AC4DecodeContext *s)
     b = get_bits1(gb);
     while (b) {
         N_ext++;
+        if (N_ext > 21 || get_bits_left(gb) < 1)
+            return 0; /* corrupt escape run; frame fails via wall meter */
         b = get_bits1(gb);
     }
 
@@ -2396,8 +2420,17 @@ static int asf_spectral_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
             if (ssch->sect_cb[g][i] == 0 || ssch->sect_cb[g][i] > 11)
                 continue;
 
+            /* sections overshooting max_sfb carry no spectral payload
+             * (empirical: 4070/4805 wall-exact vs 470 with full-table read) */
+            if (getenv("AC4_OVERSHOOT_SKIP") && ssch->sect_end[g][i] > get_max_sfb(s, ssch, g))
+                continue;
+
             sect_start_line = ssch->sect_sfb_offset[g][ssch->sect_start[g][i]];
             sect_end_line = ssch->sect_sfb_offset[g][ssch->sect_end[g][i]];
+            if (sect_end_line > 2048 || sect_start_line < 0 || sect_start_line > sect_end_line) {
+                av_log(s->avctx, AV_LOG_ERROR, "spectral line range %d..%d\n", sect_start_line, sect_end_line);
+                return AVERROR_INVALIDDATA;
+            }
             cb = ssch->sect_cb[g][i] - 1;
 
             for (int k = sect_start_line; k < sect_end_line;) {
@@ -2511,7 +2544,12 @@ static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
                     first_scf_found = 1;
                 }
 
-                ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * (scale_factor - 100));
+                if (getenv("AC4_SFSIGNED")) {
+                    /* war law: 8-bit two's-complement wrap of the sf chain */
+                    int sfw = ((scale_factor & 255) + 128 & 255) - 128;
+                    ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * (sfw - 100));
+                } else
+                    ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * (scale_factor - 100));
             }
         }
     }
@@ -2550,18 +2588,23 @@ static int sf_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch,
     int ret;
 
     if (spec_frontend == SF_ASF) {
+        av_log(s->avctx, AV_LOG_TRACE, "POS sect@%d\n", get_bits_count(&s->gbc));
         ret = asf_section_data(s, ss, ssch);
         if (ret < 0)
             return ret;
+        av_log(s->avctx, AV_LOG_TRACE, "POS spec@%d\n", get_bits_count(&s->gbc));
         ret = asf_spectral_data(s, ss, ssch);
         if (ret < 0)
             return ret;
+        av_log(s->avctx, AV_LOG_TRACE, "POS scf@%d\n", get_bits_count(&s->gbc));
         ret = asf_scalefac_data(s, ss, ssch);
         if (ret < 0)
             return ret;
+        av_log(s->avctx, AV_LOG_TRACE, "POS snf@%d\n", get_bits_count(&s->gbc));
         ret = asf_snf_data(s, ss, ssch);
         if (ret < 0)
             return ret;
+        av_log(s->avctx, AV_LOG_TRACE, "POS end@%d\n", get_bits_count(&s->gbc));
     } else {
         ret = ssf_data(s, ss, ssch, iframe);
     }
@@ -3682,6 +3725,7 @@ static int channel_pair_element(AC4DecodeContext *s, int iframe)
 static int four_channel_data(AC4DecodeContext *s, Substream *ss, int iframe)
 {
     int ret;
+    av_log(s->avctx, AV_LOG_TRACE, "POS 4ch@%d\n", get_bits_count(&s->gbc));
 
     ret = sf_info(s, ss, &ss->ssch[0], SF_ASF, 0, 0);
     if (ret < 0)
@@ -3726,6 +3770,7 @@ static int five_channel_info(AC4DecodeContext *s, Substream *ss)
 static int five_channel_data(AC4DecodeContext *s, Substream *ss, int iframe)
 {
     int ret;
+    av_log(s->avctx, AV_LOG_TRACE, "POS 5ch@%d\n", get_bits_count(&s->gbc));
 
     ret = sf_info(s, ss, &ss->ssch[0], SF_ASF, 0, 0);
     if (ret < 0)
@@ -3771,6 +3816,7 @@ static int sf_info_lfe(AC4DecodeContext *s, Substream *ss,
 static int mono_data(AC4DecodeContext *s, Substream *ss,
                      SubstreamChannel *ssch, int lfe, int iframe)
 {
+    av_log(s->avctx, AV_LOG_TRACE, "POS mono(lfe=%d)@%d\n", lfe, get_bits_count(&s->gbc));
     GetBitContext *gb = &s->gbc;
     int spec_frontend;
     int ret;
@@ -3986,6 +4032,7 @@ static int two_channel_data(AC4DecodeContext *s, Substream *ss,
         return AVERROR_INVALIDDATA;
     }
 
+    av_log(s->avctx, AV_LOG_TRACE, "POS 2ch@%d\n", get_bits_count(gb));
     ss->mdct_stereo_proc[x] = get_bits1(gb);
     if (ss->mdct_stereo_proc[x]) {
         ret = sf_info(s, ss, ssch0, SF_ASF, 0, 0);
@@ -4510,6 +4557,7 @@ static int ac4_substream(AC4DecodeContext *s, SubstreamInfo *ssinfo)
     align_get_bits(gb);
 
     offset = get_bits_count(gb) >> 3;
+    av_log(s->avctx, AV_LOG_TRACE, "POS audio start@%d size=%d bits\n", get_bits_count(gb), audio_size * 8);
     ret = audio_data(s, ssinfo->channel_mode, ssinfo->iframe[0]);
     if (ret < 0)
         return ret;
@@ -4550,12 +4598,16 @@ static void spectral_reordering(AC4DecodeContext *s, SubstreamChannel *ssch)
     for (int g = 0; g < ssch->scp.num_window_groups; g++) {
         int transf_length_g = get_transf_length(s, ssch, g, NULL);
         const uint16_t *sfb_offset = get_sfb_offset(transf_length_g);
-        int max_sfb = get_max_sfb(s, ssch, g);
+        int max_sfb = FFMIN(get_max_sfb(s, ssch, g), get_sfb_size(transf_length_g));
 
         for (int sfb = 0; sfb < max_sfb; sfb++) {
             for (int w = 0; w < ssch->scp.num_win_in_group[g]; w++) {
-                for (int l = sfb_offset[sfb]; l < sfb_offset[sfb+1]; l++)
-                    spec_reord[win_offset[win+w] + l] = scaled_spec[k++];
+                for (int l = sfb_offset[sfb]; l < sfb_offset[sfb+1]; l++) {
+                    int dst = win_offset[win+w] + l;
+                    if (dst >= FF_ARRAY_ELEMS(ssch->spec_reord) || k >= FF_ARRAY_ELEMS(ssch->scaled_spec))
+                        return;
+                    spec_reord[dst] = scaled_spec[k++];
+                }
             }
         }
         win += ssch->scp.num_win_in_group[g];
@@ -4843,6 +4895,9 @@ static void spectral_synthesis(AC4DecodeContext *s, SubstreamChannel *ssch)
             nskip = (Nfull - N) / 2;
             nskip_prev = (Nfull - ssch->N_prev) / 2;
 
+            if (N < 0 || N > 2048 || win_offset[win + w] < 0 ||
+                win_offset[win + w] + N > 2048)
+                return;
             memcpy(in, ssch->spec_reord + win_offset[win + w], N * 4);
 
 #if 0

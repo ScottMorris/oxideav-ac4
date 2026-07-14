@@ -1197,7 +1197,13 @@ pub fn parse_two_channel_data_additional(
         });
     }
     let ms_bands = aspx_core_band_count(cfg, ti.transform_length_0).unwrap_or(psy.max_sfb_0);
+    if _trace {
+        eprintln!("2CH-ADD pre-chparam@{}", br.bit_position());
+    }
     let chparam = parse_chparam_info(br, &[ms_bands])?;
+    if _trace {
+        eprintln!("2CH-ADD post-chparam@{}", br.bit_position());
+    }
     // Round 406d: body0's scalefac band count is NOT derivable from any
     // known header field (observed 2 / 2 / 14 across three tracks with
     // identical aspx configs). Discover it per frame: parse body0's
