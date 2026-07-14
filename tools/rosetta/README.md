@@ -306,3 +306,24 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   but only ~25% frame coverage — NOT the gate. No audio
   delivered. stitch2_L.wav / stitch2_R.wav (decoded vs ref,
   side-by-side) banked in the scratchpad for the record.
+
+## Round 425 — KRAFTWERK DECODES UNDER THE ROSETTA GRAMMAR
+
+- The python chain (strict w3 sections + 5-bit max_sfb bodies,
+  |q|^(4/3) x 2^(0.25 sf) dequant, IMDCT, sine window) applied to
+  KRAFTWERK frame 6: body at bit 9865 scores **-0.826 vs the
+  M=(L+R) reference at lag 1056**, with three more bodies in the
+  same frame (4614, 5016, 10847) at the same lag cluster
+  1040-1088 — the same pipeline delay found on the speaker track
+  (1024). Music, not announcements.
+- Implication: the frames carry MULTIPLE w3-grammar bodies
+  (likely the front-group channel cores) beyond the war's proven
+  w5 additional pair. The war's wall-closure proofs stand, but
+  the primary audible content appears to live in w3 bodies the
+  Rust walker never decodes — explaining flat-zero Rust PCM
+  correlations at every lag on both tracks while python scores
+  0.8-0.99 at the right positions.
+- Full 200-frame Kraftwerk joint scan (body0 vs M fixed-lag
+  1024-1104, body1 vs S free) running.
+- Speaker C announcement: joint hits on 9/10 of the first C
+  frames (quieter speech = long windows = high parser reach).
