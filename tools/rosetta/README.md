@@ -220,3 +220,41 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   (sig+noise, multiple envelopes) and exact count accounting to
   the tail token; (3) decode absolute envelope values from an
   I-frame (F0) start and reconstruct the first parametric audio.
+
+## Round 423 — r422b demoted; the real structure map (speaker track)
+
+- **DEMOTION of r422b**: frames 679-683 are DIGITAL SILENCE in the
+  5.1 reference (exact zeros; the announcement decay ends at 678,
+  bitstream/reference alignment is frame-exact). The 5-sigma
+  "decay ramp" came from a structured countdown field decoded
+  through a Huffman book — the trajectory oracle's random-bits
+  null is INVALID on structured silent-frame content. Value-
+  statistics oracles need a null built from other frames' bits,
+  not random bits.
+- **I-frame cadence**: every 24 frames exactly (42 I-frames in the
+  first 999). All share 16-bit head `0111110111111101`; silent
+  I-frames carry `00001110` at [16..24). P-frames split
+  `010111` (fronts-active, 598) vs `010001` (surrounds, 359) —
+  bits 3-5 are per-group presence flags, tracking current-frame
+  activity at ~82.5% (sticky at transitions, no lead/lag).
+- **The "tail token" is content, not syntax**: universal quiet-
+  frame ender E = `11111 00 11111 0` (+gate +optional trailer),
+  = two 5-bit raw floor values 31 + separators — the A-SPX noise
+  block at minimum. 688/999 speaker frames end with E (peak
+  15-22 bits from wall) vs 3/201 Kraftwerk music frames —
+  exactly the speech-vs-music noise-floor prediction.
+- f0 (track start, silent I-frame) is 112 audio bits total:
+  [16b I-head][8b class][7b zeros][`101000000`x3 = stride-9
+  units, exact-fit ENV_LEVEL_15_F0 pairs][12b zeros][E@70]
+  [gate=1][22b trailer, exact-fits ALPHA_FINE_DF x8 / DRC_HCB x7
+  — unconfirmed][6b pad]. Silent P-skeleton f1 carries TWO of
+  the same stride-9 units.
+- Fade P-frames: one early field's codeword length shifts by 1
+  bit every ~2 frames (the r422b "countdown") — a dt-coded value
+  walking during fades. Silent-gap frames alternate small/large
+  (period-2 refresh, ~60-bit extra block every 2nd frame).
+- Duplicate-announcement frames share 107-227-bit prefixes
+  (param header block); divergence = content payload start.
+- WAR GRAMMAR LOCKS ON SPEAKER TRACK: bed_decode resync locks
+  954/999 add-pairs, 972/999 LFE, 0 hard fails. Content
+  validation vs the 5.1 reference in progress.
