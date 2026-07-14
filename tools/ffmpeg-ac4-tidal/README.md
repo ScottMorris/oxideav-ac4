@@ -213,3 +213,27 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
   both 5x and 7x paths. THAT is the next synthesis gap, plus SF
   level law. Note: war python proved bodies decode at 0.987 — the
   channel data is right; remaining gaps are processing-side.
+
+## Round 444 — matsel cascade engine
+
+- Table 179 structure CRACKED from row analysis: five_channel
+  matrix = fixed pair cascade s=P0(I0,I1); t=P1(s0,I2);
+  u=P2(I3,I4); (O0,O3)=P3(t0,u0); (O1,O4)=P4(s1,u1); O2=t1,
+  with matsel permuting routings (row1 = P0 output swap; row2 =
+  input re-route). chparam i lives in ssch[i] = P_i params.
+- Implemented two_channel_processing_p (param/buffer split) +
+  five_channel_cascade (row-0 routing for ALL matsels — routing
+  refinement pending) + four_channel_cascade (Table 177, fixed,
+  no matsel). Knob: AC4_MATSEL. Speaker matsel distribution:
+  15 dominant (941), then 7/0/8/11/1 — scattered, so per-matsel
+  routing matters. Plan: EMPIRICAL routing search per matsel
+  value using reference correlation as oracle (no OCR needed).
+- sap_mode 2 = fullband M/S: already handled in ffmpeg (verified).
+- Meter after cascade: STILL flat (~0.04-0.10). Conclusion: the
+  blocker is upstream of matrixing — suspect per-band SF gains
+  (wrong gains scramble in-frame spectral shape; war python with
+  proven sf chain hit 0.987 on same content). DECISIVE NEXT STEP:
+  parse-level A/B of ONE war-proven body (speaker f33 body0 at
+  dump bit 1656, c0=-0.642, or f60@1602 c0=+0.987) — dump ffmpeg's
+  per-band sf/spectrum for that channel and diff against the
+  python chain values. That pinpoints the exact divergent field.

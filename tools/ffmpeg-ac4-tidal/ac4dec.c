@@ -3797,6 +3797,7 @@ static int five_channel_info(AC4DecodeContext *s, Substream *ss)
     int ret;
 
     ss->chel_matsel = get_bits(gb, 4);
+    av_log(s->avctx, AV_LOG_DEBUG, "chel_matsel: %d\n", ss->chel_matsel);
 
     for (int i = 0; i < 5; i++) {
         ret = chparam_info(s, ss, &ss->ssch[i]);
@@ -4011,6 +4012,7 @@ static int three_channel_info(AC4DecodeContext *s, Substream *ss,
     int ret;
 
     ss->chel_matsel = get_bits(gb, 4);
+    av_log(s->avctx, AV_LOG_DEBUG, "chel_matsel: %d\n", ss->chel_matsel);
     ret = chparam_info(s, ss, ssch0);
     if (ret < 0)
         return ret;
@@ -4713,9 +4715,25 @@ static void scale_spec(AC4DecodeContext *s, int ch)
     }
 }
 
+static int two_channel_processing_p(AC4DecodeContext *s, Substream *ss,
+                                    SubstreamChannel *prm,
+                                    SubstreamChannel *buf0,
+                                    SubstreamChannel *buf1);
+
 static int two_channel_processing(AC4DecodeContext *s, Substream *ss,
                                   SubstreamChannel *ssch0,
                                   SubstreamChannel *ssch1)
+{
+    return two_channel_processing_p(s, ss, ssch0, ssch0, ssch1);
+}
+
+static int two_channel_processing_p(AC4DecodeContext *s, Substream *ss,
+                                    SubstreamChannel *prm,
+                                    SubstreamChannel *buf0,
+                                    SubstreamChannel *buf1)
+{
+    SubstreamChannel *ssch0 = prm;
+    SubstreamChannel *ssch1 = buf1;
 {
     int max_sfb_prev;
     float sap_gain;
@@ -4788,18 +4806,19 @@ static int two_channel_processing(AC4DecodeContext *s, Substream *ss,
         float b = ss->matrix_stereo[g][sfb][0][1];
         float c = ss->matrix_stereo[g][sfb][1][0];
         float d = ss->matrix_stereo[g][sfb][1][1];
-        float i0 = ssch0->scaled_spec[k];
-        float i1 = ssch1->scaled_spec[k];
+        float i0 = buf0->scaled_spec[k];
+        float i1 = buf1->scaled_spec[k];
         float o0, o1;
 
         o0 = i0 * a + i1 * b;
         o1 = i0 * c + i1 * d;
 
-        ssch0->scaled_spec[k] = o0;
-        ssch1->scaled_spec[k] = o1;
+        buf0->scaled_spec[k] = o0;
+        buf1->scaled_spec[k] = o1;
     }
 
     return 0;
+}
 }
 
 static int stereo_processing(AC4DecodeContext *s, Substream *ss)
@@ -4838,6 +4857,27 @@ static int m5channel_processing(AC4DecodeContext *s, Substream *ss)
     return 0;
 }
 
+static void five_channel_cascade(AC4DecodeContext *s, Substream *ss)
+{
+    /* Table 179 row-0 cascade (matsel routing refinement TODO):
+     * s=P0(I0,I1); t=P1(s0,I2); u=P2(I3,I4);
+     * (O0,O3)=P3(t0,u0); (O1,O4)=P4(s1,u1); O2=t1 */
+    two_channel_processing_p(s, ss, &ss->ssch[0], &ss->ssch[0], &ss->ssch[1]);
+    two_channel_processing_p(s, ss, &ss->ssch[1], &ss->ssch[0], &ss->ssch[2]);
+    two_channel_processing_p(s, ss, &ss->ssch[2], &ss->ssch[3], &ss->ssch[4]);
+    two_channel_processing_p(s, ss, &ss->ssch[3], &ss->ssch[0], &ss->ssch[3]);
+    two_channel_processing_p(s, ss, &ss->ssch[4], &ss->ssch[1], &ss->ssch[4]);
+}
+
+static void four_channel_cascade(AC4DecodeContext *s, Substream *ss)
+{
+    /* Table 177: s=P0(I0,I1); t=P1(I2,I3); (O0,O2)=P2(s0,t0); (O1,O3)=P3(s1,t1) */
+    two_channel_processing_p(s, ss, &ss->ssch[0], &ss->ssch[0], &ss->ssch[1]);
+    two_channel_processing_p(s, ss, &ss->ssch[1], &ss->ssch[2], &ss->ssch[3]);
+    two_channel_processing_p(s, ss, &ss->ssch[2], &ss->ssch[0], &ss->ssch[2]);
+    two_channel_processing_p(s, ss, &ss->ssch[3], &ss->ssch[1], &ss->ssch[3]);
+}
+
 static int m7channel_processing(AC4DecodeContext *s, Substream *ss)
 {
     /* pairs per Table 33: cc0 -> (0,1),(2,3); SIMPLE/ASPX additional
@@ -4853,6 +4893,14 @@ static int m7channel_processing(AC4DecodeContext *s, Substream *ss)
     case 1:
         if (ss->mdct_stereo_proc[0])
             two_channel_processing(s, ss, &ss->ssch[3], &ss->ssch[4]);
+        break;
+    case 2:
+        if (getenv("AC4_MATSEL"))
+            four_channel_cascade(s, ss);
+        break;
+    case 3:
+        if (getenv("AC4_MATSEL"))
+            five_channel_cascade(s, ss);
         break;
     }
     if (ss->codec_mode == CM_SIMPLE || ss->codec_mode == CM_ASPX) {
