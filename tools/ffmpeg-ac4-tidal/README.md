@@ -320,3 +320,30 @@ against chparam grammar ([2b sap_mode][ms_used m bits][sap_data]),
 try alignments; replicate chain on 2-3 more anchored frames
 (f60 speaker, kw strong frames) to confirm gap monotonicity is
 coincidence or structure. Then port resync/true grammar to ffmpeg.
+
+## Round 449 — gap-field data bank (two-frame witness)
+
+f33 chain gaps: (lead~25) 23, 18, 11, 9 | f60 chain: body@220 w3
+m=1 e257; @281 w3 m=10 e412 (gap 24); @433 w3 m=27 e1326 (21);
+@1343 w5 m=19 e1587 (17); @1602 w3 m=18 e1903 (15) = war 0.987
+anchor as LAST-ish channel. GAPS MONOTONICALLY DECREASE IN BOTH
+FRAMES — structural, not noise.
+Gap bit-strings (start..end dump bits):
+ f33: ch1 842..865  10000001001011000001000
+      ch2 1255..1273 011011100010010110
+      ch3 1338..1349 11100000011
+      ch4 1647..1656 101101100
+ f60: ch1 257..281  (24b) ch2 412..433 (21b)
+      ch3 1326..1343 (17b) ch4 1587..1602 (15b)
+Huffman-run fits (SCF/SNF books, skip 0-2): inconsistent across
+witnesses (f33ch2, f60ch1, f60ch4 fit nothing) -> NOT a plain
+huffman chain. Hypotheses still open: per-channel interleaved
+chparam+transform_info combos; pair-tree metadata; width law
+tied to decreasing quantity (remaining channels? cumulative?).
+NEXT: (a) third+ witness frames (kw strong 1194/1372/1392 via
+DAG w/ kw anchors; kw = 3ch config -> different channel count =
+discriminating test for "remaining channels" hypotheses);
+(b) try parsing gaps as [transform_info][psy pre-msfb fields] for
+SHORT-window channels (5+grouping bits) mixed with chparam;
+(c) once gap law falls: port to ffmpeg five_channel_data, align,
+re-meter, GATE.
