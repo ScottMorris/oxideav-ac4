@@ -372,3 +372,19 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   pre-body grammar — next session's target, fresh context.
 - Full-track Kraftwerk fixed-lag scan (all 1406 in-reference
   frames) launched for the coverage stitch.
+
+## Round 428 — full-minute Kraftwerk sweep (session close)
+
+- Fixed-lag joint scan over all 1406 in-reference frames (the
+  first 60s of Radioactivity): **210 frames yield confirmed M/S
+  body pairs (15%); per-frame M correlation at ONE global lag:
+  mean +0.266, median +0.308, 52% > 0.3.** Same quality bar as
+  the melodic-region pilot — the decode generalizes track-wide.
+- ~9 seconds of real decoded Kraftwerk audio (scattered), banked
+  as kwstitch.wav (decoded M | reference M side-by-side) in the
+  scratchpad. Gate still unmet: coverage is grammar-blocked, not
+  scan-blocked. Signs still oracle-derived.
+- Scan crashed harmlessly at the ref boundary (last ~8 frames).
+- Next session: the pre-body/element grammar (position
+  determinism), the sign law, then the Rust port of the proven
+  python chain.
