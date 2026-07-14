@@ -258,3 +258,20 @@ gives per-channel truth positions on any frame with reference —
 use it to solve the gap-field structure across many frames
 (accumulate (channel, gap-size, preceding-body properties) pairs
 and look for the field grammar; msfb/w choice may live IN the gap).
+
+## Round 446 — gap-field forensics (negative + new attack vector)
+
+- Gap bit-strings dumped for 34 war body pairs: contents look
+  random (no prefix code, no fixed flags; all-zero and all-one
+  both occur). Confirms war r427. Gap sizes 0-13 in this sample.
+- NEW ATTACK unavailable during the war: ffmpeg now walks the
+  whole element and reports per-channel context (sap_mode, msfb,
+  num_windows, matsel). Next: full-corpus regression of gap size
+  against NEXT-channel properties (sap_mode? msfb value? w3/w5
+  choice?) across all 238 pairs (jointbest + kwjoint4 + kwmel +
+  kwfull) — the gap may encode the per-channel width/msfb
+  selector that explains mixed w3/w5 within one element.
+- Also confirmed: war body1@1871 reparses better as w3 m=2 @1878
+  (corr .727 vs .320 for the old w5 read) — the war's w1=5 reads
+  may themselves be position-lottery artifacts; re-audit with
+  fixed-lag oracle when re-anchoring.
