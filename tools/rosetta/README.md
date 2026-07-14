@@ -327,3 +327,27 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
   1024-1104, body1 vs S free) running.
 - Speaker C announcement: joint hits on 9/10 of the first C
   frames (quieter speech = long windows = high parser reach).
+
+## Round 426 — Kraftwerk melodic frames decode; session close
+
+- Melodic region (frames 1000-1119, choir/verse): 40/113 joint
+  hits after fixing the band-template to the pipeline lag (+1024)
+  — the prefilter at lag 0 had rejected the -0.826 f6 body.
+  Intro region (0-199, geiger/noise): 6 hits (expected — noise
+  fill content).
+- Stereo stitch of 46 M/S pairs: per-frame M correlation at the
+  single global lag: **mean +0.289, median +0.330, 57% > 0.3**.
+  Segment corr ~0 purely from sparse coverage (46 frames over an
+  1104-frame span). Caveat: block signs oracle-derived; the
+  bitstream sign law is still owed.
+- Speaker-track correction: the "resistant" frames are the PINK
+  NOISE bursts — noise-fill content is waveform-uncorrelatable in
+  principle vs an independent E-AC-3 encode. On VOICE frames,
+  coverage is ~94% (15/16). C announcement: 15/45 joint hits.
+- Inter-body gaps run 0-21 bits (python snf tail under-consumes);
+  bodies are adjacent modulo that slack.
+- State: the rosetta w3 grammar + python chain decodes real music
+  at the target per-frame quality bar on the frames it reaches.
+  Remaining to the gate: position determinism (the chparam/element
+  grammar), the sign law, snf tail closure, noise-fill synthesis,
+  then the Rust port.
