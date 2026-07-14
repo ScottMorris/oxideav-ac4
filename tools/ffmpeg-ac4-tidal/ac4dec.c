@@ -152,11 +152,11 @@ typedef struct SubstreamChannel {
     int     aspx_num_rel_right;
     int     aspx_num_env;
     int     aspx_num_env_prev;
-    int     aspx_freq_res[5];
+    int     aspx_freq_res[9];
     int     aspx_var_bord_left;
     int     aspx_var_bord_right;
-    int     aspx_rel_bord_left[4];
-    int     aspx_rel_bord_right[4];
+    int     aspx_rel_bord_left[8];
+    int     aspx_rel_bord_right[8];
     int     aspx_tsg_ptr;
     int     aspx_tsg_ptr_prev;
 
@@ -171,13 +171,13 @@ typedef struct SubstreamChannel {
     int     aspx_xover_subband_offset;
     int     aspx_balance;
 
-    uint8_t atsg_freqres[5];
-    uint8_t atsg_freqres_prev[5];
-    int     atsg_sig[6];
+    uint8_t atsg_freqres[9];
+    uint8_t atsg_freqres_prev[9];
+    int     atsg_sig[10];
     int     atsg_noise[3];
     int     previous_stop_pos;
 
-    int     sbg_noise[6];
+    int     sbg_noise[10];
     int     sbg_sig_lowres[24];
     int     sbg_sig_highres[24];
     int     sbg_lim[32];
@@ -2863,8 +2863,12 @@ static int aspx_framing(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ss
 
     switch (ssch->aspx_int_class) {
     case FIXFIX:
-        ssch->aspx_num_env = 1 + get_bits(gb, 1 + ss->aspx_num_env_bits_fixfix);
-        if (ssch->aspx_num_env > 4) {
+        if (getenv("AC4_ENV_POW2"))
+            /* war law: aspx_num_env = 1 << tmp, not 1 + tmp */
+            ssch->aspx_num_env = 1 << get_bits(gb, 1 + ss->aspx_num_env_bits_fixfix);
+        else
+            ssch->aspx_num_env = 1 + get_bits(gb, 1 + ss->aspx_num_env_bits_fixfix);
+        if (ssch->aspx_num_env > (getenv("AC4_ENV_POW2") ? 8 : 4)) {
             av_log(s->avctx, AV_LOG_ERROR, "invalid aspx num env in FIXFIX: %d\n", ssch->aspx_num_env);
             return AVERROR_INVALIDDATA;
         }
@@ -2902,7 +2906,7 @@ static int aspx_framing(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ss
         int ptr_bits;
 
         ssch->aspx_num_env = ssch->aspx_num_rel_left + ssch->aspx_num_rel_right + 1;
-        if (ssch->aspx_num_env > 5) {
+        if (ssch->aspx_num_env > (getenv("AC4_ENV_POW2") ? 8 : 5)) {
             av_log(s->avctx, AV_LOG_ERROR, "invalid aspx num env: %d (class %d)\n", ssch->aspx_num_env, ssch->aspx_int_class);
             return AVERROR_INVALIDDATA;
         }

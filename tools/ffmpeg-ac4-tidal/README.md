@@ -167,3 +167,24 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
   cap>5 may be Tidal-legal, check war VARVAR handling.
 - Shell trap: `env VARS cmd > log 2>&1` inside a for-loop gave
   phantom 40/40 counts; `2> log` form counts correctly.
+
+## Round 440 — env pow2 law; speaker within bytes of closure
+
+- AC4_ENV_POW2: war law — FIXFIX aspx_num_env = 1 << tmp (1/2/4/8),
+  not 1 + tmp (ffmpeg). Env arrays bumped ([9]/[10]/[8]) for 8-env
+  frames. Caps relaxed to 8 under the knob.
+- FIXFIX+1env -> qmode 0 override: ALREADY spec/ffmpeg behavior,
+  not a deviation. Removed from the todo list.
+- FULL SPEAKER RUN (all knobs: RAWSUB CB15 OVERSHOOT_SKIP MSFB5
+  F0_RAW XOVER_STICKY ENV_POW2): 718 hard errors, 1845/2412 parse
+  to completion, 89 frames within 4 BYTES of the wall, 122 within
+  32. f33 = overread 2 bytes (16 bits). Residue = one small field
+  in the aspx tail (candidates: rel_bord value semantics raw vs
+  2n+2 — same bits but wrong borders could shift atsg/ec chains
+  on later frames; noise ec_data chains; b_aspx extras).
+- Two failure classes remain: (a) near-miss tails (aspx grammar
+  residue), (b) frames whose channel data ends far too early
+  (upstream sf misparse, likely sap_data/ms chains on loud
+  frames).
+- Kraftwerk unchanged: bed closes the same way; the 60-80% tail
+  is A-JOC objects (separate element, fork ajoc.rs has grammar).
