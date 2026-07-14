@@ -188,3 +188,28 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
   frames).
 - Kraftwerk unchanged: bed closes the same way; the 60-80% tail
   is A-JOC objects (separate element, fork ajoc.rs has grammar).
+
+## Rounds 441-443 — aspx parity audit, aligned-output metering, 7X processing
+
+- r441: per-block aspx POS tracing (framing/delta_dir/ec_data).
+  f33 surplus isolated to block 4 (additional pair) ec chains.
+  AC4_XOVER_SLOT3=N tunable — sweep 0..6 barely moves counts (not
+  the lever). hfgen_iwc_2ch + framing grammars verified IDENTICAL
+  to fork war implementations (tna/ah/fic/tic all match).
+- r442: AC4_NEVER_FAIL — overread rewinds to wall instead of
+  dropping; failed substreams zero their spectra; decoder emits
+  ALL frames = timeline-aligned output for honest full-pipeline
+  A/B. FIRST FULL-PIPELINE BASELINE vs E-AC-3 reference (per-frame
+  |c| @ lag 1024): L/R ~0.04, C ~0.08, LFE ~0.10, Ls/Rs ~0.08 —
+  weak; lowpass metering no better, so not a high-band masking
+  issue. Parse-complete != decode-correct (expected).
+- r443: mode 5/6 had NO post-parse M/S-SAP inverse AT ALL
+  (processing switch stopped at mode 4). Added
+  m7channel_processing: cc0 pairs (0,1),(2,3); cc1 pair (3,4);
+  SIMPLE/ASPX additional pair (5,6) via mdct_stereo_proc[2].
+  No metric change yet — speaker is almost all coding_config=3
+  (five_channel + chel_matsel): the 5-channel matsel inverse
+  (which pairs the matrix picks) is UNIMPLEMENTED for cc2/cc3 in
+  both 5x and 7x paths. THAT is the next synthesis gap, plus SF
+  level law. Note: war python proved bodies decode at 0.987 — the
+  channel data is right; remaining gaps are processing-side.

@@ -2848,6 +2848,7 @@ static int aspx_atsg(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch,
 
 static int aspx_framing(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch, int iframe)
 {
+    av_log(s->avctx, AV_LOG_TRACE, "POS aspx_framing@%d\n", get_bits_count(&s->gbc));
     GetBitContext *gb = &s->gbc;
 
     ssch->aspx_num_rel_left = 0;
@@ -2936,6 +2937,7 @@ static int aspx_framing(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ss
 
 static void aspx_delta_dir(AC4DecodeContext *s, SubstreamChannel *ssch)
 {
+    av_log(s->avctx, AV_LOG_TRACE, "POS aspx_delta_dir@%d\n", get_bits_count(&s->gbc));
     GetBitContext *gb = &s->gbc;
 
     for (int env = 0; env < ssch->aspx_num_env; env++)
@@ -3106,6 +3108,7 @@ static int aspx_ec_data(AC4DecodeContext *s,
                         uint8_t *freq_res, int quant_mode,
                         int stereo_mode, int *direction)
 {
+    av_log(s->avctx, AV_LOG_TRACE, "POS aspx_ec_data@%d\n", get_bits_count(&s->gbc));
     int dir, num_sbg, ret;
 
     for (int env = 0; env < num_env; env++) {
@@ -3337,7 +3340,8 @@ static int aspx_data_2ch(AC4DecodeContext *s, Substream *ss,
     if (iframe) {
         if (getenv("AC4_XOVER_STICKY")) {
             /* war law: no per-block xover field; fixed per slot [0,0,0,4] */
-            ssch0->aspx_xover_subband_offset = s->aspx_slot == 3 ? 4 : 0;
+            ssch0->aspx_xover_subband_offset = s->aspx_slot == 3 ?
+                (getenv("AC4_XOVER_SLOT3") ? atoi(getenv("AC4_XOVER_SLOT3")) : 4) : 0;
         } else
             ssch0->aspx_xover_subband_offset = get_bits(gb, 3);
         ssch1->aspx_xover_subband_offset = ssch0->aspx_xover_subband_offset;
@@ -3454,7 +3458,8 @@ static int aspx_data_1ch(AC4DecodeContext *s, Substream *ss,
 
     if (iframe) {
         if (getenv("AC4_XOVER_STICKY"))
-            ssch->aspx_xover_subband_offset = s->aspx_slot == 3 ? 4 : 0;
+            ssch->aspx_xover_subband_offset = s->aspx_slot == 3 ?
+                (getenv("AC4_XOVER_SLOT3") ? atoi(getenv("AC4_XOVER_SLOT3")) : 4) : 0;
         else
             ssch->aspx_xover_subband_offset = get_bits(gb, 3);
     }
@@ -4602,7 +4607,9 @@ static int ac4_substream(AC4DecodeContext *s, SubstreamInfo *ssinfo)
     consumed = (get_bits_count(gb) >> 3) - offset;
     if (consumed > audio_size) {
         av_log(s->avctx, AV_LOG_ERROR, "substream audio data overread: %d\n", consumed - audio_size);
-        return AVERROR_INVALIDDATA;
+        if (!getenv("AC4_NEVER_FAIL"))
+            return AVERROR_INVALIDDATA;
+        skip_bits_long(gb, -(consumed - audio_size) * 8); /* rewind to wall */
     }
     if (consumed < audio_size) {
         int non_zero = 0;
@@ -4826,6 +4833,31 @@ static int m5channel_processing(AC4DecodeContext *s, Substream *ss)
             break;
         }
         break;
+    }
+
+    return 0;
+}
+
+static int m7channel_processing(AC4DecodeContext *s, Substream *ss)
+{
+    /* pairs per Table 33: cc0 -> (0,1),(2,3); SIMPLE/ASPX additional
+     * pair (5,6) via mdct_stereo_proc[2]. cc1 pair (3,4) via [0].
+     * cc2/cc3 matsel matrixing TODO. */
+    switch (ss->coding_config) {
+    case 0:
+        if (ss->mdct_stereo_proc[0])
+            two_channel_processing(s, ss, &ss->ssch[0], &ss->ssch[1]);
+        if (ss->mdct_stereo_proc[1])
+            two_channel_processing(s, ss, &ss->ssch[2], &ss->ssch[3]);
+        break;
+    case 1:
+        if (ss->mdct_stereo_proc[0])
+            two_channel_processing(s, ss, &ss->ssch[3], &ss->ssch[4]);
+        break;
+    }
+    if (ss->codec_mode == CM_SIMPLE || ss->codec_mode == CM_ASPX) {
+        if (ss->mdct_stereo_proc[2])
+            two_channel_processing(s, ss, &ss->ssch[5], &ss->ssch[6]);
     }
 
     return 0;
@@ -5987,6 +6019,13 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         switch (substream_type) {
         case ST_SUBSTREAM:
             ret = ac4_substream(s, ssinfo);
+            if (ret < 0 && getenv("AC4_NEVER_FAIL")) {
+                for (int c = 0; c < 8; c++) {
+                    memset(s->substream.ssch[c].quant_spec, 0, sizeof(s->substream.ssch[c].quant_spec));
+                    memset(s->substream.ssch[c].sf_gain, 0, sizeof(s->substream.ssch[c].sf_gain));
+                }
+                ret = 0;
+            }
             break;
         case ST_PRESENTATION:
             skip_bits_long(gb, s->substream_size[i] * 8);
@@ -6018,6 +6057,10 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     case 3:
     case 4:
         m5channel_processing(s, &s->substream);
+        break;
+    case 5:
+    case 6:
+        m7channel_processing(s, &s->substream);
         break;
     }
 
