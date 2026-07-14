@@ -5895,6 +5895,34 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     av_log(s->avctx, AV_LOG_DEBUG, "packet_size: %d\n", avpkt->size);
     skip_bits_long(gb, start_offset * 8);
 
+    if (getenv("AC4_RAWSUB")) {
+        /* TOC bypass: packet = [flags byte][raw substream starting at
+         * audio_size field]. channel_mode from AC4_RAWSUB. */
+        int flags = get_bits(gb, 8);
+
+        s->version = 0;
+        s->fs_index = 1;
+        s->frame_rate_index = 13;
+        s->frame_len_base = frame_len_base_48khz[13];
+        s->num_ts_in_ats = get_num_ts_in_ats(s->frame_len_base);
+        s->frame_len_base_idx = frame_len_base_idx_48khz[13];
+        s->resampling_ratio = resampling_ratios[13];
+        s->num_qmf_timeslots = s->frame_len_base / 64;
+        s->num_aspx_timeslots = s->num_qmf_timeslots / s->num_ts_in_ats;
+        s->ts_offset_hfgen = 3 * s->num_ts_in_ats;
+        s->iframe_global = flags & 1;
+        s->have_iframe = 1;
+        s->nb_presentations = 1;
+        s->payload_base = 0;
+        s->nb_substreams = 1;
+        s->substream_type[0] = ST_SUBSTREAM;
+        s->substream_size[0] = avpkt->size - start_offset - 1;
+        ssinfo = &s->pinfo[0].ssinfo;
+        ssinfo->channel_mode = atoi(getenv("AC4_RAWSUB"));
+        ssinfo->iframe[0] = ssinfo->iframe[1] =
+        ssinfo->iframe[2] = ssinfo->iframe[3] = s->iframe_global;
+        ssinfo->sus_ver = 1;
+    } else {
     ret = ac4_toc(s);
     if (ret < 0)
         return ret;
@@ -5904,6 +5932,7 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     presentation = FFMIN(s->target_presentation, FFMAX(0, s->nb_presentations - 1));
     ssinfo = s->version == 2 ? &s->ssgroup[0].ssinfo : &s->pinfo[presentation].ssinfo;
+    }
     avctx->sample_rate = s->fs_index ? 48000 : 44100;
     avctx->channels = channel_mode_nb_channels[ssinfo->channel_mode];
     avctx->ch_layout = ff_ac4_ch_layouts[ssinfo->channel_mode];

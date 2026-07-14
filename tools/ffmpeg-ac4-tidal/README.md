@@ -68,3 +68,27 @@ element entries, sect/spec/scf/snf/end per channel) — diffable
 against python hand-parses.
 
 Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
+
+## Round 435 — TOC-bypass harness (AC4_RAWSUB)
+
+- ac4dec.c: AC4_RAWSUB=<channel_mode> env skips ac4_toc entirely;
+  packet = [flags byte: bit0=iframe][substream starting at
+  audio_size field]. wrap_subs.py wraps dump_subs .bin dumps into
+  AC40 sync framing (iframe cadence or explicit list).
+- VALIDATED: believer dumps through the harness = corr +1.000 vs
+  the mp4 path on all channels. The harness is bit-faithful.
+- Tidal speaker/Kraftwerk substreams now run through audio_data:
+  effectively 0 clean frames (expected — A-SPX deviations not yet
+  ported), but failures are per-frame diagnosable with POS traces.
+- KEY TRACE (speaker f33, P-frame): codec_mode=1 ASPX, LFE parses
+  clean (26..57), coding_config=3 -> five_channel_data, desync in
+  the chparam/sap region ~bit 188. War truth: body0 (5-bit msfb +
+  w3 sections M/S pair) sits at packet bit 1696. ~1500 bits of
+  parameter data (war E-chains = aspx envelopes?) sit BEFORE the
+  bodies — Tidal's element puts A-SPX data before spectral bodies,
+  or the element isn't a Table-33 7X at all. NEXT: hand-map
+  57..1696 against war aspx grammar (kwjoint positions known for
+  210 Kraftwerk frames too).
+- MINIMAL-BUILD TRAP: no null muxer — "-f null" dies at muxer
+  init and error counts reflect the PROBE PHASE ONLY. Always
+  decode to -f wav. (Counting-trap rule, incident #4.)
