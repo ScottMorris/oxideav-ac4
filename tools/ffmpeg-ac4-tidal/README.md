@@ -275,3 +275,25 @@ and look for the field grammar; msfb/w choice may live IN the gap).
   (corr .727 vs .320 for the old w5 read) — the war's w1=5 reads
   may themselves be position-lottery artifacts; re-audit with
   fixed-lag oracle when re-anchoring.
+
+## Round 447 — gap regression: comprehensive negative, new design
+
+- Full-corpus regression (238 pairs): gap size uniform over the
+  scan range 0-25 -> corpus contaminated by position-lottery
+  body1 hits (weak |c1| filter in the war scans). No byte
+  alignment (body0/body1 starts uniform mod 8). No gap<->w1 or
+  gap<->m1 relation.
+- Oracle-strict rebuild (|c0|>=0.5, body1 required |c1|>=0.5 at
+  fixed lag): only 3/40 frames yield verifiable body1 (near-mono
+  content). Gaps 7/17/10, w1=3 all, body0 snf_bits 1/1/5 — too
+  few for regression. THE GAP FIELD REMAINS UNSOLVED analytically.
+- NEXT DESIGN (wall-constrained chaining INSIDE ffmpeg): unlike
+  the war's blind scans, ffmpeg now knows the full element around
+  the sf_datas. Add AC4_BODY_RESYNC: at each five_channel sf_data
+  start, try offsets 0..25 x {w3,w5}; accept the first parse that
+  (a) is grammar-valid, (b) keeps the remaining channels' chain
+  able to land within the audio wall (backtracking, like the
+  fork's r408 RSDBG machinery but with the full Table-33 context).
+  The wall + downstream-structure constraints should collapse the
+  ambiguity that killed greedy chaining. Validate on f33 (known
+  anchors 1656/1878) before trusting.
