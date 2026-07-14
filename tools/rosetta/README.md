@@ -388,3 +388,31 @@ re-run the bed decoder with true LFE, re-meter at fixed lag.
 - Next session: the pre-body/element grammar (position
   determinism), the sign law, then the Rust port of the proven
   python chain.
+
+## Round 429 — spec anchoring of the rosetta body grammar
+
+- sf_data internals are SPEC-EXACT: our section/spectra/scalefac/
+  snf models match Tables 39-42 verbatim (scalefac: 8-bit
+  reference + dpcm huff skipping the first coded band; snf: gate
+  + huff over cb==0/mqi==0 bands). The tail model is closed.
+- **The 5-bit max_sfb field is identified**: Table 106 gives
+  n_side_bits = 5 for TL 2048, used by max_sfb_side (side-limited
+  channels, sf_info(s,0,1) in the ASPX_ACPL_1 pair, Table 22) and
+  by max_sfb_master (msp pairs, 4.3.5.13). Our confirmed bodies
+  are side/master-class bodies. The 6-bit spec-mono alias is
+  ruled out empirically (f60 bit 1601 = 1 breaks leading-zero
+  absorption; the 0.987 tree requires the 5-bit read).
+- Element header sizes are now enumerable from Tables 22/23/34/35:
+  LFE = [3-bit msfb]; mono = [1+1+6]; pair msp=0 =
+  [1][1+1+6][1+1+5]; pair msp=1 = [1][1+1+6][chparam_info...].
+  Bodies within a pair are strictly adjacent per spec — the
+  observed 0-25 gaps must be inter-element fields (companding_
+  control, aspx/acpl blocks) between groups, not intra-pair.
+- Open: w3 sections on long bodies (spec Table 39 implies 5-bit
+  widths for long transforms — candidate encoder deviation #11,
+  or a transf_length-code semantic for long frames not yet
+  traced); the M partner of our S bodies (6-bit msfb class) has
+  not yet been found by scanning — next session's first test.
+- NEXT: spec-exact element walker (stereo_data / 3ch / 5ch cases
+  + companding_control + aspx/acpl) fitted against the 210-hit
+  corpus; then sign law; then Rust port.
