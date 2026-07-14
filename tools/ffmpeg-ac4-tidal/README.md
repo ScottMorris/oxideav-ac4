@@ -237,3 +237,24 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
   dump bit 1656, c0=-0.642, or f60@1602 c0=+0.987) — dump ffmpeg's
   per-band sf/spectrum for that channel and diff against the
   python chain values. That pinpoints the exact divergent field.
+
+## Round 445 — per-channel misalignment mapped; gap fields = last unknown
+
+Correlation-oracle body scan around ffmpeg's five_channel sf_data
+boundaries on speaker f33 (python, war grammar, ±40 bits):
+- ch0@223: no correlating body (quiet ch)
+- ch1@383: true body @412 w5 (off +29, corr 0.311)
+- ch2@1034: none
+- ch3@1633: true body @1656 w3 (off +23, corr 0.629) = war body0
+- ch4@2346: true body @2330 w3 m=1 (off -16, corr 0.844);
+  war body1 @1871 reparses better as w3 m=2 @1878 (corr 0.727)
+OFFSETS NON-MONOTONE (+29/+23/-16) => unknown small fields BETWEEN
+per-channel sf_datas (the war's 0-25-bit inter-body "gap mystery"
+= real per-channel leading/trailing fields ffmpeg never reads).
+This is the LAST grammar unknown for the bed. Mixed w3/w5 widths
+confirmed WITHIN one element (per-channel, not per-element).
+Toolchain note: the correlation-anchored scan (this experiment)
+gives per-channel truth positions on any frame with reference —
+use it to solve the gap-field structure across many frames
+(accumulate (channel, gap-size, preceding-body properties) pairs
+and look for the field grammar; msfb/w choice may live IN the gap).
