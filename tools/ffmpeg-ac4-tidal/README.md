@@ -115,3 +115,16 @@ Build: scratchpad/build_ffac4.sh (docker, ~1 min incremental).
   NEXT: error logging inside aspx_config + war aspx deviations.
 - Packet offset in harness: demuxer strips sync; packet bit =
   dump bit + 8 (flags byte).
+
+## Round 437 — both tracks converge on aspx_data
+
+- Kraftwerk f0 (iframe, 17688-bit audio): LFE + three_channel +
+  msp pairs with different_framing short windows ALL walk clean
+  to bit 4613, then dies INSIDE the first aspx_data_2ch. 13099
+  bits of aspx payload follow (music-sized envelopes).
+- Speaker f33: same story, tail-sized (aspx blocks at 2784..~3040
+  vs wall 3144).
+- => the LAST grammar face for both = aspx_data_2ch/1ch. Port the
+  war deviations as knobs: mixed raw/huff F0 (LEVEL_30=6,
+  LEVEL_15=7, BAL_30=4, BAL_15=5, NOISE=5, NBAL=4), sticky xover
+  slots [0,0,0,4], P-frame FIXFIX+1env->Fine qmode override.
