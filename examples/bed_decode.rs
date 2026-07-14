@@ -174,8 +174,13 @@ fn main() {
                     }
                 }
             }
+            let lfe_start = br.bit_position();
             match parse_mono_data(&mut br, true, TL) {
-                Ok(m) => match (m.scaled_spec.as_deref(), m.scaled_spec_windows.as_deref()) {
+                Ok(m) => {
+                    if std::env::var_os("AC4_BED_TRACE").is_some() {
+                        eprintln!("LFE f={i} start={lfe_start} end={}", br.bit_position());
+                    }
+                    match (m.scaled_spec.as_deref(), m.scaled_spec_windows.as_deref()) {
                     (Some(s), _) => {
                         ok_lfe += 1;
                         ola.long(2, s)
@@ -185,7 +190,7 @@ fn main() {
                         ola.grouped(2, w)
                     }
                     _ => ola.silent(2),
-                },
+                }}
                 Err(_) => ola.silent(2),
             }
         };
@@ -223,6 +228,15 @@ fn main() {
                     u8::from(grp0),
                     u8::from(grp1),
                 );
+            }
+            if let Some(dir) = std::env::var_os("AC4_BED_SPEC_DIR") {
+                for (ch, tag) in [(0usize, "pl"), (1, "pr")] {
+                    if let Some(Some(s)) = p.scaled_spec_per_channel.get(ch) {
+                        let pth = std::path::Path::new(&dir).join(format!("{tag}{i:05}.f32"));
+                        let bytes: Vec<u8> = s.iter().flat_map(|v| v.to_le_bytes()).collect();
+                        let _ = fs::write(pth, bytes);
+                    }
+                }
             }
             // §5.3.3.2 pair unmix (SAP a/b/c/d per band) for the
             // joint-MDCT-stereo long-frame case.
