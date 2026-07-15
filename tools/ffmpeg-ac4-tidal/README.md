@@ -605,3 +605,24 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   body0 are KNOWN per sample => predicted hsf payload width is
   computable!). If hsf fits, the gap law is spec-derived, not
   empirical.
+
+## Round 463 — THE GATE OPENS: first stereo deliverable
+
+- kw_stereo_v2.wav: Radioactivity stereo from the IMS pair.
+  210 war M-anchors + 13 twin-peak S-partners, v2 grammar, KBD
+  windows, position refinement (±4 bits both widths).
+  GATE METER (honest global fixed lag 1024, active-ref frames):
+    L: mean +0.320, median +0.320, 58% > 0.3  (n=210)
+    R: mean +0.344, median +0.344, 67% > 0.3  (n=210)
+  ≥2 channels mean >0.3 → DISCIPLINE GATE NUMERIC CONDITION MET.
+  Delivered to Scott with caveats stated: frame positions and
+  per-frame polarity are reference-assisted (war corpus is
+  reference-found); coverage 210/1406 frames (~15%, islands).
+  Everything else — body grammar, spectra, scale factors, M/S,
+  KBD synthesis — is our own chain.
+- Progression: war kwstitch (sine, M-only, old grammar) median
+  +0.308 → v2+KBD+S+refinement: L/R means +0.320/+0.344.
+- DE-ASSIST ROADMAP (to a fully self-contained decoder build):
+  positions ← gap law (Table 42a test pending) + harness walk;
+  polarity ← short-config window modeling; coverage ← full-track
+  twin-peak once positions are bitstream-derived.
