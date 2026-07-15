@@ -893,3 +893,31 @@ the 4760-bit corpus under exact-consume constraint (MDL search).
   should show structure (e.g., sum to element budget, or repeat
   across frames) even though slack doesn't. Test with the 285-
   sample (sb, e0, gap) chain data + kw sweep (running).
+
+## r471 (2026-07-15) — WALKER REALITY CHECK; SELF-CONSISTENCY ORACLE MEASURED
+
+- SLOT STRUCTURE NEGATIVE: slot sizes (body0 start → body1 start)
+  show no quantization (%2..%32 uniform), no cross-frame
+  persistence (adjacent-frame corr +0.01, 1% equal), and slack
+  does NOT anti-correlate with body length (corr −0.006) — fixed
+  slots dead; phenomenon = "body + Uniform(0..N) random pad".
+- REFERENCE-FREE VALIDITY WALKER (chainwalk.py banked): memoized
+  v2-parse over all positions + DFS chaining, gaps 0..60. Result:
+  validity chains are EVERYWHERE (depth 12-25 chains from frame
+  front, sailing past true anchors; body0 hit rate 0/7). The v2
+  grammar is too permissive for naive validity chaining — the
+  completeness theorem again. Position determinism needs a
+  stronger per-body oracle.
+- TEMPORAL SELF-CONSISTENCY ORACLE (no reference needed): true
+  same-channel bodies in adjacent frames share their OLA overlap
+  → |corr(y_f tail, y_f+1 head)|: TRUE pairs 25% > 0.2 (mean
+  0.121), DECOYS 2% > 0.2 (mean 0.023). Weak per-boundary,
+  usable AGGREGATED over whole-track chains. This is the seed of
+  the de-assisted pipeline: chain hypotheses scored by summed
+  overlap consistency across all frames.
+- ALBUM SURVEY: catalog spans encoder generations — speaker v0,
+  Thriller v1(+v2 mixed reads), kw/Joni v2. Differential material
+  for gap-mechanism experiments across vintages.
+- kw full-track sweep running (fulltrack_kw.log); ~28h ETA at
+  python pace — results land incrementally in the log; v4 stereo
+  master rebuild queued on its completion.
