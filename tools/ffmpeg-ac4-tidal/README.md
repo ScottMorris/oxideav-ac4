@@ -626,3 +626,20 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   positions ← gap law (Table 42a test pending) + harness walk;
   polarity ← short-config window modeling; coverage ← full-track
   twin-peak once positions are bitstream-derived.
+
+## Round 464 — listening fix: per-frame level matching
+
+- v2 wav played as SILENCE: per-frame levels are arbitrary
+  (absolute SF law open); one hot frame forced global
+  normalization to bury the rest ~60 dB down. VLC log red
+  herring: file was valid; Bluetooth sink noise + buried levels.
+- v3 build: per-frame energy matched to reference envelope
+  (reference-assisted, documented) + S scaled by ref S/M ratio.
+  Result: 453 audible frames (level fix surfaced frames the old
+  normalization buried), montage 19.3s across 85 runs.
+- Files banked: kw_stereo_v3.wav (timeline) +
+  kw_stereo_montage.wav (concatenated runs, crossfaded).
+- LESSON: the absolute SF level law is now a LISTENING blocker,
+  not just a metric footnote — promote it in the de-assist queue
+  (likely tied to believer's clipping + the 2^(sf-100)/4 offset
+  question from r434).
