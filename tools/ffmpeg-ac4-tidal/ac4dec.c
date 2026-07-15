@@ -2340,6 +2340,9 @@ static int asf_section_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel
         i = 0;
         ssch->num_sec_lsf[g] = 0;
         max_sfb = get_max_sfb(s, ssch, g);
+        av_log(s->avctx, AV_LOG_TRACE, "SECTL g=%d msfb=%d w=%d sl=%d dm=%d side=%d\n",
+               g, max_sfb, n_sect_bits, ssch->scp.side_limited,
+               ssch->scp.dual_maxsfb, ssch->scp.side_channel);
         while (k < max_sfb) {
             int sect_len_incr;
             int sect_len;

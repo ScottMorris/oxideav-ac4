@@ -497,3 +497,29 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   with v2: body ends move, more bodies become visible (cb15
   class), gaps re-measured on correct ends -> pair layout;
   plus window-exact IMDCT for the gate.
+
+## Round 458 — v2 BIT-EXACT (89/102); TWIN-PEAK GAP HARVEST
+
+- OFF-BY-ONE FOUND: ffmpeg probe double-decodes packet 0 → trace
+  frame i = dump i-1. Map via audio_size matching (offset votes
+  {1:200}). r456's failed audits were THIS, not grammar.
+- python v2 vs ffmpeg on believer long single-group spans:
+  ** 89/102 EXACT, zero nonzero deltas ** (13 exceptions left to
+  classify). The v2 grammar (cb0-15, overshoot-skip, snf) is
+  bit-perfect. => war body END positions were CORRECT; Tidal pair
+  gaps are REAL structure absent from believer.
+- TWIN-PEAK METHOD: on single-channel frames, body1 (S) correlates
+  as strongly as body0 (M=S=L). f60's TRUE S: gap=11 w5 m=26 at
+  |c|=0.988 (war's gap-7 was 4 bits off). Sixteen clean gap
+  samples harvested (jointbest anchors, v2 grammar, c>=0.45):
+  f33 g9 w3 m2 | f36 g10 w3 m3 | f39 g19 | f58 g23 | f60 g11 w5
+  m26 | f61 g26 | f62 g24 | f63 g31 | f64 g5 | f108 g22 | f109 g3
+  | f110 g6 | f134 g5 | f135 g16 | f136 g16 | f140 g0 (flush!).
+  Bit-strings in transcript. Gap range 0-31, no simple width law
+  yet; f140 g0 = believer-style flush exists in Tidal too.
+- NEXT (r459): (a) classify the 13 v2 exceptions; (b) twin-peak
+  over ALL 2412 speaker frames (not just war anchors) => hundreds
+  of gap samples + the full M/S corpus for the gate; (c) gap
+  grammar regression on the clean set (vs w1/m1/sap candidates);
+  (d) window-exact IMDCT. The gate corpus and the gap law now
+  come from the SAME scan.
