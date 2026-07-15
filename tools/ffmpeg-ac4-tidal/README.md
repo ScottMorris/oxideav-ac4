@@ -402,3 +402,27 @@ re-meter, GATE.
   fixed-lag). (3) Believer contradiction to interleave hypothesis
   noted: believer msp=0 grouped layout is wall-exact-validated,
   so Tidal's pair layout deviation (if any) is Tidal-specific.
+
+## Round 454 — phase wobble PROVEN; the knot identified
+
+- Role table (28 anchors, L/R/M/S per frame): speaker announce
+  frames are single-channel; body tracks the ACTIVE channel
+  (M-of-pair consistent). Old sign(c0) flips = lag artifacts.
+- Fine lag sweep (step 1, 960..1090): peak lags SPREAD the whole
+  range (several pinned at sweep edges, e.g. f140 c=0.936 with
+  peak <=960; f60 0.987 at 1020); signs still mixed 18+/10-.
+  => NOT sweep quantization: per-frame TRANSFORM PLACEMENT.
+  Bodies with short-window configs place energy at different
+  offsets; our fixed single-2048 sine IMDCT smears/shifts them.
+- THE KNOT: pair sf_info (immediately before each body = the
+  "gap" field) carries the window config; window config fixes
+  phase; phase fixes sign+lag; sign+lag close the honest gate.
+  ONE implementation unlocks all: backward-parse sf_info at
+  body0_start - {1 | 6+n_grp_bits_a[idx0][idx1]} bits, then
+  window-correct IMDCT/OLA (needs short-window SFB tables +
+  grouped spectrum layout — fork has BlockSwitchOla + tables).
+- PLAN r455: implement window-exact python recon for the 28
+  anchors (enumerate sf_info candidates that end exactly at
+  body0 start; pick the one that locks peak to a constant lag);
+  expect lag to collapse to single value & signs to unify ->
+  re-run gate WITHOUT assists -> listening master.
