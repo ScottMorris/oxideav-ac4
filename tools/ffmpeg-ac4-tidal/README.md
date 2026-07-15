@@ -868,3 +868,28 @@ pairs (near-identical body0 bits, diff gaps); (d) mine Dolby
 patents/DP580 encoder docs for post-sf_data per-channel tools in
 ASPX mode; (e) unknown-codebook induction: fit a prefix-code to
 the 4760-bit corpus under exact-consume constraint (MDL search).
+
+### r470 addendum — independence result + slot-slack hypothesis
+
+- corr(gap, X) ~ 0.00 for X in {nz0, len0, m0, nz1, len1, m1,
+  energy0} on 285 samples — field size is independent of BOTH
+  neighbors' content, all positions, and frame type. Statistically
+  an i.i.d. ~Uniform(0..N) draw.
+- Codebook induction impossible: both '0' and '1' occur as
+  complete 1-bit fields (any generating prefix code is
+  degenerate). gap=2 strings {00,01,11}, gap=3 {001,010,100,101,
+  110} — content space unconstrained.
+- SURVIVING HYPOTHESIS (new): CHANNEL BUDGET SLOTS — each
+  sf_data is written into a rate-allocated slot; gap = slot
+  slack; content = stale reservoir bits. Explains: uniform
+  independent size ✓, flat entropy content ✓, no alignment ✓,
+  gap=0 possible ✓, believer (SIMPLE, low-rate CBR channels?)
+  flush ✓. Consequence if true: THE GAP NEEDS NO GRAMMAR —
+  positions come from parse-chaining body0→scan tiny window→
+  body1 (which twin-peak already does reference-free once body0
+  is found). De-assist route: derive body0 discovery from
+  element-walk + validity-scan instead of reference correlation.
+- Falsification for r471: if slots, the SLOT SIZES (sb_i .. sb_{i+1})
+  should show structure (e.g., sum to element budget, or repeat
+  across frames) even though slack doesn't. Test with the 285-
+  sample (sb, e0, gap) chain data + kw sweep (running).
