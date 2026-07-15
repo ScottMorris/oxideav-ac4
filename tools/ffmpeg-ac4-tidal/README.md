@@ -787,3 +787,38 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   (6.2.1.x) to re-derive what the Tidal TOC actually says
   (channel_mode 6 reading may be a v1-style parse of v2 fields);
   model post-aspx two_channel_data boundaries as gap candidates.
+
+### r469 addendum — final iframe verdict + Rosetta leads
+
+- SPK IFRAME SWEEP COMPLETE (100 rows, full-position v2+KBD scan,
+  twin-peak S): 19 pairs, 16 strong (c>=0.45) — ALL 16 have
+  NONZERO gaps {2,2,7,8,8,9,9,12,14,24,26,27,28,30,31,33}.
+  P-frame-only hypothesis DEAD with prejudice. Corpus now 45
+  labeled samples (iframe_gaps_spk.json banked). Note gap=33
+  exceeds the old 0-31 range; f456/f1920 give 2-bit fields
+  '00'/'01'.
+- BITSTREAM-VERSION SPLIT DISCOVERED: speaker mp4 = bitstream
+  v0 (part-1-only stream!), Kraftwerk = v2. Both carry the gap
+  deviation ⇒ it's encoder-family-wide, NOT a part-2 feature.
+- KW MP4 TOC PATH IS CLEAN (kw-fixedstco.mp4): v2 TOC parses
+  (1 presentation, 1 group, channel-coded 7.1, sus_ver 1,
+  2 substreams). RAWSUB harness unnecessary for kw. sap_mode=3
+  (Full SAP → Table 48 sap_data with alpha huffman chains) is
+  ACTIVE in kw pairs — sap_data widths are a live gap candidate
+  readable from the real walk.
+- f1361 ROSETTA CANDIDATE: ffmpeg's mp4 walk lands an sf_data
+  end EXACTLY on our anchor body0 start (pkt 2169) and walks
+  LFE + 3ch(2 chparams: sap 2,0) + 2ch + SAP add-pair (adjacent,
+  gap 0) into aspx trailers, all contiguous, with SHORT-frame
+  geometry (g=2/g=4) for the big bodies. Full-chain synthesis
+  still meters at noise (0.05) so the walk is unverified — but
+  SHORT-FRAME GEOMETRY as the origin of our "gaps" (v2 long-parse
+  end error on short bodies) is now a prime suspect: gap=0 on
+  long frames, largest gaps on known short frames (f63 g31,
+  f135/f136 g16/g16 identical).
+- r470 PLAN: (1) implement grouped/short sf_data parse in python
+  (sections/spectra/scf per group, short SFB tables); re-parse
+  all 45 corpus body0s under short geometry read from their
+  actual sf_info; test whether corrected ends absorb the gaps.
+  (2) Full-track twin-peak sweeps for the 10x corpus. (3) kw mp4
+  walk comparison at scale (kw_mp4_walk.json method).
