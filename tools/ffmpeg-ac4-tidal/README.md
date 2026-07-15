@@ -704,3 +704,30 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   what transform length do pair bodies really use? Try parsing
   w3 bodies with SFB_1024/512 tables + matching IMDCT and
   compare correlations on anchors.)
+
+## Round 468 — three arbitrations: 2048 confirmed, gap-fear dissolved, hsf refuted
+
+- W3 TRANSFORM-LENGTH HYPOTHESIS DEAD: correlation arbitration
+  over 28 anchors: 2048-line geometry wins 25-3 vs 1024 (all
+  placements). The 3 dissenters (f63, f135 esp.) prefer 1024@512
+  — SAME frames the parity-alternation helped: they are the
+  genuine mixed-transform frames; keep as short-config test set.
+- COVERAGE GAP DISSOLVED BY SAMPLE BIAS: fork derive_master_sbg
+  == ffmpeg exactly (sba=40 = 15kHz is the true derivation).
+  War anchors are dark voiced frames (m 10-26 = 0.9-4.4kHz);
+  bright pair bodies would carry m~40 (14-15kHz), meeting aspx
+  at 15kHz seamlessly. No gap; nothing unexplained.
+- TABLE 42a (hsf) REFUTED for the pair gap: ALL 29 corpus body0s
+  have ZERO overshoot sections (old-grammar selection bias) →
+  hsf predicts gap=0 everywhere; observed 0-31. Another
+  hypothesis eliminated cleanly.
+- The -11dB mids deficit re-read: dominated by weak anchors
+  (c~0.4 = partly-wrong parses); f60-class frames match ref
+  across the band. Cure = better positions (de-assist), not a
+  new law.
+- GAP STATUS: not chparam, not sf_info, not ti, not alignment,
+  not hsf, not template-solvable with fixed fields, presence
+  externally gated (gap=0 exists). Next candidates: fields gated
+  by FRAME-level state (aspx framing class of the PAIR? iframe
+  distance?) — test gap size vs frame%24 and vs the pair's
+  aspx_num_env once measurable.
