@@ -376,3 +376,29 @@ re-meter, GATE.
   trailer whose position ffmpeg knows); (d) M/S stitch under
   ffmpeg synthesis -> GATE attempt. The gate may not need the bed
   at all — the IMS pair IS the stereo listening target!
+
+## Rounds 452-453 — GATE DRY-RUN: numbers met (with one asterisk)
+
+- f60 S-partner hunt (free-lag, e0..e0+34): best = war's @1910 w5
+  but only |c|=0.138 — f60 is near-mono; S genuinely tiny. M
+  carries the content: M-only stereo reconstruction is viable on
+  such frames.
+- M-ONLY GATE DRY-RUN (28 jointbest M bodies, python chain, sign
+  from stored c0, GLOBAL fixed lag 1024, active-ref frames only):
+    L: n=15 mean +0.389 median +0.376 (73% > 0.3)
+    R: n=14 mean +0.368 median +0.376 (64% > 0.3)
+  Two channels > 0.3 mean per-frame = DISCIPLINE GATE NUMBERS MET
+  on the anchored corpus. ASTERISK: per-frame signs taken from
+  reference-derived c0 (leakage — not gate-legit); coverage = 28
+  frames of the 133-frame scanned range (voiced segments).
+- REMAINING HONEST BLOCKERS: (1) deterministic sign law — signs
+  mix ± across frames; war lag0 also varied 992-1072 per frame:
+  both smell like WINDOW-SEQUENCE PHASE (we OLA with fixed sine
+  2048; true frames have start/stop window shapes + possibly
+  variable transform splits). Fix = model window sequence from
+  sf_info in the python chain (or drive ffmpeg synthesis with
+  aligned bodies). (2) Coverage: scan all 2412 speaker frames for
+  M bodies (position prior: tail region before aspx; M template
+  fixed-lag). (3) Believer contradiction to interleave hypothesis
+  noted: believer msp=0 grouped layout is wall-exact-validated,
+  so Tidal's pair layout deviation (if any) is Tidal-specific.
