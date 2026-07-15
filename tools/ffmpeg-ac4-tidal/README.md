@@ -731,3 +731,10 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   by FRAME-level state (aspx framing class of the PAIR? iframe
   distance?) — test gap size vs frame%24 and vs the pair's
   aspx_num_env once measurable.
+
+- r468 addendum: gap vs iframe-distance corr = -0.07 (no linear
+  relation) BUT the corpus's only true iframe (kw1320, fr%24==0)
+  has gap=0. Hypothesis for next corpus expansion: the gap field
+  is P-FRAME-ONLY (inter-frame prediction state for the pair —
+  e.g. time-delta flags/chains absent on iframes). Need more
+  iframe samples: harvest gaps specifically on fr%24==0 anchors.
