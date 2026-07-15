@@ -664,3 +664,24 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
 - NEXT: exact snf semantics from ffmpeg synthesis (snf usage in
   scale_spec/prepare_channel paths); then A-SPX high band =
   the remaining timbre gap; then de-assist (positions/sign).
+
+## Round 466 — SPEC-EXACT NOISE FILL (Pseudocode 22/23)
+
+- ffmpeg also parses-and-discards snf (no answer key) — went to
+  spec 5.1.4: ref level = log2 RMS of FIRST nonzero decoded band
+  (self-referencing scaled_spec — no absolute constant!); per
+  noise band delta = code - 17 (-17 = no-fill escape, level not
+  updated); level accumulates; amp = 2^(0.5 * level); unit
+  Gaussian per line. SNF alphabet = 22 codes; kw corpus: 56/58
+  noise bands DO fill, deltas mostly -5..+4.
+- Band-deficit profile vs FULL reference (71 frames, |c|>=0.4):
+  0-300Hz +0.5dB (match); 300-600 -4.4; 600-1000 -11.9 (was
+  -18.5 pre-snf); 1000-2000 -11.0; 2000-3000 -20.4.
+- Remaining mids deficit hypotheses: (a) encoder genuinely thin
+  (quantization) and A-SPX/A-CPL reconstructs there — check pair
+  codec mode / acpl config (crossover may sit ~1-4kHz, not 6k);
+  (b) sf chain end-of-band defects. NEXT: locate the pair's aspx
+  crossover frequency from the harness (sbx values for the ADD
+  PAIR specifically) — if sbx*375Hz ~ 1-2kHz, the deficit IS the
+  A-SPX region and high-band synthesis is the next big win.
+- kw_montage_snf_exact.wav banked (spec-exact snf build).
