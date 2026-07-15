@@ -543,3 +543,20 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
 - Note: frames improved by parity alternation (f110/135/136) are
   candidates for short/split transform configs — use as test set
   for window hypotheses.
+
+## Round 460 — KBD confirmed; long-frame model near-perfect
+
+- AC-4 windows are KBD (Table 186: alpha=3 @ 2048), NOT sine.
+  Python chain upgraded: mean |c| 0.408 -> 0.411 across 28
+  anchors; f60 0.987 -> 0.993 (long-frame model now near-exact).
+- Signs UNCHANGED under KBD => sign is not window shape; the
+  negative-c frames are genuinely different transform structures
+  (short/split configs — the same frames parity-alternation
+  helped). The long-KBD model is correct for long frames; short
+  frames need the full grouped-spectrum reconstruction.
+- STATUS toward the gate: magnitude side solid (|c| mean 0.411 on
+  anchors, well over 0.3); positions still come from reference-
+  assisted war scans — a fully honest master needs bitstream-
+  derived positions (ffmpeg harness alignment + the gap law).
+  Polarity flips are near-inaudible; gate ruling on signed vs |c|
+  is Scott's call.
