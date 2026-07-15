@@ -738,3 +738,52 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   is P-FRAME-ONLY (inter-frame prediction state for the pair —
   e.g. time-delta flags/chains absent on iframes). Need more
   iframe samples: harvest gaps specifically on fr%24==0 anchors.
+
+## r469 (2026-07-15) — P-FRAME HYPOTHESIS FALSIFIED; PART-2 SPEC OPENED
+
+- IFRAME GAP HARVEST (fr%24==0, both tracks, v2+KBD twin-peak):
+  spk iframes carry NONZERO gaps with strong twin-peak evidence —
+  f432 gap=14 (c1=+0.796), f456 gap=2 (c1=+0.806), f936 gap=28
+  (c1=0.68), f1248 gap=27 (c1=-0.843). kw anchored iframes (8):
+  only f1320 clears the 0.45 bar (gap=0 — coincidence, not law).
+  VERDICT: the gap field is PRESENT on iframes. P-frame-only /
+  delta-time-state hypothesis DEAD. (Full sweep: iframe_gaps_spk
+  .json banked this dir.)
+- ASPX HUFFMAN CHAIN NEGATIVE: none of the 18 spec aspx books
+  (ENV/NOISE × LEVEL/BAL × F0/DF/DT) exactly consumes the corpus
+  gap strings as a single-book chain (best 12/27 = chance).
+- HARNESS TRANSLATION DEAD END: full-track spk trace (winning
+  knob stack) shows ffmpeg desyncs right after the LFE on all 16
+  corpus frames (msfb=31 garbage) — its 1845 "parse to completion"
+  walks are position-garbage; the gap law cannot be read out of
+  the C walk. (Counting note: packet i = dump frame i-1 confirmed
+  again via audio_size matching, offset votes 199/200.)
+- **TS 103 190-2 (PART 2) IS ON DISK AND IS THE REAL SPEC FOR
+  THESE STREAMS** (~/Documents/ac4-spec/part2.txt, V1.3.1):
+  - audio_data_ajoc (6.2.3.4): static-dmx A-JOC substream = 5.1
+    bed via 5_X_channel_element THEN ajoc()+oamd — explains the
+    whole Kraftwerk layout (bed ~4.9k bits + object tail).
+  - immersive_channel_element (6.2.4.1): codec modes SCPL/
+    ASPX_SCPL/ASPX_ACPL_1/2 (7CH_STATIC core = five_channel_data
+    + b_use_sap_add_ch pair + 3x2ch+1ch aspx trailers) and
+    ASPX_AJCC (5CH_DYNAMIC + ajcc_data). ACPL_1 layout matches
+    the war's f33 walk EXACTLY, and puts TWO MORE two_channel_
+    datas + 4 chparam_infos AFTER the aspx trailers (the war's
+    "high-offset pair bodies").
+  - immers_cfg on iframes only (aspx_config+acpl_config) —
+    explains sticky-xover/iframe-config behavior as SPEC.
+  - Import table (6.1 Tables 48/49): ALL sf/asf/channel-data
+    tables imported from part 1 UNCHANGED; part 2 redefines only
+    TOC/substream/audio_data/metadata layers. ⇒ the inter-body
+    gap is a Dolby deviation from BOTH parts, OR our bodies span
+    element boundaries we haven't modeled (chparam_info-after-
+    data, metadata layer, fill_bits).
+- Interleaved-sf_info re-test on bit-exact corpus: first-bit
+  diagnostic fails (f39 g19 starts '1'; long-frame model demands
+  gap=1='1' only). Dead again with better data.
+- NEXT (r470): finish full-track twin-peak sweeps (all frames,
+  both tracks) for a 10x corpus; regression of gap vs frame
+  features on the big corpus; mine part-2 TOC/substream_group
+  (6.2.1.x) to re-derive what the Tidal TOC actually says
+  (channel_mode 6 reading may be a v1-style parse of v2 fields);
+  model post-aspx two_channel_data boundaries as gap candidates.
