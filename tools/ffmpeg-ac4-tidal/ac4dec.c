@@ -2036,6 +2036,7 @@ static int asf_psy_info(AC4DecodeContext *s, Substream *ss,
         ssch->scp.max_sfb_side[0] = get_bits(gb, n_side_bits);
     } else {
         ssch->scp.max_sfb[0] = get_bits(gb, n_msfb_bits);
+        av_log(s->avctx, AV_LOG_TRACE, "POS msfb=%d@%d\n", ssch->scp.max_sfb[0], get_bits_count(gb));
         if (dual_maxsfb)
             ssch->scp.max_sfb_side[0] = get_bits(gb, n_msfb_bits);
     }
