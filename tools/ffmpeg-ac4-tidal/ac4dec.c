@@ -2590,7 +2590,9 @@ static int sf_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch,
     int ret;
 
     if (spec_frontend == SF_ASF) {
-        av_log(s->avctx, AV_LOG_TRACE, "POS sect@%d\n", get_bits_count(&s->gbc));
+        av_log(s->avctx, AV_LOG_TRACE, "AUDIT m=%d g=%d long=%d sect@%d\n",
+               get_max_sfb(s, ssch, 0), ssch->scp.num_window_groups,
+               ssch->scp.long_frame, get_bits_count(&s->gbc));
         ret = asf_section_data(s, ss, ssch);
         if (ret < 0)
             return ret;

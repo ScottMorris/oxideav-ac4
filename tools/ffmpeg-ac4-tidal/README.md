@@ -473,3 +473,27 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   bits = dump bits + 8, no ambiguity); then measure the exact
   missing-tail grammar on believer sf_datas with the python
   parser; apply to Tidal pair; THEN window-exact IMDCT for gate.
+
+## Round 457 — WAR SCANNER SELECTION BIAS EXPOSED; v2 parser near-exact
+
+- ti-interleave hypothesis dead in pure form: f140's single gap
+  bit = 0 (not b_long=1); gap-size set {1,7,9,10,13,14,16,21}
+  fits none of the strong anchors' actual bits.
+- AUDIT LINES added to sf_data (m/groups/long/sect-pos per
+  channel) — believer harness now emits self-contained
+  calibration data (blvh2.txt, 1444 sf_datas).
+- ** WAR PYTHON GRAMMAR IS A STRICT SUBSET: ** on believer's
+  validated spans it FAILS 102/107 with 'cb 15 invalid' and
+  'section overrun' — the war scanner REJECTED cb12-15 and
+  overshoot bodies by construction (selection bias). All war
+  anchors are from the subset; Tidal bodies using cb15/overshoot
+  were invisible to every war scan.
+- parse_body_v2 (believer semantics: cb0-15, overshoot-skip,
+  snf over max_sfb): 0 -> 8/107 exact matches, remainder
+  clustered at ±1..±9 bits = replication details (spectra
+  decode-per-section structure, snf clamps, sign handling).
+- NEXT (r458): make v2 bit-exact against ffmpeg's asf functions
+  (target ~100% on believer audit), then RE-SCAN Tidal anchors
+  with v2: body ends move, more bodies become visible (cb15
+  class), gaps re-measured on correct ends -> pair layout;
+  plus window-exact IMDCT for the gate.
