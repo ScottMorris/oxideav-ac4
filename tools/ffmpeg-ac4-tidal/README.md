@@ -822,3 +822,49 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   actual sf_info; test whether corrected ends absorb the gaps.
   (2) Full-track twin-peak sweeps for the 10x corpus. (3) kw mp4
   walk comparison at scale (kw_mp4_walk.json method).
+
+## r470 (2026-07-15) — MASS FALSIFICATION ROUND; FIELD CHARACTERIZED AS FLAT ENTROPY PAYLOAD
+
+CORPUS 10x: full-track spk twin-peak sweep complete — 624 scanned,
+380 pairs, 269 strong (c>=0.45); combined strong spk corpus = 285
+samples (spk_gaps_big.json banked; fulltrack_gaps_spk.json raw).
+Gap histogram ~UNIFORM over 0..34 with pile-up at the scan cap —
+the old "0-31 range" was a cap artifact; true range likely larger
+(next sweeps: scan gap 0..80).
+
+KILLED THIS ROUND (all exact-consume tests on the 269 strong
+gap>=2 strings unless noted):
+1. SHORT-GEOMETRY ABSORPTION (r470 prime suspect): spec-exact
+   grouped sf_data parser (per-group w3 sections, offsets scaled
+   by wins-in-group, spec overshoot split at num_sfb_48, grouped
+   scf/snf; SFB tables 1024/49, 512/36, 256/20 from ac4dec_data.h)
+   brute-forced over 138 geometries (T x grouping compositions)
+   + self-grouping variant: ZERO exact end-absorptions over 298
+   anchored samples (best diffs = chance scatter). The gap is NOT
+   unread grouped-parse tail. (shortgeo.py banked.)
+2. BACK-ANCHORING/ALIGNMENT: body1 start %8 uniform, body1 end %8
+   uniform, wall - e1 huge and scattered (mean ~3900 bits);
+   corr(gap, sb/e0/wall/wall-e0) all ~0.00.
+3. ASPX_FRAMING fragments (Table 53 via fork parse_aspx_framing,
+   all 8 config combos envbits x sfr x note1): best 11/269 = 4%
+   = chance.
+4. ASF_HCB_SNF chains: 65-72/269 vs 58 chance. Dead.
+5. ASF_HCB_SCALEFAC chains: 83/269 vs 106 chance (BELOW). Dead.
+(Plus r469's: aspx env/noise huffman books, interleaved sf_info,
+P-frame gating, harness translation.)
+
+CONTENT CHARACTERIZATION (4760 field bits, 285 samples): ones
+47.6%; per-position P(1) flat 0.42-0.51 from BOTH start and end;
+no duplicate strings beyond chance; first-2-bits uniform. The
+field is FLAT ENTROPY-CODED PAYLOAD — data, not flags/config.
+Combined with ~uniform width 0..34+: a variable-count huffman
+chain from an UNKNOWN codebook, or a Dolby-private tool's payload.
+
+r471 CANDIDATE ATTACKS: (a) kw full-track sweep (running) for
+cross-track content correlation of field size; (b) survey OTHER
+albums (Joni Mitchell AC-4s on disk) — different encoder vintages
+may have gap=0 configs → differential; (c) differential frame
+pairs (near-identical body0 bits, diff gaps); (d) mine Dolby
+patents/DP580 encoder docs for post-sf_data per-channel tools in
+ASPX mode; (e) unknown-codebook induction: fit a prefix-code to
+the 4760-bit corpus under exact-consume constraint (MDL search).
