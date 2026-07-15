@@ -523,3 +523,23 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   grammar regression on the clean set (vs w1/m1/sap candidates);
   (d) window-exact IMDCT. The gate corpus and the gap law now
   come from the SAME scan.
+
+## Round 459 — sign law: two falsifications, one conclusion
+
+- Spectral parity alternation ((-1)^k = half-hop shift): flips
+  and improves SOME frames (f135 -0.339 -> +0.488, f136, f110)
+  but degrades others (f134, f140) — per-frame window property,
+  not a global law. NOT the sign law alone.
+- Overlap-consistency decoder-side sign resolver (maximize OLA
+  constructive overlap with previous frame): 9/15 = chance.
+  Wrong windows break TDAC cancellation, which the test needs.
+- CONCLUSION: sign + lag + parity all reduce to WINDOW-EXACT
+  SYNTHESIS. No shortcut exists. Implement AC-4 §5.5 window
+  sequence in the python chain by porting the Rust fork's
+  mdct.rs / BlockSwitchOla shapes (TDAC round-trip tested,
+  session 1) — window params per frame from the pair's sf_info
+  (transform_info now REACHABLE: body positions known to the bit
+  via twin-peak; the sf_info sits in the gap fields).
+- Note: frames improved by parity alternation (f110/135/136) are
+  candidates for short/split transform configs — use as test set
+  for window hypotheses.
