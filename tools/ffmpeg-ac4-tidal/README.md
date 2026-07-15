@@ -560,3 +560,22 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   derived positions (ffmpeg harness alignment + the gap law).
   Polarity flips are near-inaudible; gate ruling on signed vs |c|
   is Scott's call.
+
+## Round 461 — gap corpus at 29 clean samples (both tracks)
+
+- Kraftwerk twin-peak harvest (74 strong anchors, S-template,
+  KBD windows): 13 clean gap samples incl gap=0 (f1320) and
+  gap=1 bits='1' (f1361). Saved: kw_gaps.json (fr,gap,w1,c,bits).
+- Combined corpus: 29 samples, gaps 0-31, both tracks. Spot
+  hypothesis checks ([ti][sap] width combos): individual fits
+  exist (f109 g3=long+sap, f60 g11=short grp3+sap) but bit-level
+  consistency FAILS cross-sample (f33 g9 bits contradict its own
+  idx-implied grouping width).
+- NEXT: systematic solver — enumerate candidate field-sequence
+  templates (products of: ti forms, sap_mode variants, ms_used
+  with band-count from {m0,m1,const,aspx-derived}, b_-flags,
+  huffman chains) against ALL 29 samples requiring exact width +
+  self-consistent field values on every sample. Corpus is small
+  enough to brute a large template space. Also grow corpus via
+  twin-peak on non-anchored frames (needs bitstream body0 finding
+  or full-position scan).
