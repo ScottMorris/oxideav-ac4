@@ -426,3 +426,28 @@ re-meter, GATE.
   body0 start; pick the one that locks peak to a constant lag);
   expect lag to collapse to single value & signs to unify ->
   re-run gate WITHOUT assists -> listening master.
+
+## Round 455 — window knot: two negatives, sharper aim
+
+- Wide lag sweep (700..1350): peak offsets -86..+325, NOT clean
+  window multiples — speech pitch-period aliases contaminate lag
+  evidence (voiced content self-correlates at F0 periods). Lag
+  cannot diagnose window config directly on voice.
+- Backward sf_info enumeration at 28 anchor bodies (long-bit /
+  self-consistent short forms, slack 0-5, shift 0-1): coverage
+  never beats ~19/28 with 'long' hits at chance level (~50%).
+  => the field immediately before bodies is NOT bare sf_info in
+  the simplified [b_long | 0+idx+idx+diff+grouping] form. Layout
+  likely richer (psy_info extras: dual_maxsfb/side fields, or
+  chparam interleaved, or msfb belongs to a larger psy block).
+- NEXT TOOL (strongest available): BELIEVER AS PAIR-LAYOUT
+  ROSETTA. Believer's additional pair is wall-exact through
+  ffmpeg (SIMPLE mode) — dump exact bit spans of msp/sf_info0/
+  sf_info1/sf_data0/sf_data1 on believer frames (POS logs already
+  in ac4dec.c), then structurally align the Tidal pair region
+  around known anchors (body0 position fixed) and diff the two
+  layouts field-by-field. Model Table 37/38 BIT-EXACT (incl.
+  dual_maxsfb/side_limited paths) before re-attempting.
+- Window-exact IMDCT implementation still pending (grouped
+  spectrum + short SFB tables) — needed for the honest gate
+  regardless of how the layout question resolves.
