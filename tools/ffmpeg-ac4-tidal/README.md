@@ -921,3 +921,42 @@ the 4760-bit corpus under exact-consume constraint (MDL search).
 - kw full-track sweep running (fulltrack_kw.log); ~28h ETA at
   python pace — results land incrementally in the log; v4 stereo
   master rebuild queued on its completion.
+
+## r472 (2026-07-15) — VITERBI OLA PILOT NEGATIVE (measured, twice); V4 MASTER PIPELINE LIVE
+
+- VITERBI SELF-CONSISTENCY PILOT (viterbi_ola.py banked): per-frame
+  reference-free candidates (all v2-valid positions), transitions =
+  |corr(OLA tail, next head)|, validated on anchored runs
+  f1251-1261 / f936-943.
+  v1 (top-120 by nz): 0/19 — true bodies NOT IN SET; nz is an
+  ANTI-signal (true announce bodies rank ~1071/1324 — fake parses
+  accumulate more lines than dark real bodies).
+  v2 (cap 2600, (e0,w) dedupe, batched float32 IMDCT with
+  per-spectrum normalization — float32 overflow trap: hot-SF
+  spectra blow up norms): 0/11. True b0 present at ranks 582-1529
+  in 6/11 frames (co-terminal earlier fakes still shadow the
+  rest); best path never touches any true body. VERDICT: the
+  25%-vs-2% per-boundary oracle cannot beat ~2000 competitors per
+  frame. De-assist needs a strong per-candidate PRIOR first.
+- r473 PLAN: TRUE-BODY CLASSIFIER — believer supplies thousands of
+  validated true bodies; fake parses generatable in bulk. Features:
+  section stats, scf-delta distribution, huffman efficiency,
+  band-energy smoothness, msfb-vs-extent. A ~100:1 prior stacked
+  with the ~12:1 OLA oracle should let chains lock. Then Viterbi
+  over top-30 candidates/frame.
+- KW CROSS-TRACK: kw sweep gaps (first 30) uniform 0..32 — v2-
+  bitstream encoder pads exactly like v0. Mechanism is stable
+  across Dolby encoder generations.
+- V4 MASTER PIPELINE (kw_master_v4.py banked): merges all anchor
+  sources incl. sweep log incrementally; exact-snf noise fill;
+  interim build with 254 anchors: 167 frames rendered, S in 150
+  (stereo width coverage 13 → 150 frames). Delivered
+  kw_montage_v4.wav to Scott — his read: "thumpy" = bass-correct,
+  mids weak (known −11dB on weak anchors), no 15kHz+ (A-SPX
+  unimplemented). v4b rebuild queued on sweep completion.
+- Harvest gap-scan cap raised 34 → 80 for all future sweeps.
+- ffmpeg mp4-walk vs kw anchors at scale: 3/210 exact = chance;
+  f1361 "Rosetta" was a coincidence — walk desyncs on kw too.
+- Thriller v1 differential BLOCKED: lab decoder's v1 TOC path
+  reads nb_substreams=4 size=0 and aborts; needs its own repair
+  before v1 gap survey.
