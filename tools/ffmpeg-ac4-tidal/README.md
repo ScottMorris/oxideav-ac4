@@ -685,3 +685,22 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   PAIR specifically) — if sbx*375Hz ~ 1-2kHz, the deficit IS the
   A-SPX region and high-band synthesis is the next big win.
 - kw_montage_snf_exact.wav banked (spec-exact snf build).
+
+## Round 467 — coded-band edges + aspx range measured
+
+- Body m values map to coded edges: m=10 -> 936Hz, m=18 -> 2.3kHz,
+  m=26 -> 4.4kHz (SFB_2048, 23.4Hz/line). Pair bodies (m 10-26)
+  = waveform-coded only to ~1-4.4kHz.
+- ASPXBAND log (kw40): sba=40 sbx=40 (xover 0) or sbx=50 (xover
+  4), nsbgm=6 => aspx covers QMF subbands 40+ = 15kHz+ ONLY.
+  GAP: 4.4k-15k covered by NEITHER waveform nor aspx under
+  current understanding => something wrong: either aspx_config
+  values still misparsed (sf=7 suspicious), or A-CPL covers the
+  mids, or transform-length assumption wrong for w3 bodies
+  (Table 39: w3 <=> transf code <=2 <=> length <=1024?! If w3
+  bodies are 1024-or-shorter transforms, SFB table + IMDCT size
+  differ and m=26 reaches much higher in Hz — BUT f60 w3 hit
+  0.993 under 2048 assumptions, contradicting. RESOLVE next:
+  what transform length do pair bodies really use? Try parsing
+  w3 bodies with SFB_1024/512 tables + matching IMDCT and
+  compare correlations on anchors.)
