@@ -579,3 +579,29 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   enough to brute a large template space. Also grow corpus via
   twin-peak on non-anchored frames (needs bitstream body0 finding
   or full-position scan).
+
+## Round 462 — template solver + alignment: both negative; ASPX-tail deduction
+
+- Full-context corpus (29 samples with gap/w0/w1/m0/m1/bits):
+  banked as gap_corpus.json.
+- Mechanical template solver (~20k field-sequence templates from
+  {flags, U2-U5, transform_info, sap variants with band sources
+  m0/m1/min/half, gated forms}, exact width + parse-consistency
+  on all 29): ZERO exact fits; best 5/29 (chance). Byte/word
+  alignment padding: dead (mod-k tests at chance).
+- LOGICAL CORNER: gap=0 samples (f140, kw1320) prove NO
+  bit-consuming grammar can live in the gap unconditionally —
+  presence must be signaled OUTSIDE, or the field is a
+  conditional tail of sf_data itself.
+- DEDUCTION: believer = SIMPLE mode, gaps absent (validated
+  flush); Tidal = ASPX mode, gaps present => THE GAP IS AN
+  ASPX-MODE-ONLY VARIABLE TAIL OF sf_data. Spec candidate:
+  asf_hsf_spectral_data (Table 42a) — separate coding of lines
+  for sections beyond num_sec_lsf (our overshoot sections!), or
+  another mode-gated extension. NEXT (r463): grep the ffmpeg
+  patchset + spec for mode-gated sf_data extensions (hsf gate
+  bits, ssf paths, aspx-conditional reads); test Table 42a
+  decode against the 29 gap bit-strings (overshoot sections of
+  body0 are KNOWN per sample => predicted hsf payload width is
+  computable!). If hsf fits, the gap law is spec-derived, not
+  empirical.
