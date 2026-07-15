@@ -643,3 +643,24 @@ sf_data (snf-tail under-read OR an inter-sf_data field).
   not just a metric footnote — promote it in the de-assist queue
   (likely tied to believer's clipping + the 2^(sf-100)/4 offset
   question from r434).
+
+## Round 465 — spectral forensics + NOISE-FILL SYNTHESIS
+
+- Scott's ears + spectral profile: decode matched ref within
+  0.5 dB below 300 Hz but fell -18 dB at 600-1000 Hz INSIDE the
+  coded band; montage energy 87% below 200 Hz.
+- SF exponent regression (359 bands): fitted beta 0.043 — but
+  CONFOUNDED by zero-decoded bands carrying real ref energy;
+  waveform meter arbitrates: beta=0.25 wins (0.352 vs 0.314).
+  Quarter-dB law REJECTED; 2^(0.25*(sf-ref)) CONFIRMED.
+- The -18 dB mids = the mqi==0/cb==0 bands = NOISE FILL. The snf
+  dpcm chains (parsed since the war, never synthesized) carry the
+  levels. Implemented: snf accumulator (delta-4 offset guess,
+  base=ref_sf), noise injection amp = K*2^(0.25*(snf-ref)),
+  K=0.27 calibrated vs ref band energies (rough: sigma 13 log2 —
+  refine semantics vs spec Table 42/ffmpeg snf usage later).
+- Montage+NF: below-200Hz 87%->67%, below-1k 98.5%->88%.
+  kw_montage_nf.wav delivered + banked.
+- NEXT: exact snf semantics from ffmpeg synthesis (snf usage in
+  scale_spec/prepare_channel paths); then A-SPX high band =
+  the remaining timbre gap; then de-assist (positions/sign).
