@@ -960,3 +960,32 @@ the 4760-bit corpus under exact-consume constraint (MDL search).
 - Thriller v1 differential BLOCKED: lab decoder's v1 TOC path
   reads nb_substreams=4 size=0 and aborts; needs its own repair
   before v1 gap survey.
+
+## r473 (2026-07-15) — 🎧 V4B MASTER: BEST GATE NUMBERS OF THE CAMPAIGN
+
+- KW FULL-TRACK SWEEP (in progress, 575+ pairs at gap-cap 80):
+  merged with old anchors → 823 total, 575 frames rendered (41%
+  of the 60s window), STEREO WIDTH (true S bodies) in 489 frames
+  (was 13 in the r463 gate build!).
+- HONEST GATE METER v4b (zero shift, fixed timeline, ~990 active
+  frames): **L mean +0.439 median +0.462 (76% > 0.3); R mean
+  +0.410 median +0.461 (71% > 0.3)** — vs r463's +0.320/+0.344
+  at ~15% coverage. Both correlation and coverage up massively.
+  Same documented assists as r463 (polarity + per-frame level
+  from reference; positions reference-anchored).
+- WRITER SHIFT BUG FOUND+FIXED: v3/v4 wavs were written 2048
+  samples EARLY (out = L[LAG:...] shifts the wrong way; block
+  coords + LAG = ref coords ⇒ pad LAG zeros at front). All
+  previous delivered wavs had the same constant offset
+  (inaudible standalone, but any A/B sync vs ref was off by
+  43ms). kw_master_v4.py banked with fix; kw_stereo_v4.wav +
+  kw_montage_v4.wav (42.6s) banked + delivered.
+- RAISED-CAP CONFIRMATION: kw pads reach ≥61 bits (gap=61
+  c=0.58, gap=46 c=0.57) — pad field range extends well past
+  the old 34 cap.
+- R473 CLASSIFIER (in progress): bodyfeat.py (25 parse-shape
+  features) + bodyclf.py (class-weighted logistic, leave-frames-
+  out CV, rank-of-true metric) banked; extraction running.
+- OPS: box is memory-starved (Firefox ~6GB of 16GB) — single-
+  process background jobs with per-frame checkpointing only;
+  nohup setsid pattern; sweeps resume from their logs.

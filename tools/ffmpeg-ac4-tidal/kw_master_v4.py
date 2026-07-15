@@ -159,7 +159,8 @@ if __name__ == '__main__':
         used += 1
     print(f'frames rendered: {used} (S in {withS})')
     out = np.zeros((NFR * N, 2))
-    out[:, 0] = L[LAG: LAG + NFR * N]; out[:, 1] = R[LAG: LAG + NFR * N]
+    # block coords + LAG = ref coords, so pad LAG zeros at the front
+    out[LAG:, 0] = L[:NFR * N - LAG]; out[LAG:, 1] = R[:NFR * N - LAG]
     mx = np.abs(out).max()
     if mx > 0: out *= 0.85 * 32767 / mx
     wv = wave.open('kw_stereo_v4.wav', 'wb')
