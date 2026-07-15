@@ -451,3 +451,25 @@ re-meter, GATE.
 - Window-exact IMDCT implementation still pending (grouped
   spectrum + short SFB tables) — needed for the honest gate
   regardless of how the layout question resolves.
+
+## Round 456 — believer pair layout BIT-MAPPED (Rosetta landed)
+
+Believer clean frame 68 (wall-exact, POS msfb logging):
+- msp=0 pair: [2ch@273][ti0][msfb0=2 ends@280][ti1][msfb1=1
+  ends@286][sections0@286 CONTIGUOUS][...sf_data0 end@310]
+  [sf_data1@310 NO PREFIX, GAP 0][end@328]
+- msp=1 pair: [2ch@328][ti][msfb=26 ends@339][~5b chparam]
+  [sections0@344][sf_data0 end@2133][sf_data1@2133 gap 0]
+=> In believer, sections abut the OTHER channel's msfb (grouped
+sf_infos), and the pair's second sf_data has no prefix and zero
+gap. TIDAL WAR PAIRS MATCH NEITHER SHAPE (both bodies carry
+[5b msfb][sections] prefixes, gaps 0-25 nonzero) => Tidal
+genuinely deviates: per-sf_data msfb prefix (war "msfb
+everywhere") + a small variable trailing field after each
+sf_data (snf-tail under-read OR an inter-sf_data field).
+- Python-vs-ffmpeg span audit attempted on believer; blocked by
+  dump-index/offset bookkeeping (cb-15 fails = misalignment, not
+  grammar). NEXT: redo audit with harness-wrapped blv.ac4 (packet
+  bits = dump bits + 8, no ambiguity); then measure the exact
+  missing-tail grammar on believer sf_datas with the python
+  parser; apply to Tidal pair; THEN window-exact IMDCT for gate.
