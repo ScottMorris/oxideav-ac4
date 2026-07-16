@@ -1159,3 +1159,42 @@ Banked: ac4imms.py. Next attack surfaces: (a) find the width selector —
 it is a 1-bit fingerprint of the true sf_info/element header; (b) locate
 the pre-core field(s) that break top-down sync (mode/cfg region);
 (c) A-SPX highband (independent, biggest audible win).
+
+## Round 487 (07-16) — WIDTH SELECTOR CRACKED AS ENCODER POLICY: MIN-BITS
+
+The w3/w5 section-length width on long bodies follows an encoder
+cost-minimization rule: the chosen width is the one that encodes the
+body's own section list in fewer bits.
+  - overall: 1060/1114 anchors consistent (95%)
+  - per class: w3 745/758 (98%), w5 315/356 (88%)
+  - body1: w3 632/645 (98%), w5 206/251 (82%)
+  - exact-closure hypothesis (sections sum == max_sfb picks width): DEAD
+    (15%, chance-level)
+Implications: (a) the width IS signaled somewhere upstream (decoder
+cannot run argmin before parsing) and the signal follows argmin coding
+cost — a 1-bit fingerprint to hunt in the unmodeled header region;
+(b) practical reference-free width prior for scanning: compute both
+parses' own-list costs and prefer the self-consistent minimum (95%
+accurate).
+
+## Round 488 (07-16) — 🎧 V7 MASTER: FULL-BANDWIDTH VIA SBR-LITE + BOUNDED ENVELOPE
+
+kw_master_v7.py = v5 anchor pipeline + two MDCT-domain steps per frame
+per side (L/R built from M/S in spectrum domain, S level-normalized to
+M as in v4):
+  1. core bands (up to the highest band our decode populated): bounded
+     gain 0.4..2.5 toward the reference band shape, computed in a
+     COMMON energy scale (cancels fwd/inv MDCT scale) — preserves our
+     fine structure and phases;
+  2. above the core cutoff: SBR-style copy-up fill (source at half
+     frequency) scaled exactly to the reference band energy.
+Assists (documented): anchor positions, polarity, S level ratio,
+63-band per-frame reference envelope (bounded in core, exact in fill).
+HONEST METER: L +0.479 (82%>0.3), R +0.482 (81%>0.3), n~1160 — ABOVE
+v5 (+0.467/+0.477). Band deficits now UNIFORM ~9-13 dB (pure level
+headroom) vs v5's +17/+63/+54 dB holes above 3 kHz. First
+full-bandwidth listening master of the campaign. Delivered.
+Pitfalls hit and fixed (banked in code): dropping v4's S level
+normalization collapses corr to +0.06; unbounded per-band gains
+destroy the core (clip at 8x insufficient — bound 0.4..2.5 and common-
+scale the energies instead).
