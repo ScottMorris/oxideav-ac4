@@ -989,3 +989,29 @@ the 4760-bit corpus under exact-consume constraint (MDL search).
 - OPS: box is memory-starved (Firefox ~6GB of 16GB) — single-
   process background jobs with per-frame checkpointing only;
   nohup setsid pattern; sweeps resume from their logs.
+
+### r473/r474 addendum — classifier verdict + position-recovery trilogy closed
+
+- CLASSIFIER FINAL (82,540 candidates, 110 true bodies, 36 frames,
+  leave-frames-out CV): median rank-of-true 583/~2300, top-30 5%.
+  Parse-shape features cannot separate true bodies from fakes —
+  fakes are misaligned reads of REAL data and inherit its
+  statistics. Weak signals only (nzdens +0.55, nsect +0.48,
+  dmax +0.48, w3 −0.46).
+- BACKCHAIN/DAG (backchain.py banked, 3 variants tried on war-
+  ground-truth f33: greedy max-|c|, beam with landing constraint,
+  exact DP-memoized DAG with pads<=25 + header-region landing):
+  ALL fail to recover the proven chain [218,865,1273,1349,1656] —
+  306 viable region starts, >4000 full chains, overlapping fakes
+  carry |c| 0.4-0.7. THE TRILOGY VERDICT (chainwalk + OLA Viterbi
+  + DAG): v2-grammar permissiveness makes combinatorial position
+  recovery infeasible. Only high-threshold per-channel correlation
+  anchoring (the twin-peak family) yields real positions.
+- CONSEQUENCE / r475 PLAN: PER-CHANNEL ANCHOR HARVEST — scan each
+  frame against EACH of the 6 reference channels separately
+  (r445-style oracle scan, |c|>=0.5, free lag), sort hits by
+  position → within-frame PAD SEQUENCES without any chaining.
+  Purpose: test the monotone-pad observation (war f33/f60: bed
+  pads 25,23,18,11,9 / 24,21,17,15 — 9/9 monotone steps, p~0.2%)
+  at scale. If pads are a deterministic per-channel sequence,
+  that's the first real structure in the pad mechanism.
