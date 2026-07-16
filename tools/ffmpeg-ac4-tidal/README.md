@@ -1277,3 +1277,15 @@ v10e (kw_master_v10e.py): PRE-EMPHASIZED matching pursuit — atom
 selection and weight fitting in a whitened domain (y[n]=x[n]-0.95
 x[n-1]) so mids compete with bass for atoms; reconstruction with raw
 atoms. Building; A/B vs v9 on mid-band corr pending.
+
+## Round 494c (07-16) — BAND-SPLIT PURSUIT WINS THE MID BAND
+
+kw_master_v10f.py: pursuit split at 700 Hz — bass fit (8 atoms) and
+mid/high fit (14 atoms) run independently on band-filtered atoms,
+reconstructions summed. MID-BAND (1-4 kHz) METER TRAJECTORY:
+  v9 (single broadband pursuit):   +0.104 (14%>0.3)
+  v10e (pre-emphasized pursuit):   +0.176 (25%)
+  v10f (band-split pursuit):       +0.258 (41%)   <- winner
+Broadband essentially unchanged (+0.681 vs +0.694). Band-split is the
+render default going forward. Interim rebuild with backext 415+/
+shortfill 562+ inventories in flight for delivery.
