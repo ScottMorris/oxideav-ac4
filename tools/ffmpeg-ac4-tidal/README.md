@@ -1015,3 +1015,61 @@ the 4760-bit corpus under exact-consume constraint (MDL search).
   pads 25,23,18,11,9 / 24,21,17,15 — 9/9 monotone steps, p~0.2%)
   at scale. If pads are a deterministic per-channel sequence,
   that's the first real structure in the pad mechanism.
+
+## Round 476-479 (07-16) — THE PAD MYSTERY IS SOLVED: NOT A REAL FIELD
+
+The "gap/pad field" chased for ~30 rounds does not exist in the true
+AC-4 grammar. Two decisive results:
+
+1. **The ffmpeg walk tiles the frame.** Parsing the walk's own
+   internally-consistent output (r477_tiling.py): 95% of intra-element
+   body transitions have gap == EXACTLY 0 (1527/1613). Bodies within a
+   channel element are edge-to-edge. The nonzero "gaps" are the
+   INTER-ELEMENT HEADERS (codec_mode + msfb + sf_info + aspx_config,
+   7-40 bits) whose distribution IS the "flat-entropy uniform 0..61 pad."
+
+2. **The phantom gaps were a long-only parser artifact.** The walk's
+   (g,long) census: only ~1752/3000 bodies are (g=1,long=1) single-group
+   long transforms. The rest are SHORT transforms with 2-9 window groups
+   (602 big short-transform bodies vs 906 big long). The campaign's
+   v2_parse handles only long single-group bodies -> it uses the wrong
+   SFB table on short/multigroup bodies, under-reads by hundreds to
+   thousands of bits, and leaves a "gap" everywhere it under-reads. The
+   f33 "monotone pads 25,23,18,11,9" were successive under-reads plus
+   element headers.
+
+Also: r476_dagseq.py counting-DP found 3.86 BILLION grammar-valid chains
+through the f33 anchor (412M through f60) -> single-anchor combinatorial
+position recovery is hopeless under v2 permissiveness (reconfirms the
+closed position-recovery trilogy).
+
+**Correct parser ported: `ac4asf.py`** — faithful port of this decoder's
+ASF chain with full short + multi-window-group support:
+  - asf_transform_info: [1b long_frame]; if short [2b idx0][2b idx1]
+  - asf_psy_elements: scale_factor_grouping -> num_window_groups,
+    num_win_in_group, per-group sect_sfb_offset (SFB_OFF tables for
+    128/256/512/1024/2048), offset2sfb
+  - asf_section_data: n_sect_bits keys off transf_length_idx (<=2 -> 3
+    bits else 5); LSF section split at num_sfb_48 boundary
+  - ABSOLUTE scalefactor law: gain = 2^(0.25*(scale_factor - 100)),
+    NOT the relative 2^(0.25*(sf - ref_sf)) v2_parse used
+  - split into parse_sf_info / parse_sf_data so interleaved element
+    layouts (info,info,data,data non-proc pairs; shared-config 5ch bed)
+    reproduce correctly
+Validated: LFE sf_data stages (spec/scf/snf positions) match.
+
+CAVEAT: the ffmpeg WALK trace and the extracted DUMPS (kw4/*.bin) are
+near-aligned but NOT bit-identical extractions — the walk logs LFE m=3
+where the dump bits read 5, and the 2ch msfb values (16,19) are absent
+at the walk's positions. The walk desyncs from the dumps in VALUES
+post-LFE, so it cannot seed parsing on the dumps.
+
+Spectral diagnosis of the v5 master ("thumpy"): 99% of master energy is
+below 773 Hz vs the reference's 7488 Hz; bands >6 kHz are ~50-63 dB
+down. The core is band-limited and the master currently only captures
+long-transform bodies. The missing mid/high content = short-transform
+mains (needs ac4asf per-window IMDCT) + all A-SPX highband synthesis.
+
+NEXT: run ac4asf top-down on the dumps via correlation anchoring (not
+the walk) to recover the short-transform content, then A-SPX. v5 master
+delivered (792/1406 frames, L +0.47 / R +0.48, 91% coverage).
