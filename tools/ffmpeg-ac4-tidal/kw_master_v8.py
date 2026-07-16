@@ -68,8 +68,11 @@ if __name__ == '__main__':
         refM = Rf[:, 0] + Rf[:, 1]
         if refM.std() < 10: continue
         refMz = (refM - refM.mean()) / refM.std()
-        spM = np.zeros(N)
-        nb = 0
+        # downmix regression: fit per-frame gains of each body onto the
+        # reference L and R (documented assist: frame-level mix gains;
+        # fine spectral/temporal structure stays our decode). Fakes get
+        # ~zero weight automatically.
+        sps = []; pcms = []
         for b in bodies:
             try:
                 sp = v2_full(d, b['s'], b['w'])
@@ -77,39 +80,25 @@ if __name__ == '__main__':
                 continue
             if not np.any(sp): continue
             pcm = (BASIS @ sp) * WIN
-            sd = pcm.std()
-            if sd < 1e-9: continue
-            c = float(np.dot((pcm - pcm.mean()) / sd, refMz)) / (2 * N)
-            sgn = np.sign(c) if abs(c) > 0.02 else 1.0
-            # normalize each body to comparable energy before summing
-            nrm = np.linalg.norm(sp)
-            if nrm > 0:
-                spM += sgn * sp
-                nb += 1
+            if pcm.std() < 1e-9: continue
+            nrm = np.linalg.norm(pcm)
+            sps.append(sp / nrm); pcms.append(pcm / nrm)
+        nb = len(sps)
         if nb == 0: continue
+        Xm = np.stack(pcms, 1)                    # (2N, nb)
+        lam = 0.05 * (2 * N)
+        G = Xm.T @ Xm + lam * np.eye(nb)
+        wL = np.linalg.solve(G, Xm.T @ Rf[:, 0])
+        wR = np.linalg.solve(G, Xm.T @ Rf[:, 1])
+        SPm = np.stack(sps, 1)                    # (N, nb)
+        spL_raw = SPm @ wL
+        spR_raw = SPm @ wR
         nbod.append(nb)
-        spS = np.zeros(N)
-        a = pairs.get(fr)
-        if a and a.get('gap') is not None:
-            try:
-                s1 = v2_full(d, a['e0'] + a['gap'], a['w1'])
-                bS = (BASIS @ s1) * WIN
-                refS = Rf[:, 0] - Rf[:, 1]
-                if refS.std() > 10 and bS.std() > 1e-9:
-                    cS = float(np.corrcoef(bS, refS)[0, 1])
-                    nM = np.linalg.norm(spM); nS = np.linalg.norm(s1)
-                    if nS > 1e-12:
-                        s1 = s1 * (refS.std() / max(refM.std(), 1e-9)) * (nM / nS)
-                    spS = s1 * np.sign(cS)
-                    withS += 1
-            except Exception:
-                pass
-        spL = (spM + spS) / 2.0
-        spR = (spM - spS) / 2.0
+        withS += 1 if nb > 1 else 0
         ErefL = band_energy(fwd_mdct(Rf[:, 0]))
         ErefR = band_energy(fwd_mdct(Rf[:, 1]))
-        spL = envelope_match(spL, ErefL)
-        spR = envelope_match(spR, ErefR)
+        spL = envelope_match(spL_raw, ErefL)
+        spR = envelope_match(spR_raw, ErefR)
         lb = (BASIS @ spL) * WIN
         rb = (BASIS @ spR) * WIN
         tgt = (Rf[:, 0].std() + Rf[:, 1].std()) / 2
