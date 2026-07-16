@@ -1223,3 +1223,17 @@ METER (partial build, 573/1114 frames): L +0.577 (86%>0.3),
 R +0.647 (92%>0.3) vs v7 +0.479/+0.482. CAMPAIGN RECORD.
 Assists: anchor positions, per-frame downmix gains (regression),
 63-band bounded envelope + SBR fill, short-body placement offset.
+
+## Round 492 (07-16) — 🎧 V9: SHIFT-AWARE MATCHING PURSUIT, L +0.71 / R +0.72
+
+Scott on v8-partial: musical structure audible but "still low pitched
+and mushy, fading into something." Mush cause: bodies mixed at fixed
+lag despite true lags varying ±40 samples (transient smear) + noise
+regressors. v9 (kw_master_v9.py) replaces the one-shot ridge with
+shift-aware matching pursuit: atoms = every body at shifts -64..64
+step 16; greedy pick vs residual, LS refit on the selected set, K<=18
+atoms per side. Full 1114-frame inventory (sweep complete).
+METER: L +0.710 (86%>0.3, n=1351), R +0.723 (88%>0.3, n=1206) —
+campaign trajectory v7 +0.48 -> v8 +0.58/0.65 -> v9 +0.71/0.72.
+~50% of waveform variance now matches the reference. Short-fill sweep
+still enriching (54 frames of shorts so far); rebuild when complete.
