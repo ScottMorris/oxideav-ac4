@@ -1073,3 +1073,38 @@ mains (needs ac4asf per-window IMDCT) + all A-SPX highband synthesis.
 NEXT: run ac4asf top-down on the dumps via correlation anchoring (not
 the walk) to recover the short-transform content, then A-SPX. v5 master
 delivered (792/1406 frames, L +0.47 / R +0.48, 91% coverage).
+
+## Round 481-483 (07-16) — DETERMINISTIC TOP-DOWN DECODE RECONFIRMED BLOCKED BY v2 DEVIATION
+
+Built ac4frame.py: a full top-down CORE parser for channel_element_7x
+(codec_mode, aspx_config=15b, mono LFE, coding_config, two/three/four/
+five_channel_data, chparam_info, companding, sap_data). KEY STRUCTURAL
+FACT exploited: ALL channel cores are parsed BEFORE any aspx_data, so
+the whole core (LFE + up to 7 channels) is recoverable without touching
+A-SPX -- IF the grammar stays in sync.
+
+RESULT (negative, reconfirms the frontier): the top-down parse does NOT
+reproduce real bodies on these dumps. Decoded cores correlate <0.24 with
+the reference (vs 0.47-0.68 for correlation-anchored bodies), and most
+come out empty. The parse desyncs early (bed region) and accumulates:
+top-down thinks f48's cores end at bit 2487, but the correlation scan
+finds a valid R-correlating body (m=31) at bit 7819. The ac4asf PARSER
+is correct (it decodes scan-found bodies fine); it is the grammar-
+predicted POSITIONS that diverge -- the documented v2 immersive
+deviation from TS 103 190-1 that also defeats both open decoders in the
+five_channel_data region. Deterministic decode needs that specific
+deviation identified; correlation anchoring (v5, +0.47) remains the
+ceiling until then.
+
+ALSO tried (r481/r482): ac4asf twin-peak (M/S) and per-channel 5.1
+harvesters. Per-channel is DEGENERATE on near-mono content -- one strong
+body correlates with L,R,C,LFE simultaneously (~0.55 each), and full-band
+bodies "match" LFE. Correlation cannot separate the bed channels. v5
+(v2_parse M/S master) stays the best deliverable.
+
+CAMPAIGN STATE: pad mystery SOLVED (parser artifact); deterministic
+decode BLOCKED (v2 deviation, unidentified); correlation ceiling ~0.47
+and band-limited (<773Hz, no A-SPX). Next real frontiers: (1) find the
+v2 bed-region deviation (diff a scan-anchored body chain against the
+grammar-predicted chain to locate the first extra/missing field);
+(2) A-SPX highband synthesis for audible bandwidth.
