@@ -15,6 +15,7 @@ import numpy as np
 sys.path.insert(0, '/home/scott/source/oxideav-ac4/tools')
 import ac4scan as A
 from kw_master_v7 import v2_full, band_energy, envelope_match, fwd_mdct
+import ac4short
 T = A.T; SFB = A.SFB_2048
 N = 2048
 n_ = np.arange(2 * N); k_ = np.arange(N)
@@ -38,6 +39,19 @@ def load_inventory():
             inv[r['fr']] = r['bodies']
     return inv
 
+
+def load_shorts():
+    sh = {}
+    try:
+        for ln in open('shortfill_kw.log'):
+            mm = re.match(r'f(\d+): SHORT (\{.*\})', ln)
+            if mm:
+                r = json.loads(mm.group(2))
+                sh[r['fr']] = r['bodies']
+    except FileNotFoundError:
+        pass
+    return sh
+
 def load_pairs():
     pairs = {}
     for ln in open('fulltrack_kw.log'):
@@ -54,7 +68,8 @@ def load_pairs():
 if __name__ == '__main__':
     inv = load_inventory()
     pairs = load_pairs()
-    print(f'inventory: {len(inv)} frames; S pairs: {len(pairs)}')
+    shorts = load_shorts()
+    print(f'inventory: {len(inv)} frames; shorts: {len(shorts)}; S pairs: {len(pairs)}')
     L = np.zeros(NFR * N + 2 * N); R = np.zeros_like(L)
     used = withS = 0
     nbod = []
@@ -71,8 +86,9 @@ if __name__ == '__main__':
         # downmix regression: fit per-frame gains of each body onto the
         # reference L and R (documented assist: frame-level mix gains;
         # fine spectral/temporal structure stays our decode). Fakes get
-        # ~zero weight automatically.
-        sps = []; pcms = []
+        # ~zero weight automatically. Long bodies contribute their IMDCT
+        # blocks; short bodies (r491) contribute their placed OLA blocks.
+        pcms = []
         for b in bodies:
             try:
                 sp = v2_full(d, b['s'], b['w'])
@@ -81,18 +97,27 @@ if __name__ == '__main__':
             if not np.any(sp): continue
             pcm = (BASIS @ sp) * WIN
             if pcm.std() < 1e-9: continue
-            nrm = np.linalg.norm(pcm)
-            sps.append(sp / nrm); pcms.append(pcm / nrm)
-        nb = len(sps)
+            pcms.append(pcm / np.linalg.norm(pcm))
+        for sb_ in shorts.get(fr, []):
+            try:
+                pr = ac4short.parse_short(d, sb_['s'])
+            except Exception:
+                continue
+            if pr is None: continue
+            blk = ac4short.short_block(pr[0], pr[1], sb_['off'])
+            if blk.std() < 1e-9: continue
+            pcms.append(blk / np.linalg.norm(blk))
+        nb = len(pcms)
         if nb == 0: continue
         Xm = np.stack(pcms, 1)                    # (2N, nb)
         lam = 0.05 * (2 * N)
         G = Xm.T @ Xm + lam * np.eye(nb)
         wL = np.linalg.solve(G, Xm.T @ Rf[:, 0])
         wR = np.linalg.solve(G, Xm.T @ Rf[:, 1])
-        SPm = np.stack(sps, 1)                    # (N, nb)
-        spL_raw = SPm @ wL
-        spR_raw = SPm @ wR
+        tL = Xm @ wL
+        tR = Xm @ wR
+        spL_raw = fwd_mdct(tL)
+        spR_raw = fwd_mdct(tR)
         nbod.append(nb)
         withS += 1 if nb > 1 else 0
         ErefL = band_energy(fwd_mdct(Rf[:, 0]))

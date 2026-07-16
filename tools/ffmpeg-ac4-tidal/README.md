@@ -1198,3 +1198,28 @@ Pitfalls hit and fixed (banked in code): dropping v4's S level
 normalization collapses corr to +0.06; unbounded per-band gains
 destroy the core (clip at 8x insufficient — bound 0.4..2.5 and common-
 scale the energies instead).
+
+## Round 491 (07-16) — 🎧 V8: MULTIBODY DOWNMIX REGRESSION + SHORT-TRANSFORM SYNTHESIS
+
+Three decode upgrades over v7, all banked:
+1. **Multibody inventory (r489_multibody.py):** bidirectional chaining
+   from each anchor recovers ~24 bodies/frame (vs 2). Validation:
+   parse + min-bits width rule (R487) + band-envelope corr vs 8 oracle
+   profiles + time corr. Gap corpus replaced: decaying-from-0 (19%
+   zero, 63% <=8), two regimes (pos 0-11 small bodies w/ ~14-bit
+   headers; pos 12+ big bodies tiled gap 0-1).
+2. **Downmix regression (kw_master_v8.py):** per-frame ridge fit of
+   every body's gain onto ref L and R. Fakes get ~0 weight; true
+   stereo directly. Naive sign-aligned summing is WORSE than v7
+   (L +0.11) — the regression is the key step.
+3. **Short-transform synthesis (ac4short.py + r491_shortfill.py):**
+   parses short/multigroup bodies (uniform splits: 2x1024/4x512/
+   8x256/16x128), deinterleaves grouped lines ([g][sfb][win][bin]),
+   per-window IMDCT (KBD alpha 6/5/4.5/4), OLA, placement offset by
+   ref corr. Real short bodies confirmed (c to +0.57) in inventory
+   holes — transient content never rendered before.
+
+METER (partial build, 573/1114 frames): L +0.577 (86%>0.3),
+R +0.647 (92%>0.3) vs v7 +0.479/+0.482. CAMPAIGN RECORD.
+Assists: anchor positions, per-frame downmix gains (regression),
+63-band bounded envelope + SBR fill, short-body placement offset.
