@@ -1258,3 +1258,22 @@ gates; short: placement corr >= 0.28). Validated: f480 walked back
 from 1561 to bit 143 (near frame start), f240 gained 14 bodies at the
 old cap. Full sweep running; kw_master_v10.py merges multibody +
 shortfill + backext into the matching-pursuit render.
+
+## Round 494 (07-16) — WIDTH BITMAP DEAD; MID-BAND METER; PRE-EMPHASIZED PURSUIT
+
+Width-bitmap hypothesis KILLED with backext data: 76 frames now have
+both the header window (bits 16..first_body, first<500) and 14+ known
+body widths — searching every window offset for the width sequence
+(both polarities): 0 exact hits, best-agreement 0.73 vs null 0.71.
+No contiguous per-frame width bitmap in the header (or labels too
+noisy). LFE-candidate tiny bodies found as early as @192 (f103, m=3).
+
+NEW INSTRUMENT (meter_ab.py): band-resolved corr. v9 verdict:
+broadband +0.694 (85%>0.3) but 1-4kHz MID BAND ONLY +0.104 (14%) —
+the intelligibility band is nearly random; this IS the "garbliness."
+Mid-band corr is now the primary quality target.
+
+v10e (kw_master_v10e.py): PRE-EMPHASIZED matching pursuit — atom
+selection and weight fitting in a whitened domain (y[n]=x[n]-0.95
+x[n-1]) so mids compete with bass for atoms; reconstruction with raw
+atoms. Building; A/B vs v9 on mid-band corr pending.
