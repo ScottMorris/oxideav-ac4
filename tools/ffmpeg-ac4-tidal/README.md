@@ -1237,3 +1237,24 @@ METER: L +0.710 (86%>0.3, n=1351), R +0.723 (88%>0.3, n=1206) —
 campaign trajectory v7 +0.48 -> v8 +0.58/0.65 -> v9 +0.71/0.72.
 ~50% of waveform variance now matches the reference. Short-fill sweep
 still enriching (54 frames of shorts so far); rebuild when complete.
+
+## Round 493 (07-16) — WIDTH VERDICT REFINED; PRE-REGION = THE HOLE; BACKEXT THROUGH SHORTS
+
+Width selector: NO local flag possible — width flips across 41% of
+ZERO-GAP boundaries (same rate in strong-only subset); no per-frame
+rule (49% all-same ~ chance); adaptive-width grammars (len in
+ceil(log2(remaining)) bits, 3 variants) DEAD at 6-9% exact-end vs the
+labels. Min-bits (95%) stands. Best remaining explanations: label
+noise on small bodies (both widths parse near-equally), or a per-frame
+width bitmap in the unparsed header region.
+
+Coverage map from full inventory (n=1097): tails mostly recovered
+(19% tile to within 50 bits of wall; median tail 1261) but the
+PRE-BODY REGION is the real hole: median 3935 bits unrecovered before
+the first chained body — the backward chain only linked LONG bodies,
+so one short body breaks the walk. r493_backext.py extends backward
+through BOTH long and short bodies (long: minbits + corr/envelope
+gates; short: placement corr >= 0.28). Validated: f480 walked back
+from 1561 to bit 143 (near frame start), f240 gained 14 bodies at the
+old cap. Full sweep running; kw_master_v10.py merges multibody +
+shortfill + backext into the matching-pursuit render.
