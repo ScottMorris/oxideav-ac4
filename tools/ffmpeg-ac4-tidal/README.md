@@ -1108,3 +1108,54 @@ and band-limited (<773Hz, no A-SPX). Next real frontiers: (1) find the
 v2 bed-region deviation (diff a scan-anchored body chain against the
 grammar-predicted chain to locate the first extra/missing field);
 (2) A-SPX highband synthesis for audible bandwidth.
+
+## Round 484-486 (07-16) — WALK DISQUALIFIED AS GROUND TRUTH; R477 TILING CLAIM CORRECTED; IMMERSIVE GRAMMAR EXTRACTED; SECTION-WIDTH MIXTURE PROVEN REAL
+
+1. **Walk-alignment verdict (definitive negative):** exhaustive scan of
+   (frame mapping K in -3..+3) x (bit offset delta in -64..+64) using only
+   BIG long bodies (m>=14, span>=150, ~zero chance rate): max 1/19 exact.
+   The mp4 walk and the kw4/ dumps are NOT the same bit positions under
+   any constant transform. The walk cannot seed dump parsing, period.
+
+2. **CORRECTION to R477:** the "95% intra-element gap==0 tiling" result
+   is VACUOUS as evidence about Tidal's stream — ffmpeg parses
+   contiguously by construction, so its own walk always tiles. The
+   (g,long) short-transform census also inherits ffmpeg's desync and is
+   unreliable. What SURVIVES of R477-480, dump-side and walk-independent:
+   ac4asf (correct short/multigroup + absolute-SF parser) finds real
+   wide-band bodies on the dumps (m=31, nz=232, corr 0.68) that v2_parse
+   could not represent. The phantom-gap/under-read mechanism remains the
+   best available explanation but is NOT proven; gap-as-inter-element-
+   header remains plausible, also unproven.
+
+3. **True element grammar extracted (TS 103 190-2 6.2.4.1):**
+   immersive_channel_element = [mode_code 1|3b][iframe: immers_cfg]
+   [LFE mono_data][AJCC: companding(5)][core_5ch_grouping 2b ->
+   1+2+2 / 3+2 / 1+4 / 5][7CH_STATIC: b_use_sap_add_ch + add pair]
+   [ASPX block][SCPL/ASPX_SCPL/ACPL_1: TWO OR THREE MORE core pairs +
+   chparams][ACPL data]. Post-ASPX core pairs qualitatively explain the
+   campaign's mid-frame anchored pairs (~5000 bits deep after LFE).
+   Ported as ac4imms.py. RESULT: top-down immersive parse also fails to
+   sync on dumps (all origins P=16..24, all bodies corr <0.4, mode reads
+   ASPX_ACPL_2='011' consistently but ACPL_2 has no post-ASPX pairs —
+   contradiction with anchor positions => pre-core fields still wrong).
+
+4. **SECTION-WIDTH MIXTURE IS REAL (new hard constraint):** re-parsing 58
+   w5-labeled anchors with w3: 0/58 same end, corr drops mean -0.37 =>
+   labels are solid; Tidal long bodies genuinely use BOTH 3-bit and
+   5-bit section-length coding, per body. No adjacent signaling: bit
+   census sb-16..sb-1 flat (ALL and STRONG subsets); 1-bit and 3-bit
+   patterns before sb non-predictive; no m0 threshold (68% = base rate);
+   no position-in-frame pattern; pair (w0,w1) statistically INDEPENDENT
+   (432/165/213/86 ~ independence) => not an element-level flag on true
+   sibling pairs either. Per spec, n_sect_bits is fixed by transform
+   index (long => 5). A free per-body width with no adjacent flag is
+   impossible in a decodable stream => the selector lives upstream in
+   an unmodeled field, OR "w3 long bodies" are a structurally different
+   body type that happens to IMDCT long at 0.99. THE sharpest open
+   question for the deterministic-decode frontier.
+
+Banked: ac4imms.py. Next attack surfaces: (a) find the width selector —
+it is a 1-bit fingerprint of the true sf_info/element header; (b) locate
+the pre-core field(s) that break top-down sync (mode/cfg region);
+(c) A-SPX highband (independent, biggest audible win).
