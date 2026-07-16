@@ -1289,3 +1289,12 @@ reconstructions summed. MID-BAND (1-4 kHz) METER TRAJECTORY:
 Broadband essentially unchanged (+0.681 vs +0.694). Band-split is the
 render default going forward. Interim rebuild with backext 415+/
 shortfill 562+ inventories in flight for delivery.
+
+## Round 494d (07-16) — V10G: RAISED ATOM BUDGETS, DOUBLE BEST
+
+Diagnosis confirmed: adding backext bodies didn't move mids at K=14 ->
+the pursuit was BUDGET-starved, not content-starved. v10g raises
+budgets to 26 mid / 10 bass atoms:
+  mid 1-4kHz: +0.290 (48%>0.3)   [v10f +0.259/41%, v9 +0.104/14%]
+  broadband:  +0.700 (85%>0.3)   [v10f +0.683]
+Both campaign bests. v10g = render default. Delivered.
