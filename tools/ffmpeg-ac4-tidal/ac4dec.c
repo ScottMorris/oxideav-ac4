@@ -144,6 +144,7 @@ typedef struct SubstreamChannel {
     int     snf_data_exists;
 
     float   sf_gain[16][128];
+    int     scale_factor_ref;
 
     int     aspx_int_class;
     int     aspx_num_noise;
@@ -2531,6 +2532,7 @@ static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
     int scale_factor;
 
     scale_factor = get_bits(gb, 8);
+    ssch->scale_factor_ref = scale_factor;
     memset(ssch->sf_gain, 0, sizeof(ssch->sf_gain));
 
     for (int g = 0; g < ssch->scp.num_window_groups; g++) {
@@ -2549,7 +2551,13 @@ static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
                     first_scf_found = 1;
                 }
 
-                if (getenv("AC4_SFSIGNED")) {
+                if (getenv("AC4_SFREL")) {
+                    /* v2 law candidate: gains relative to the frame's
+                     * leading 8-bit scale_factor (ref_sf), not the
+                     * absolute v0/v1 -100 offset. Kills the 2^26
+                     * blowup (ref_sf~207 -> 2^((207-100)/4)=1.2e8). */
+                    ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * (scale_factor - ssch->scale_factor_ref));
+                } else if (getenv("AC4_SFSIGNED")) {
                     /* war law: 8-bit two's-complement wrap of the sf chain */
                     int sfw = ((scale_factor & 255) + 128 & 255) - 128;
                     ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * (sfw - 100));

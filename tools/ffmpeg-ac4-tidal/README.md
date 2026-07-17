@@ -1809,3 +1809,24 @@ from v0/v1 — the last real magnitude bug; SFSIGNED is the working law.
 Delivered: kw_core_v12_sfsigned.wav (60s stereo downmix) for the ear
 test. NEXT: settle exact v2 sf law (vs SFSIGNED approximation); mop up
 msfb=0/two_channel_data edge frames; re-enable A-SPX highband.
+
+## Round 517 (07-17) — ear test verdict: clicks/pops; sf VALUE law still open
+
+Scott's listen: kw_core_v12_sfsigned.wav = digital clicks and pops,
+not music. The tonality metrics were fooled by frame-rate-periodic
+transients (a click every 2048 samples reads as "pitched"). Diagnosis:
+SFSIGNED randomizes per-frame level (mod-256 wrap) -> click at every
+frame boundary. KEY QUANTITATIVE CLUE: the default-law blowup is
+~1e8 = 2^((207-100)/4) where 207 = the observed ref_sf, so v2 gains
+are RELATIVE to the frame's leading 8-bit scale_factor, not absolute
+vs -100. Added AC4_SFREL (gain = 2^(0.25*(sf - ref_sf))): spread drops
+17 -> ~10 orders (median sane, p99 ~0.8) — right direction but still
+too wide; the dpcm chain APPLICATION rule (which sfbs advance the
+chain / VLC offset) must also differ in v2. STATUS: bit-framing
+PROVEN (aspx anchor); quant values proven (huffman consumes exact
+bits); remaining bug is ONLY the scalefactor VALUE law. That's a
+narrow hunt: candidates = (a) chain relative to ref_sf with different
+dpcm offset (not -60); (b) chain resets per window group; (c) v2 scf
+VLC table differs; (d) chain only advances on cb<=11 non-overshoot
+sections (harvest's rule — its bodies validated semantically with
+g=2^(0.25*(sf-ref_sf))). Try (d) first: port harvest's exact rule.
