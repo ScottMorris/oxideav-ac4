@@ -1740,3 +1740,48 @@ NEXT SESSION ENTRY POINT: enumerate (a)/(b)/(c) fully on ims_f32
 require sane short-geometry (msfb<=36 @512, LSF split, spectra
 in-range, clean tiling into the next element). One variant will
 survive; port it to the 7_X path and re-walk the Tidal dumps.
+
+## Round 516 (07-17) — THE WALL FALLS: MSFB5 is the v2 delta; core decodes
+
+Not a glue-bit riddle after all. Two independent fixes cracked it:
+
+1. **TOC parser corrected (bit-exact, all frames).** r511's v2 TOC
+   had two bugs: (a) emdf_info() must end with emdf_protection/
+   emdf_reserved [2b primary][2b secondary][8*n_skip] — this is the
+   40-bit field the R511 entropy map had flagged; (b) n_substreams in
+   substream_index_table is an EXPLICIT u(2)(+vb) field, NOT derived
+   from max substream index. With both fixed, r516_toc.py chains all
+   5880 clean Tidal mdat frames (7.1:3/4/0.1, ndot matches iframe
+   cadence) AND matches the fork byte-for-byte on the ims references
+   (f30 sizes [672,23], f32 [766,22], payload_base 55). AC4_RAWSUB
+   crutch no longer needed.
+
+2. **MSFB5 (5-bit max_sfb) is the v2 grammar difference.** The fork
+   default reads max_sfb as 6 bits for transf_length in [384,2048];
+   that over-decodes v2 bodies 10-40x (msfb=39..55) and desyncs. With
+   AC4_MSFB5 (5-bit read) the ims content frames and the Tidal 7.1
+   dumps parse to completion:
+     - ims f32 (7.0, codec SIMPLE, coding_config 3): five_channel_data
+       + two_channel_data = 7 channels, 0 decode errors, 2048 samples.
+     - Tidal f0 (7.1, codec ASPX, coding_config 1): silent LFE +
+       three_channel_data + two_channel_data + additional
+       two_channel_data (8ch), then reaches aspx_data.
+   PROOF the framing is correct: 6/10 sampled Tidal iframes land on
+   aspx_config with the EXACT R498 constants (nsbgm=6 xover=7 sf=7
+   st=1 scale=1) at *different* bit positions — impossible unless the
+   core huffman consumes exactly the right bits every frame.
+
+3. **A-SPX made non-fatal (AC4_SKIP_ASPX) + AC4_DUMP_SPEC** added to
+   the instrumented decoder. Core-only PCM now emits for the whole
+   track (1410 frames, ~1243 fully clean; the rest hit residual
+   two_channel_data/msfb=0 edge cases). Dumped scaled_spec shows
+   correct MUSICAL shape (energy concentrated in the lowest octave,
+   sparse ~12 nonzero bins/frame) but magnitudes ~1e8 -> a
+   scalefactor dequant SCALE bug (ref_sf/exponent), which is why the
+   int16 WAV clipped to noise. Correlation is scale-invariant, so
+   next step is Python IMDCT+OLA on the float spectra.
+
+NEXT: (a) validate core spectra correlate to kw-ref51 via own IMDCT;
+(b) fix the scalefactor scale so PCM doesn't clip; (c) mop up the
+residual msfb=0 / two_channel_data edge frames; (d) build v12 real
+core render (no synthesis guesswork — actual decoded bed).
