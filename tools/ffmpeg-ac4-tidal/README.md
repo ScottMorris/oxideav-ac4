@@ -1594,3 +1594,41 @@ AC4_RAWSUB TOC-bypass on the wrapped kw4 dumps with CB15+OVERSHOOT:
   champion; purge kept 36140/48595 = 74%, matching the R500
   ~27% FP estimate almost exactly (independent confirmation of the
   FP-floor measurement, even though the filter hurt the render).
+
+## Round 511 (07-17) — THE v2 TOC FALLS: hand-parsed bit-exact, channel_mode SETTLED
+
+Extracted raw frames from the library mp4 (mdat @67701, frames
+back-to-back; the mp4's SAMPLE TABLE is broken — ffprobe packets are
+misaligned garbage, explaining years of TOC confusion). Anchored the
+substream_index_table by brute solve (unique solution, bit 121 on
+every frame), then closed the full field map via a cross-frame
+entropy profile of the 121-bit TOC head (3000+ frames):
+
+  [ver=2 (2)][seq (10)][b_wait=1, wait_frames, br_code][fs=48k]
+  [frame_rate_index=13][b_iframe_global][b_single_presentation=1]
+  [payload_base=0][b_program_id=0]
+  presentation_v1: [single_group=1][presentation_version=2]
+    [md_compat=0][pres_id=0][emdf ver/key=0]
+    [EMDF_PROTECTION: 2b+2b -> 5 skip bytes = 40 high-entropy bits
+     (the field my first parse missed = the desync)]
+    [b_presentation_filter=0][group_index=0][b_pre_virtualized=0]
+    [b_add_emdf=0][pres_substream_info: alt=0, ndot, index=0]
+  group_info: [substreams_present=1][hsf=0][single_substream=1]
+    [b_channel_coded=1][channel_mode = 0b1111001 = 7.1 (3/4/0.1)]
+    [sf_mult=0][bitrate_info=0][B_AUDIO_NDOT (bit 111)]
+    [substream_index=1][content_type: complete main]
+  [n_substreams=2][sizes: pres_substream, audio_substream]
+
+SETTLED: channel_mode = 7.1 CONFIRMED (22.2 hypothesis dead; 7_X
+element stands). Substream 0 = 3-10 byte PRESENTATION SUBSTREAM
+(sits between TOC and audio; iframes carry the 10-byte variant).
+Audio sizes in the table match the kw4 dumps byte-exactly
+(extraction validated end-to-end). b_audio_ndot (TOC bit 111) is
+the TRUE per-frame iframe flag: matches %24 for all 1410 dump
+frames, but 28/5933 frames later in the track DEVIATE — any
+full-track work must read ndot from the TOC, not assume cadence.
+Chain walk self-validates 5933 frames.
+Tool: r511_toc.py. NEXT: parse the presentation substream (10B
+iframe variant may hold per-presentation config); fix the fork's
+v2 TOC path with this map (removes AC4_RAWSUB crutch); resume the
+audio-element wall with ndot ground truth.
