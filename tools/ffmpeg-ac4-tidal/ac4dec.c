@@ -2525,6 +2525,10 @@ static int asf_spectral_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
     return 0;
 }
 
+static int ac4_frame_ctr;   /* frame index matching the DUMP_SPEC write order */
+static int ac4_frame_failed;
+static float ac4_last_spec[8][2048];   /* AC4_CONCEAL: last good frame's spectra */
+
 static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch)
 {
     GetBitContext *gb = &s->gbc;
@@ -2540,6 +2544,7 @@ static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
 
         for (int sfb = 0; sfb < max_sfb; sfb++) {
             if ((ssch->sfb_cb[g][sfb]) != 0 && (ssch->max_quant_idx[g][sfb] > 0)) {
+                int had_first = first_scf_found;
                 if (first_scf_found == 1) {
                     ssch->dpcm_sf[g][sfb] = get_vlc2(gb, scale_factors_vlc.table, scale_factors_vlc.bits, 3);
                     if (ssch->dpcm_sf[g][sfb] < 0) {
@@ -2551,12 +2556,34 @@ static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
                     first_scf_found = 1;
                 }
 
+                {
+                    const char *sfdump = getenv("AC4_DUMP_SF");
+                    if (sfdump) {
+                        FILE *fp = fopen(sfdump, "a");
+                        if (fp) {
+                            fprintf(fp, "%d %d %d %d %d %d %d %d\n",
+                                    ac4_frame_ctr,
+                                    (int)(ssch - s->substream.ssch),
+                                    g, sfb,
+                                    had_first ? ssch->dpcm_sf[g][sfb] : -1,
+                                    scale_factor, ssch->scale_factor_ref,
+                                    ssch->sfb_cb[g][sfb]);
+                            fclose(fp);
+                        }
+                    }
+                }
                 if (getenv("AC4_SFREL")) {
                     /* v2 law candidate: gains relative to the frame's
                      * leading 8-bit scale_factor (ref_sf), not the
                      * absolute v0/v1 -100 offset. Kills the 2^26
                      * blowup (ref_sf~207 -> 2^((207-100)/4)=1.2e8). */
-                    ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * (scale_factor - ssch->scale_factor_ref));
+                    int rel = scale_factor - ssch->scale_factor_ref;
+                    if (getenv("AC4_SFCLAMP") && (rel < -120 || rel > 120)) {
+                        /* clean-body excursion p99 = 81; beyond +/-120 is a
+                         * desynced chain (dpcm=0 runs) — mute those sfbs */
+                        ssch->sf_gain[g][sfb] = 0.f;
+                    } else
+                        ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * rel);
                 } else if (getenv("AC4_SFSIGNED")) {
                     /* war law: 8-bit two's-complement wrap of the sf chain */
                     int sfw = ((scale_factor & 255) + 128 & 255) - 128;
@@ -6081,6 +6108,7 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     skip_bits_long(gb, s->payload_base * 8);
 
+
     for (int i = 0; i < s->nb_substreams; i++) {
         int substream_type = s->substream_type[i];
 
@@ -6088,6 +6116,8 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         case ST_SUBSTREAM:
             ret = ac4_substream(s, ssinfo);
             if (ret < 0 && getenv("AC4_NEVER_FAIL")) {
+                fprintf(stderr, "NEVERFAIL frame %d\n", ac4_frame_ctr);
+                ac4_frame_failed = 1;
                 for (int c = 0; c < 8; c++) {
                     memset(s->substream.ssch[c].quant_spec, 0, sizeof(s->substream.ssch[c].quant_spec));
                     memset(s->substream.ssch[c].sf_gain, 0, sizeof(s->substream.ssch[c].sf_gain));
@@ -6115,6 +6145,21 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     for (int ch = 0; ch < avctx->channels; ch++)
         scale_spec(s, ch);
 
+    if (getenv("AC4_CONCEAL")) {
+        if (ac4_frame_failed) {
+            /* failed parse: repeat last good spectra instead of silence
+             * (a silent frame next to signal is a guaranteed click) */
+            for (int ch = 0; ch < 8; ch++)
+                memcpy(s->substream.ssch[ch].scaled_spec, ac4_last_spec[ch],
+                       sizeof(ac4_last_spec[ch]));
+        } else {
+            for (int ch = 0; ch < 8; ch++)
+                memcpy(ac4_last_spec[ch], s->substream.ssch[ch].scaled_spec,
+                       sizeof(ac4_last_spec[ch]));
+        }
+    }
+    ac4_frame_failed = 0;
+
     if (getenv("AC4_DUMP_SPEC")) {
         FILE *fp = fopen(getenv("AC4_DUMP_SPEC"), "ab");
         if (fp) {
@@ -6124,6 +6169,7 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
             fclose(fp);
         }
     }
+    ac4_frame_ctr++;
 
     switch (ssinfo->channel_mode) {
     case 0:

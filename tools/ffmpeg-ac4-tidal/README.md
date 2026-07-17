@@ -1830,3 +1830,58 @@ dpcm offset (not -60); (b) chain resets per window group; (c) v2 scf
 VLC table differs; (d) chain only advances on cb<=11 non-overshoot
 sections (harvest's rule — its bodies validated semantically with
 g=2^(0.25*(sf-ref_sf))). Try (d) first: port harvest's exact rule.
+
+## Round 518 (07-17) — ref_sf is NOT loudness; SFREL confirmed; shape-noise is the wall
+
+Rigorous value-law round with null controls. Findings:
+
+1. SFREL CONFIRMED as the v2 scalefactor value law. Clean smoothness
+   metric (median inter-frame body-level jump) with null control:
+   SFREL 0.79 decade vs ABSOLUTE 5.25 vs SIGNED 5.9 (all 7 channels
+   agree). SFREL wins decisively.
+
+2. The "blowup" was NEVER a decode bug. The known-good v0 ims control
+   ALSO peaks at 2.3e13 in the spectral domain yet decodes to clean
+   PCM at absmax 9.6e4 — large spectral magnitudes are normal and the
+   synthesis/normalization handles them. Earlier int16 clipping was a
+   RENDER problem, not a decode problem.
+
+3. WHY SFREL is right (the real mechanism, reversing R517's framing):
+   ref_sf is UNCORRELATED with body content. corr(ref_sf, n_active_sfb)
+   = +0.04; corr(ref_sf, mean_codebook) = -0.02. And |Δref_sf| between
+   consecutive frames (p50 67) == shuffled null (p50 71). So the leading
+   u(8) "ref_sf" is NOT valid per-frame loudness — SFREL works because
+   it cancels a garbage/normalization anchor, not because gains are
+   "relative to loudness." Per-frame level is genuinely not recoverable
+   from the current ref_sf read.
+
+4. Where real level DOES live: the quantized-coefficient energy itself
+   carries genuine temporal dynamics — body log-energy |Δ| consecutive
+   0.79 vs null 1.57 (21% excess smoothness). SFREL body energy ≈ quant
+   energy (within-body gain is O(1)), so the SFREL render already drives
+   level from this real signal. Level is as good as it will get.
+
+5. THE REMAINING WALL = spectral-SHAPE incoherence. Per-frame spectra
+   are sparse (top-8 bins = 86% energy) but the shape barely persists:
+   consecutive-frame log-mag envelope corr 0.29 vs null 0.17 (excess
+   only 0.12); ZERO dominant-tone runs ≥5 frames (longest 0.17s). The
+   spectrogram is vertical-streak dominated (broadband transients), and
+   those impulses are NOT frame-locked (5% near boundaries ≈ chance) —
+   so the residual error is in the spectral VALUES/placement, not the
+   framing or the scalefactor law. Next target: the quant codebook
+   interpretation / spectral placement for ASPX-coded bodies.
+
+Robustness knobs added this round (decoder):
+  AC4_SFCLAMP  — mute sfbs whose (sf-ref) leaves ±120 (kills 42
+                 desynced-chain bodies, excursion p99 of clean bodies=81)
+  AC4_CONCEAL  — on parse failure, repeat last good frame's scaled_spec
+                 instead of silence (removes silence-adjacent clicks from
+                 the 141/1411 hard-fail frames)
+  AC4_DUMP_SF  — per-record scalefactor chain dump (frame ch g sfb dpcm
+                 sf ref cb) for offline chain forensics
+
+Renders (SFREL+CONCEAL+CLAMP, 7.1→stereo): kw_sfrel_raw / _desp. Still
+noise-dominated (weak real signal under shape-noise) — NOT delivered as
+music. Spectrogram banked as the diagnostic. STATUS: framing proven,
+scalefactor law settled (SFREL), level source identified (quant energy);
+sole remaining bug = spectral-shape/value incoherence in the core decode.
