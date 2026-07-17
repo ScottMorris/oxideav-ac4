@@ -1409,3 +1409,28 @@ substream front turned out to be deterministic:
 Tools banked: ac4aspx2.py (exact parser), r498_aspxcfg.py,
 r498_cfg7x.py (config extractors), r498_fit.py (tail fitter),
 r498_topdown.py (position-match harness).
+
+## Round 499 (07-17) — two honest negatives sharpen the gate
+
+R499a (r499_hdrwin.py): header-window tiling test. Chaining v2 bodies
+from LFE-end reaches the first validated harvest body in 87% of
+frames — but a +13-bit mis-offset null reaches it in 82%. The v2 body
+grammar is permissive enough that reachability carries ~no
+information (reconfirms R476's 3.86-billion-chains result at the
+frame front). Constrained field-by-field decode is required.
+
+R499b (r499_aspxsem.py): A-SPX semantic test WITH the exact R498
+parser (real 6-band 15-21kHz tables, 3dB quant, duration-rule
+freq_res, 4-block tail). 714/1114 frames fit a window-searched tail.
+Per-frame decoded signal-envelope level vs reference 15-21kHz
+log-energy across 714 frames: corr -0.05; shift nulls -0.01..-0.07.
+ZERO separation. Window-searched tail positions do not produce real
+values even under the exact grammar.
+
+CONSOLIDATED CONCLUSION: every remaining deterministic goal (A-SPX
+values, exact core positions, Rust decoder port) is gated on ONE
+thing — the post-LFE header window (~50-150 bits). Next instrument:
+joint field-hypothesis enumeration scored across all 1410 frames
+(a candidate grammar must explain every frame simultaneously;
+cross-frame constancy of config-like fields + landing on validated
+body positions are the score).
