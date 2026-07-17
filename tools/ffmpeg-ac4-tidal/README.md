@@ -1334,3 +1334,26 @@ render: the QMF master frequency table (maps the 12 high bands to Hz)
 — aspx_config start_freq/stop_freq/master_freq_scale still unlocated;
 sweep those next, then dequantize (3dB steps) and drive the highband
 in place of SBR copy-up fill = v11.
+
+## Round 497 (07-16) — A-SPX ENVELOPE SEMANTICS: NEGATIVE (retracts R496 overclaim)
+
+Extracted per-frame 12-band signal envelopes from tail fits (141/1114
+frames, r497_aspxenv.py). VALIDATION vs reference highband band-energy
+shape (the decisive test R496 lacked):
+  - decoded shape (natural order) vs ref: -0.53, SAME as wrong-frame
+    null -0.53
+  - reversed band order: +0.52 (74%>0.3) BUT reversed null ALSO +0.53
+    => separation -0.007 = ZERO
+The +0.52 is an artifact: every frame decodes to a near-identical
+RISING ramp (0.9->1.3), which correlates ~+0.5 with any falling
+highband regardless of frame. NO per-frame information.
+CONCLUSION: the tail STRUCTURALLY parses as A-SPX (0/1500 null on bit
+consumption stands) but the decoded envelope VALUES are NOT validated
+as real highband data. Either the tail fits are consumption-
+coincidental, or the value decode (offset/dequant/band-map/num_env) is
+still wrong. R496's "first real highband data" was premature — the
+frame-generic ramp is the tell. A-SPX render (v11) BLOCKED until values
+decode frame-specifically. Honest reference-assisted highband (v7-v10
+envelope fill) remains the render path. NEXT: locate real aspx_config
+(start/stop/master_scale) for correct band count + dequant, OR accept
+A-SPX as beyond reach without the QMF master tables.
