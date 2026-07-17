@@ -1318,3 +1318,19 @@ the band config per frame, extract real envelopes, replace SBR fill in
 the render — the path to killing "video-call mush".
 
 v10g final (full backext): broadband +0.709 (85%), mid +0.293 (49%).
+
+## Round 496 (07-16) — 🔓🔓 A-SPX ENVELOPES DECODE TO SANE VALUES (REAL HIGHBAND DATA)
+
+Locked config across tails: nsb_hi=12, freq_res_mode=3, quant_mode=0
+dominant (29/60 tails fit >=90%). Envelope EC decode bug fixed: Huffman
+returns codebook INDEX; the F0/DF/DT books are centered on their
+shortest codeword (mode = zero-delta), so value = index - argmin(LEN).
+Offsets: ENV F0 30, ENV DF/DT 69/70, NOISE F0 7, NOISE DF 29.
+RESULT: post-offset envelope values now SANE — n=6228, central 90%
+[-17,+15], mean 0.5, median 0 (was min3/max1213/median227 = garbage).
+Tight symmetric distribution around 0 = real coded deltas, not noise.
+FIRST REAL HIGHBAND DATA READ FROM THE STREAM. Remaining unknown to
+render: the QMF master frequency table (maps the 12 high bands to Hz)
+— aspx_config start_freq/stop_freq/master_freq_scale still unlocated;
+sweep those next, then dequantize (3dB steps) and drive the highband
+in place of SBR copy-up fill = v11.
