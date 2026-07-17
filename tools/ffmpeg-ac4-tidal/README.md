@@ -1497,3 +1497,32 @@ instruments: (a) decode believer.mp4 (v0/v1, DECODABLE by the fork)
 and diff its frame-front bit layout against Tidal v2 to identify the
 inserted/changed layer; (b) autocorrelation/grammar-free segmentation
 of the payload region to find its code's symbol statistics.
+
+## Round 507 (07-17, overnight) — payload fingerprint: ASF-spectra-flavored; naive element recurrence negative
+
+- Codebook compression fingerprint (grammar-free): decoding the
+  dominant-mode payload (bit 25) under each of 60 AC-4 codebooks and
+  comparing observed mean code length vs the tree's random-bits
+  expectation. ASF spectral books win (cb9 +0.126, cb7/cb1/cb3/cb5
+  +0.09..0.10); ASPX books actively anti-fit (-0.14). The payload
+  region is ASF-spectra-flavored huffman. CAVEAT: the frame is
+  mostly spectra everywhere, and 1-heavy bit bias inflates books
+  with 1-run short codes — treat as directional, not positional.
+- Recurrence test NEGATIVE: [12 lines under cb X][ref_sf][snf] then
+  expect next '011' descriptor — all 11 codebooks at/below the 12.5%
+  chance floor. The descriptor-chain structural guess is wrong.
+- Believer diff blocked: believer.mp4 no longer on disk (only its
+  decoded wav). Prior memory: R458 proved fork bit-exact on believer
+  v0/v1; R465 REFUTED Table 42a for MID-FRAME gaps (bodies had no
+  overshoot sections) — but the FRAME FRONT is full of overshoot
+  sections, so an hsf-STYLE inline tail remains live for the front
+  specifically. Official spec hsf lives in a separate 96/192kHz
+  substream (Table 17), so any inline variant is v2-custom.
+OVERNIGHT STATE: descriptor structure + payload offsets stand
+(R501-506); payload coding still unidentified. Strongest next plays:
+(1) re-obtain a v0/v1 AC-4 sample (believer) and diff frame fronts;
+(2) instrument the fork's C walk on Tidal to log its OWN parse of
+bits 16-100 per frame (walk vs dump divergence localizes the first
+misread field); (3) position-free spectral matching: IMDCT candidate
+decodes of the bit-25 region against the ref's LOW-band (the front
+element should be an audible channel, not LFE).
