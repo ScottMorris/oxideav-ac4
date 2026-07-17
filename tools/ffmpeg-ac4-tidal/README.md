@@ -1688,3 +1688,30 @@ NEXT: C-level stage log on atsc3 (v0/v1, correct output) vs Tidal
 computation differs is the deviation. The ims sample's
 multi-presentation TOC also needs the full n_pres loop in
 r511_toc.py before its audio front can be compared.
+
+## Round 514 (07-17) — crash microscope: ims frame ~32 catches the desync in the act
+
+- Version-gate audit of ac4dec.c: ZERO bitstream_version branches in
+  the audio element / sf_data code — the fork decodes ALL v2 audio
+  with v0/v1 grammar (by construction it cannot know v2 deltas).
+- The Chromium ims sample decodes ONLY its silent lead-in (32
+  frames); it crashes on the FIRST content frame — same class of
+  failure as Tidal, now in ~870-byte frames. The trace catches it:
+  a pair body ends clean (end@1321), ~15 bits of pair glue, then
+  msfb reads 47 on a 512-sample short transform (legal width,
+  impossible value; num_sfb(512) ~= 36), no LSF section split, and
+  spectra map to lines 2020..2500 = overrun. The desync ignites in
+  the INTER-BODY GLUE (b_2ch_proc / transform_info / chparam bits),
+  not in the msfb field itself.
+- atsc3.ts (v0/v1 5.1) decodes fully: LFE msfb=3 then shared
+  msfb=43 bodies of 1.4k bits alternating with ~33-bit partners —
+  big bodies are NORMAL. Frame-budget check: Tidal 13k bits ≈ 8 big
+  bodies + tail, so the fork's 8-body model fits the budget too;
+  the harvest's ~25 validated fragments may be resync artifacts
+  INSIDE 8 true bodies (carrying real spectra either way).
+NEXT (bounded, high-value): bit-level forensics of ims frame 32's
+pair glue — hand-enumerate the ~15 bits between end@1321 and the
+msfb read against stereo_data/chparam grammar variants; the variant
+that yields a sane short-transform parse (msfb<=36, LSF split
+present, spectra in range) IS the v2 delta. Then port to the 7_X
+path and re-walk Tidal.
