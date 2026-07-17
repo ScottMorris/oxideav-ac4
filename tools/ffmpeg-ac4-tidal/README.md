@@ -1526,3 +1526,20 @@ bits 16-100 per frame (walk vs dump divergence localizes the first
 misread field); (3) position-free spectral matching: IMDCT candidate
 decodes of the bit-25 region against the ref's LOW-band (the front
 element should be an audible channel, not LFE).
+
+## Round 508 (07-17, overnight) — walk corpus rediscovered; giant front body = fork desync artifact
+
+bedgeo.log/bedfull.log (scratchpad, 51MB/1.1GB) = the fork C walk's
+element-by-element trace on the kw file, 189 frames, WALL-MATCHED to
+the dumps (f1 13720, f2 13304 — same file, same bit origin, positions
+transferable; the R479 "not bit-identical" caveat needs re-scoping).
+The walk parses a GIANT front body at in@40 (cb10 sections spanning
+63-66 "sfbs" via the known stale-array overshoot bug, spec ~8000
+bits). Replicating that decode on dump bits: correlation vs ref =
+0.05 = null. VERDICT: the giant front body is the fork's own desync
+artifact — it burns most of the frame through garbage right after
+the descriptor zone; matches session-3's "both decoders desync in
+the five-channel region."
+NET OVERNIGHT: descriptor structure + payload offsets stand; payload
+coding remains unidentified; the walk corpus is available for
+field-level forensics but its front parse is not ground truth.
