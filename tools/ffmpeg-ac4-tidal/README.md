@@ -1298,3 +1298,23 @@ budgets to 26 mid / 10 bass atoms:
   mid 1-4kHz: +0.290 (48%>0.3)   [v10f +0.259/41%, v9 +0.104/14%]
   broadband:  +0.700 (85%>0.3)   [v10f +0.683]
 Both campaign bests. v10g = render default. Delivered.
+
+## Round 495 (07-16) — 🔓 A-SPX GRAMMAR FITS THE FRAME TAILS (0/1500 null)
+
+Census of the full merged tiling (multibody+backext): NO mid-frame
+gaps >90 bits (bodies pack tight); the unexplained regions are the
+pre-body run-up (median first body @766) and the TAIL (median 1261
+bits after last body). Built ac4aspx.py = A-SPX bitstream parser
+(Tables 51-58: aspx_framing int_class FIXFIX/FIXVAR/VARVAR/VARFIX,
+delta_dir, hfgen_iwc_1ch/2ch tna/ah/fic/tic flags, ec_data/huff_data
+F0/DF/DT chains) with band counts (nsb_hi, nsb_noise, env_bits_fixfix,
+freq_res_mode, quant_mode) as free params since aspx_config/master
+tables unlocated. EXACT-FIT TEST on frame tails, chain [2ch][2ch][1ch]:
+15/25 frames consume >=85% of the tail (several land EXACTLY on wall),
+NULL-fit rate 0/1500 (same test 700 bits earlier = inside body region).
+First contact with REAL highband data (vs synthetic SBR fill). Common
+fit params: nsb_hi 10-12, freq_res_mode 3, quant_mode 0. NEXT: lock
+the band config per frame, extract real envelopes, replace SBR fill in
+the render — the path to killing "video-call mush".
+
+v10g final (full backext): broadband +0.709 (85%), mid +0.293 (49%).
