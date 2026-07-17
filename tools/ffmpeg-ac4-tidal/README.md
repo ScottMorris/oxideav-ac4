@@ -1715,3 +1715,28 @@ msfb read against stereo_data/chparam grammar variants; the variant
 that yields a sane short-transform parse (msfb<=36, LSF split
 present, spectra in range) IS the v2 delta. Then port to the 7_X
 path and re-walk Tidal.
+
+## Round 515 (07-17) — glue forensics begun on the ims microscope frame
+
+- DISCOVERY about the trace: ffmpeg's ac4 demuxer hands the decoder
+  multi-frame packets (gb 'size=248936 bits' ~ 31KB vs 866B frames),
+  so POS trace positions are packet-relative, NOT frame-relative.
+  Trace-position mapping to file bits is therefore unreliable across
+  frames; all forensics must run on file coordinates.
+- Frame 32 (ims_f32.bin, banked) audio element located INDEPENDENTLY
+  by anatomy scan: codec_mode '11' at file bit 1116, silent LFE
+  (msfb=2, one cb15 overshoot section, ref_sf=207, snf=0) ending at
+  1149 — same LFE shape as Tidal. Then coding_config '01' = 3+2,
+  SAME as Tidal's dominant config. GLUE REGION = file bits 1149+.
+- Candidate readings of the glue (bits 01011001101100100011100010):
+  (a) cc=1, short, tl=(3,0) -> different_framing=1 -> DUAL msfb
+      (6+6) — the fork does implement dual msfb; values 54/27-ish
+      need the tl-idx -> length mapping checked;
+  (b) cc=1 + one extra v2 bit before transform_info;
+  (c) v2-body grammar directly at 1149 (msfb5=11, cb=3 — plausible
+      smallband body!).
+NEXT SESSION ENTRY POINT: enumerate (a)/(b)/(c) fully on ims_f32
+(and 2-3 sibling content frames): parse each variant to body end,
+require sane short-geometry (msfb<=36 @512, LSF split, spectra
+in-range, clean tiling into the next element). One variant will
+survive; port it to the 7_X path and re-walk the Tidal dumps.
