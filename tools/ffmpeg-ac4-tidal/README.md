@@ -1543,3 +1543,21 @@ the five-channel region."
 NET OVERNIGHT: descriptor structure + payload offsets stand; payload
 coding remains unidentified; the walk corpus is available for
 field-level forensics but its front parse is not ground truth.
+
+## Round 509 (07-17) — corrections and closures while v10i builds
+
+- bedgeo/bedfull RE-CLASSIFIED: ~1072 BODY lines per frame and flat
+  position alignment vs the validated harvest prove these are a
+  prior round's brute-force SCAN corpus, not a single clean C walk.
+  The R508 'walk corpus' framing is dead; no walk instrument exists
+  on disk for Tidal.
+- Iframe-only STRICT A-SPX tail hunt (all-4-xovers-equal, sane
+  num_env, end within [wall-400, wall-4]): 6/47 unique fits, 41
+  no-fit, xovers inconsistent (3 vs 1) across the six. Third
+  independent confirmation: the tail cannot be window-searched; it
+  needs the forward anchor (task #12).
+- v10i render building: phantom purge (long: bc>=0.60 or |c|>=0.45
+  or bc>=0.50&nz>=25; shorts: |c|>=0.40 or nz>=20) + pursuit atoms
+  bass 10->12, mid 26->30. Rationale: R500 measured ~27% FP floor
+  in the r489 accept test — cleaning the atom pool should help the
+  mid band more than adding inventory did (v10h was flat vs v10g).
