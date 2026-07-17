@@ -3343,6 +3343,9 @@ static int aspx_data_2ch(AC4DecodeContext *s, Substream *ss,
     GetBitContext *gb = &s->gbc;
     int ret;
 
+    if (getenv("AC4_SKIP_ASPX"))
+        return 0;   /* core-only decode: leave highband silent */
+
     if (iframe) {
         if (getenv("AC4_XOVER_STICKY")) {
             /* war law: no per-block xover field; fixed per slot [0,0,0,4] */
@@ -3461,6 +3464,9 @@ static int aspx_data_1ch(AC4DecodeContext *s, Substream *ss,
     av_log(s->avctx, AV_LOG_TRACE, "POS aspx_data_1ch@%d\n", get_bits_count(&s->gbc));
     GetBitContext *gb = &s->gbc;
     int ret;
+
+    if (getenv("AC4_SKIP_ASPX"))
+        return 0;   /* core-only decode: leave highband silent */
 
     if (iframe) {
         if (getenv("AC4_XOVER_STICKY"))
@@ -6100,6 +6106,16 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
 
     for (int ch = 0; ch < avctx->channels; ch++)
         scale_spec(s, ch);
+
+    if (getenv("AC4_DUMP_SPEC")) {
+        FILE *fp = fopen(getenv("AC4_DUMP_SPEC"), "ab");
+        if (fp) {
+            for (int ch = 0; ch < 8; ch++)
+                fwrite(s->substream.ssch[ch].scaled_spec,
+                       sizeof(float), 2048, fp);
+            fclose(fp);
+        }
+    }
 
     switch (ssinfo->channel_mode) {
     case 0:
