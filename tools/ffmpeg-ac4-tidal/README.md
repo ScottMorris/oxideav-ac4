@@ -1561,3 +1561,36 @@ field-level forensics but its front parse is not ground truth.
   bass 10->12, mid 26->30. Rationale: R500 measured ~27% FP floor
   in the r489 accept test — cleaning the atom pool should help the
   mid band more than adding inventory did (v10h was flat vs v10g).
+
+## Round 510 (07-17) — INSTRUMENTED DECODER REBUILT AND RUN ON THE DUMPS
+
+Rebuilt the fork ffmpeg from scratch (ffmpeg 6.1.2 + community patch
++ fork ac4dec.c, host gcc 13.3 — the binary was lost). Ran via the
+AC4_RAWSUB TOC-bypass on the wrapped kw4 dumps with CB15+OVERSHOOT:
+- FRONT WALK CONFIRMS R501-506 FIELD MAP on the exact dump bits:
+  codec_mode=1 (ASPX), LFE msfb=3 sections@36, coding_config=1
+  (3+2), shared sf_info msfb=55 (near-full-band core). The "frame
+  descriptor" was [LFE][coding_config][sf_info] all along — my
+  python LFE-end computation was the misread, not the concept.
+- BUT the walk's 8 bodies/frame occupy only bits ~33..4100 and reach
+  aspx_data_2ch@~4128, while the SPECTRALLY VALIDATED harvest bodies
+  (~25/frame) fill ~5000..13300. Zero position overlap. The walk's
+  bodies decode to full-scale noise (8ch RMS ~20000, corr 0.06 =
+  session-3 result reproduced deterministically).
+- Decoder WEDGES (infinite loop) inside aspx escape handling after
+  ~194 frames at trace level — crash-proofing gap, r510_walk log
+  banked (194 frames of field-labeled front walk).
+- TOC parse on the real mp4 is GARBAGE (presentations:0, substream
+  sizes 332/0/2/704) — the v1 path misreads the v2 TOC. IMPLICATION:
+  channel_mode 6 = "7.1" rests on this unreliable parse. The ~25
+  validated bodies/frame EXACTLY matches 22_2_channel_element
+  (2 mono + 11 pairs = 24 sf_datas + 11 aspx_2ch tails). NEXT: (a)
+  fix the v2 TOC parse (or hand-parse the TOC bits properly) to
+  settle channel_mode; (b) try 22_2 element grammar against the
+  frame; (c) fix the aspx escape wedge and trace all 1410 frames.
+- v10i phantom-purge render: NEGATIVE (full +0.704, mid +0.273 vs
+  v10h +0.709/+0.298) — hard filtering removes real bodies; the
+  ridge regression already handles phantoms better. v10h remains
+  champion; purge kept 36140/48595 = 74%, matching the R500
+  ~27% FP estimate almost exactly (independent confirmation of the
+  FP-floor measurement, even though the filter hurt the render).
