@@ -1660,3 +1660,31 @@ constrain the aspx tail from BEHIND the wall on reconciling-ish
 frames; (3) revisit the sf_data grammar against believer (v0/v1)
 C-walk once believer.mp4 is re-obtained — the sf_data DELTA between
 v0/v1 (works) and v2 (fails) is the deviation, by construction.
+
+## Round 513 (07-17) — queue of three: stage diff, reference streams, tail status
+
+1. STAGE-LEVEL DIFF (f25/f56): the fork's per-body SPECTRA stages
+   span 1.4k-5.7k bits each (msfb=55 sections -> decodes 10-40x too
+   much spectrum), swallowing entire clusters of validated harvest
+   fragments INSIDE single walk bodies. Positive characterization of
+   the deviation: v2's true payload = many small self-contained
+   bodies (the harvest's ~25/frame); part1's shared-sf_info
+   channel-group layout DOES NOT DESCRIBE v2 7.1 audio.
+2. REFERENCE STREAMS OBTAINED (believer replacement + bonus):
+   - atsc3.ts (ffmpeg trac #8349): v0/v1 broadcast — fork decodes
+     it FULLY (5.5MB wav) = working v0/v1 ground truth for stage
+     diffs.
+   - ac4-ims.ac4 (Chromium media test data): bitstream v2,
+     presentation v2 IMS STEREO — fork decodes 32 frames before
+     'two_channel_data underflow' (output silent lead-in, 57 frames
+     total, ~866B/frame, multi-presentation TOC).
+   FAULT LINE: fork OK on v0/v1 and on v2-stereo-IMS (mostly), noise
+   on v2-7.1 => the deviation is plausibly 7_X-path-specific (or
+   multi-body-layout specific), NOT a global v2 rewrite.
+3. Backward tail pinning: still blocked pending body layout (no hard
+   end anchor exists; fill_bits length is free). Unchanged.
+NEXT: C-level stage log on atsc3 (v0/v1, correct output) vs Tidal
+(v2, noise) for the SAME element types — first field whose size
+computation differs is the deviation. The ims sample's
+multi-presentation TOC also needs the full n_pres loop in
+r511_toc.py before its audio front can be compared.
