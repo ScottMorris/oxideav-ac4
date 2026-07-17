@@ -1434,3 +1434,31 @@ joint field-hypothesis enumeration scored across all 1410 frames
 (a candidate grammar must explain every frame simultaneously;
 cross-frame constancy of config-like fields + landing on validated
 body positions are the score).
+
+## Round 500 (07-17) — ENTROPY MAP: v2 P-frames have NO element structure after bit ~40
+
+Three instruments, one decisive:
+- r500_hdrenum.py: joint header-grammar enumeration (288 layouts x
+  1067 P-frames, scored on cross-frame field sanity). NO winner —
+  discriminators saturated (section-parse passes 99% of anything;
+  msfb reads hit 1-runs).
+- r500_body1.py: semantic body-1 scan at LFE_end+h, h=0..12 vs null
+  h=24..36: FLAT 27% validation at every offset INCLUDING nulls.
+  => r489-style per-body validation has a ~27% false-positive floor;
+  the 54-bodies/frame inventory contains a large phantom fraction
+  (the ridge-regression render survives by downweighting them).
+- PER-BIT-POSITION ENTROPY MAP across 1351 P-frames (the keeper):
+  absolute positions: structure ONLY in bits 16-40 (codec 16-17
+  constant; 18-31 low/partial entropy; ~1.00 from bit 41 to the
+  wall). LFE-END-ALIGNED: entropy 1.00 from E+0 for 120+ bits.
+  CONCLUSIONS: (1) NO coding_config / shared sf_info / chparam /
+  per-body fixed headers exist in v2 P-frames — the TS 103 190-1
+  Table 33 element structure is ABSENT; (2) all fixed per-frame
+  structure fits in ~24 bits (16-40); (3) everything after is one
+  unbroken entropy-coded payload run.
+  OPEN QUESTION for next round: is the bits-18-40 "silent LFE"
+  reading real, or are those 24 structured bits a compact frame
+  table-of-contents (with all payloads packed back-to-back after)?
+  Iframe variant of the map (offset +15) should discriminate; also
+  diff the 24-bit zone against frame-level knowns (frame size,
+  body count, long/short mix) to find what it encodes.
