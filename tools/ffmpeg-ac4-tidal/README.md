@@ -1462,3 +1462,38 @@ Three instruments, one decisive:
   Iframe variant of the map (offset +15) should discriminate; also
   diff the 24-bit zone against frame-level knowns (frame size,
   body count, long/short mix) to find what it encodes.
+
+## Rounds 501-506 (07-17) — THE FRAME DESCRIPTOR: v2's front decoded to the field level; payload coding still unknown
+
+Six-iteration arc on the 24-bit structured zone:
+- R501 bit<->feature correlations: bit22 correlates -0.61 with frame
+  size; no clean integer field => variable-length coding.
+- R501b prefix conditioning (the breakthrough instrument): grouping
+  frames by bits21-25 yields FIVE modes with mode-dependent CONSTANT
+  extensions. Payload start per mode (P-frames): 1111->bit 25,
+  0111->33, 0110->37, 0011->39, 0101->42 (also rare A='000' variant).
+- R502: the "LFE with payload" reading is REFUTED: the non-silent
+  codebook groups decode to all-zero quant in 275/275 frames AND the
+  bits where spectra should vary are constant across frames. The
+  entire "silent LFE" reading of bits 18-40 is now suspect; what is
+  certain is the structure, not its name.
+- R503 modal readout: descriptor = [3b A in {011,000}][4b MODE]
+  [mode-dependent constant extension 0-17 bits].
+- R504 iframe cross-check (CONFIRMATION): iframe bits 33-40 have the
+  IDENTICAL pattern distribution as P-frame bits 18-25 (config sits
+  between codec_mode and descriptor). The descriptor is real,
+  position-exact, and tabled.
+- R505 mode-anchored semantic body scan: FLAT vs nulls — the payload
+  at descriptor-end is NOT a v2 spectral body.
+- R506 A-SPX-at-front probe: parse_tail fits at descriptor-end in 28%
+  of frames vs 81% at +13-bit null — NOT an A-SPX chain either
+  (anti-aligned, if anything).
+
+STATE OF THE WALL: v2 P-frame = [codec_mode 2b][descriptor 9-26b,
+fully tabled] + UNKNOWN entropy-coded payload layer that is neither
+sf_data-shaped nor aspx-shaped at its start. Harvest-validated
+spectral bodies live deeper in the frame (~bit 97+). Next candidate
+instruments: (a) decode believer.mp4 (v0/v1, DECODABLE by the fork)
+and diff its frame-front bit layout against Tidal v2 to identify the
+inserted/changed layer; (b) autocorrelation/grammar-free segmentation
+of the payload region to find its code's symbol statistics.
