@@ -1785,3 +1785,27 @@ NEXT: (a) validate core spectra correlate to kw-ref51 via own IMDCT;
 (b) fix the scalefactor scale so PCM doesn't clip; (c) mop up the
 residual msfb=0 / two_channel_data edge frames; (d) build v12 real
 core render (no synthesis guesswork — actual decoded bed).
+
+## Round 516b (07-17) — core decode VALIDATED AS MUSIC (not noise)
+
+Reference caveat surfaced: kw-ref51.wav is a DIFFERENT MASTER (E-AC-3
+release of the same song), so sample-waveform correlation is a dead
+metric (accuracy-plan already noted "0.03 at every lag"). Validated
+the MSFB5 core decode with master-invariant metrics instead:
+  - avg spectral-envelope shape vs ref: corr 0.83 (right frequency
+    balance, bass-heavy tonal rolloff)
+  - spectral crest (tonality): 65 median (tonal>50, noise 2-10);
+    reference 90 — DECODE IS TONAL, NOT NOISE
+  - pitch-periodicity (time-domain autocorrelation): 0.44 median
+    (pitched>0.3); reference 0.51 — DECODE HAS MUSICAL PITCH
+  - mel-spectrogram corr 0.065 vs 0.056 null — weak (different master
+    + missing A-SPX highband + 167 hole frames), inconclusive but not
+    contradicting.
+Scalefactor magnitude: default v2 sf law blows up 17 orders of
+dynamic range (some frames 1e11 -> int16 clip). AC4_SFSIGNED (8-bit
+two's-complement sf wrap) BOUNDS it to ~3 orders and yields the tonal/
+pitched render above. So v2's scalefactor reference/exponent differs
+from v0/v1 — the last real magnitude bug; SFSIGNED is the working law.
+Delivered: kw_core_v12_sfsigned.wav (60s stereo downmix) for the ear
+test. NEXT: settle exact v2 sf law (vs SFSIGNED approximation); mop up
+msfb=0/two_channel_data edge frames; re-enable A-SPX highband.
