@@ -1632,3 +1632,31 @@ Tool: r511_toc.py. NEXT: parse the presentation substream (10B
 iframe variant may hold per-presentation config); fix the fork's
 v2 TOC path with this map (removes AC4_RAWSUB crutch); resume the
 audio-element wall with ndot ground truth.
+
+## Round 512 (07-17) — element-wall triangulation after the TOC win
+
+- Presentation substream (R511's discovery) parsed by syntax review:
+  it is dialnorm/DRC/custom-downmix/loudness metadata
+  (6.2.2.3 tail) — valuable for playback polish, NOT a gate for the
+  audio element. Deprioritized.
+- All-long-frame reconciliation test NEGATIVE: 19 walk frames report
+  all bodies long; their aspx-tail positions still scatter (gap to
+  wall 1.1k..6.2k bits; one overshoots the wall). The fork's
+  desync is NOT confined to short-transform under-read.
+- Global tail-gap stats (72/194 walk frames that reach aspx):
+  median gap 4999 bits, only 2/194 land in the plausible
+  [200,900] fill window = chance. NO fully-reconciling frames
+  exist under the fork's current v2 grammar.
+CONCLUSION: the v2 deviation lives inside sf_data / sf_info layout
+for ALL transform types (values AND lengths wrong), not in the
+element ordering (front fields through coding_config are proven) and
+not in the TOC (solved). The ~25 validated harvest bodies are best
+explained as fragments of the 8 true sf_datas over-segmented by the
+permissive v2 parse. NEXT INSTRUMENTS: (1) C-level field diff on
+near-reconciling frames (f25/f56-class) — instrument sf_data stages
+and compare against harvest fragment boundaries stage by stage;
+(2) exploit b_audio_ndot ground truth + exact iframe aspx_config to
+constrain the aspx tail from BEHIND the wall on reconciling-ish
+frames; (3) revisit the sf_data grammar against believer (v0/v1)
+C-walk once believer.mp4 is re-obtained — the sf_data DELTA between
+v0/v1 (works) and v2 (fails) is the deviation, by construction.
