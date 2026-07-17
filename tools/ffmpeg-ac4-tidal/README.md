@@ -1357,3 +1357,55 @@ decode frame-specifically. Honest reference-assisted highband (v7-v10
 envelope fill) remains the render path. NEXT: locate real aspx_config
 (start/stop/master_scale) for correct band count + dequant, OR accept
 A-SPX as beyond reach without the QMF master tables.
+
+## Round 498 (07-17) — aspx_config LOCATED AND READ; substream front anchored; LFE-first re-confirmed under CB15
+
+THE CONFIG HUNT ENDED AT BIT 18. Spec archaeology (part1 Table 50 +
+clauses 4.3.10.1.x + Pseudocode 67-70) gave the full aspx_config field
+map and master-table derivation the R496/497 rounds lacked. Then the
+substream front turned out to be deterministic:
+
+- sub*.bin = ac4_substream: [audio_size_value 15][b_more 1][element...].
+  VERIFIED: size15 == filelen minus metadata on every frame. All prior
+  top-down parses that started at bit 0 were 16 bits off.
+- bit 16-17 = 7_X codec_mode: reads ASPX (01) on ALL 1410 frames.
+- iframes (fr%24==0, PROVEN by config-presence: the 15 config bits
+  appear at 18-32 on exactly those 59 frames and the following field
+  re-aligns with P-frame bit 18): aspx_config =
+    quant_mode_env=1 (3dB), start_freq=7, stop_freq=1, master_scale=1
+    => sbg_master=[40,42,44,47,50,53,56], 6 groups, A-SPX = 15-21 kHz;
+    interpolation=1 preflat=1 limiter=1 noise_sbg=3 (n_noise=1),
+    env_bits_fixfix=0 (num_env in {1,2}), freq_res_mode=2
+    (duration-rule freq_res, Pseudocode 77; 16 timeslots).
+  ONE config across all 59 iframes. R496/497 fits used nsb_hi=12 —
+  structurally wrong band count, fully explaining the semantic null.
+- ac4aspx2.py: EXACT A-SPX parser for this config (borders, tsg_ptr,
+  mode-2 freq_res, FIXFIX/1-env qmode override, inter-frame
+  previous_stop, per-block xover). Element tail per Table 33 ASPX mode:
+  aspx_data_2ch, 2ch, 1ch, 2ch (R497 chained only 3 blocks - second
+  structural error). Naive tail-window fits are still ambiguous
+  (multi-fit, xover disagreement) => tail needs a forward anchor, not
+  a search window.
+- LFE-first RE-CONFIRMED: P-frame LFE at bit 18 = msfb=3 (constant
+  across ~1300 frames), one cb=15 no-payload section with overshoot
+  length (round-434 knobs!), ref_sf, snf gate. The LFE is coded
+  SILENT throughout Radioactivity. The immersive_channel_element
+  detour (mode/ACPL reading of the same bits) is dead: part2 Table 73
+  3-bit mode code produced inconsistent iframe/P-frame modes; the
+  2-bit 7_X reading is consistent everywhere.
+- Even/odd metadata cadence discovered: every even frame carries ~85
+  bytes of substream metadata, every odd frame ~4. Audio parse is
+  unaffected (metadata sits after audio_size) but any tool that
+  assumed iframe<->big-metadata is wrong: iframes are %24.
+- THE REMAINING WALL (task #12): the field right after LFE end still
+  histograms uniform across frames (not a sane coding_config). With
+  the front now bit-exact to ~bit 39-52, the deviation window is
+  narrow: suspects are per-body msfb (v2 abandons shared psy_info -
+  consistent with 50k+ validated harvest bodies that all start with
+  their own 5-bit msfb) and chparam/sap bitmap sizing. Next: bit-DP
+  over the [LFE-end .. first-validated-body] window (458 frames have
+  it under 200 bits) solving both hypotheses jointly.
+
+Tools banked: ac4aspx2.py (exact parser), r498_aspxcfg.py,
+r498_cfg7x.py (config extractors), r498_fit.py (tail fitter),
+r498_topdown.py (position-match harness).
