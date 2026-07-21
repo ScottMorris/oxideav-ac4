@@ -1671,10 +1671,14 @@ static int get_side_bits(int transf_length)
     return 3;
 }
 
+static int get_transf_length(AC4DecodeContext *s, SubstreamChannel *ssch, int g, int *idx);
+static int num_sfb_48(int transf_length);
+
 static int get_max_sfb(AC4DecodeContext *s, SubstreamChannel *ssch,
                        int g)
 {
     int idx = 0;
+    int v;
 
     if (s->frame_len_base >= 1536 && (ssch->scp.long_frame == 0) &&
         (ssch->scp.transf_length_idx[0] != ssch->scp.transf_length_idx[1])) {
@@ -1686,10 +1690,17 @@ static int get_max_sfb(AC4DecodeContext *s, SubstreamChannel *ssch,
 
     if ((ssch->scp.side_limited == 1) ||
         (ssch->scp.dual_maxsfb == 1 && ssch->scp.side_channel == 1))  {
-        return ssch->scp.max_sfb_side[idx];
+        v = ssch->scp.max_sfb_side[idx];
     } else {
-        return ssch->scp.max_sfb[idx];
+        v = ssch->scp.max_sfb[idx];
     }
+
+    if (getenv("AC4_MSFBCLAMP")) {
+        int tl = get_transf_length(s, ssch, g, NULL);
+        int ns = num_sfb_48(tl);
+        if (v > ns) v = ns;
+    }
+    return v;
 }
 
 static int get_transf_length(AC4DecodeContext *s, SubstreamChannel *ssch, int g, int *idx)

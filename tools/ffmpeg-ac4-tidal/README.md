@@ -2287,3 +2287,56 @@ RAWSUB path mishandles, or (b) a substream-header field the RAWSUB TOC-bypass
 skips. Use RAWDUMP=<forkframe> + the drift-aware mapping to pull the exact
 bytes of a cb=15 frame and hand-walk the substream header. New env: AC4_RAWDUMP
 (hex dump audio_data of one fork frame), AC4_BODYTRACE/PSY/SPECERR traces.
+
+================================================================================
+R526 — DRIFT RESOLVED (harmless), WRAPPER I-FRAME BUG, CRASH IS max_sfb-DRIVEN.
+================================================================================
+1. FRAME-COUNTER DRIFT IS A HARMLESS +1 OFFSET. Matched the fork's decoded
+   audio_size sequence (WALL trace) against the dumps' audio_size sequence:
+   fork ac4_frame_ctr=k decodes dump[k-1] exactly (f2=dump1, f3=dump2, ...
+   f13=dump12). The ffmpeg AC4 demuxer emits one priming packet; there is NO
+   mis-framing. So RAWDUMP "frame 18" == sub0017.bin. This de-risks all of
+   R523-R525: the fork decodes each real substream correctly, in order.
+
+2. WRAPPER MIS-MARKED I-FRAMES. Real I-frames are every 24 (0,24,48,..., 59
+   total, from the mp4 TOC b_iframe_global). wrap_subs.py used cadence:1024000
+   => only frame 0 marked iframe; 58 real I-frames decoded as P-frames (skips
+   aspx_config, corrupts the persisted A-SPX config for the whole GOP). Rebuilt
+   kw_wrapped_fixed.ac4 with iframes_real.txt (every 24). CORE results identical
+   (248 overread / 526 neverfail) => with AC4_SKIP_ASPX the iframe flag doesn't
+   change the core parse, so the wrapper bug is NOT the core-failure cause (but
+   the fixed wrapper matters for A-SPX-enabled runs — use it going forward).
+
+3. sub0017 (=fork f18, a P-frame) HAND-DECODED FROM BYTE-EXACT BITS yields two
+   spec-VIOLATIONS: LFE first section cb=15 (spec 4.3.6.3.1: 12..15 shall not be
+   used) AND ch0 max_sfb=56 for transf_length=1024 (spec 4.3.6.2.2: max_sfb <=
+   num_sfb=49). Verified nothing hides these: ac4_substream (Table 16) has only
+   audio_size+align before audio_data; audio_data (Table 19) goes straight to
+   7_X_channel_element; codec_mode=01 is unambiguous; the LFE consumes exactly
+   the bits the fork reports (ends rel bit 23). So these violations are REAL in
+   the stream under a byte-exact, Part-1-conformant parse.
+
+4. THE CRASH IS max_sfb-DRIVEN (new AC4_MSFBCLAMP experiment). Clamping
+   get_max_sfb to min(max_sfb, num_sfb_48(transf_length)) cuts hard fails
+   526 -> 239 (more than half) but raises overreads 248 -> 401 (net wrong
+   frames 774 -> 640). So max_sfb>num_sfb is what makes group_offset index the
+   HSF-ext region and crash; but a GLOBAL clamp over-corrects because
+   asf_section_data must read sections up to the FULL max_sfb to stay bit-
+   aligned (spec Table 39 uses full max_sfb; only scalefac/snf Tables 41/42
+   clamp with min(max_sfb,num_sfb_48)).
+
+INTERPRETATION: short/transient blocks in this native-immersive (frame_rate_
+index=13) content genuinely carry max_sfb > num_sfb_48(partial-block) and
+cb in 12..15 — both forbidden by BASE Part 1. Long frames (62%) decode cleanly
+under Part 1, so Part 1 is right for them; the SHORT-BLOCK grammar/semantics in
+the fri=13 profile differ. Leading hypothesis: for a short frame max_sfb may be
+expressed in FULL-block (2048, num_sfb=63) sfb units, not partial-block (1024,
+num_sfb=49) units, so indexing the partial-block sfb_offset table with it is the
+category error; cb=15 may likewise be a profile marker.
+
+R527 TARGET: (a) study Part 2 (TS 103 190-2) for the frame_rate_index=13 /
+native-immersive short-block max_sfb + section-codebook semantics; (b) test the
+"max_sfb in full-block units" hypothesis by mapping the short-frame max_sfb
+through the 2048 sfb grid instead of the partial-block table. New env:
+AC4_MSFBCLAMP (diagnostic: proves the crash is max_sfb-driven), AC4_RAWDUMP.
+Files: iframes_real.txt, kw_wrapped_fixed.ac4 (correct I-frames).
