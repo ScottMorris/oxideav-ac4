@@ -2926,7 +2926,11 @@ static int aspx_framing(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ss
     switch (ssch->aspx_int_class) {
     case FIXFIX:
         if (getenv("AC4_ENV_POW2"))
-            /* war law: aspx_num_env = 1 << tmp, not 1 + tmp */
+            /* SPEC-CORRECT (TS 103 190-1 table 53, FIXFIX case):
+             * aspx_num_env = 1 << tmp_num_env, a power of two (1,2,4,8).
+             * The fork default `1 + tmp` is WRONG and desyncs A-SPX on
+             * this v2 content ("invalid aspx num env: 6/7"). Enabling
+             * this env eliminates all num_env parse errors. */
             ssch->aspx_num_env = 1 << get_bits(gb, 1 + ss->aspx_num_env_bits_fixfix);
         else
             ssch->aspx_num_env = 1 + get_bits(gb, 1 + ss->aspx_num_env_bits_fixfix);

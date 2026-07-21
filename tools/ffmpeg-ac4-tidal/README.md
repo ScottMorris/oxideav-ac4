@@ -1962,3 +1962,52 @@ Followed the sf↔quant pairing. Key refinements:
   quant/scalefactor magnitude decode itself must be fixed. This is genuine
   frontier work — likely needs the v2 codebook/scalefactor spec tables or a
   reference v2 decoder to cross-check.
+
+## Round 520 (07-21) — WE HAVE THE FULL SPEC (both parts). Tiny substream = EMDF; P-frames ruled out; A-SPX num_env is an MSFB5-analog spec bug
+
+Discovered the ETSI spec is LOCAL: ~/Documents/ac4-spec/ has part1 AND part2
+(TS 103 190-1 and -2) PDFs+text+extracted C tables. Used it to answer three
+things definitively:
+
+1. TINY SUBSTREAM (the [10B iframe / 3B P-frame] substream 0, alongside the
+   ~2kB audio substream 1): it is an emdf_payloads_substream with
+   emdf_payload_id = 8 — DYNAMIC METADATA (DRC/loudness/object), grows on
+   I-frames (full config). NOT audio, not our level bug; we ignore it for a
+   clean master decode.
+
+2. P-FRAMES RULED OUT as the core per-frame-level cause:
+   - Part 2 defines NO ASF scalefactor/spectral codebook tables (only A-JOC
+     and A-JCC Huffman). So the core ASF tables are IDENTICAL to Part 1.
+   - Part 2's "amended" elements (its Table 49) are only the WRAPPERS
+     (ac4_toc, ac4_substream, audio_data, metadata); asf_scalefac_data /
+     spectral_data / sf_data / 7_X_channel_element are UNCHANGED.
+   - In the decoder, the core ASF path never uses the iframe flag and
+     sf_info re-reads transform/psy config every frame — no cross-frame
+     inheritance. So P-frame handling cannot explain the jumpy levels.
+   CONTENT re-confirmed by TOC-parsing real v2 mp4 samples (kw-fixedstco.mp4):
+   version=2, b_channel_coded=1, channel_mode 7.1:3/4/0.1 (NOT immersive,
+   NOT A-JOC objects); I-frames every 24; we decode the right substream.
+
+3. HIGHBAND (the "missing high frequencies"): re-enabling A-SPX (no
+   AC4_SKIP_ASPX) fails with "invalid aspx num env: 6/7 (class 3)" on nearly
+   every frame — an INDEPENDENT A-SPX grammar bug (frame 0 core decodes fine
+   but its A-SPX desyncs, so NOT a cascade from the core). Found the exact
+   delta in TS 103 190-1 table 53 (aspx_framing, FIXFIX case):
+     spec:  aspx_num_env = 1 << tmp_num_env   (power of two: 1,2,4,8)
+     fork:  aspx_num_env = 1 + tmp            (1,2,3,4)  <-- WRONG
+   The fork already had this behind AC4_ENV_POW2 mislabeled a "war law"; it
+   is in fact SPEC-CORRECT. AC4_ENV_POW2=1 eliminates ALL num_env errors
+   (pervasive -> 0) and drops hard-fails 141 -> 26; the A-SPX config anchor
+   now lands (nsbgm=6 xover=7 sf=7 st=1 scale=1, plus a 2nd subband anchor).
+   REMAINING: with A-SPX parsing correctly, the A-SPX SYNTHESIS hangs at
+   ~frame 48 (process spins, output stalls) and frames still show ~500-1300
+   bit underreads (an element after A-SPX not consumed). So the highband
+   parse is fixed; next is the A-SPX hfgen/synthesis hang + the trailing
+   underread element.
+
+NET: corrected comment on AC4_ENV_POW2 (spec-correct, not a hack). The core
+per-frame-level bug (R519) is NOT tables and NOT P-frames — it's a residual
+core desync (A-SPX anchor was 6/10; core-only still 141/1410 hard-fails),
+pointing to one more MSFB5-style width delta in the core ASF path. Best next
+move now that the spec is in hand: build a spec-exact ASF parser and diff
+bit positions vs the fork on real frames to localize it.
