@@ -2190,3 +2190,48 @@ first; then diff THAT body's fork reader (asf_spectral_data sign/ext order
 Pseudocode 20, asf_scalefac_data chain, asf_snf_data gating) bit-for-bit vs
 ac4scan.py on the exact frame. Logs banked: specA.log/noaspx.log/msfb5.log/
 w3.log/trace6.log residual histograms.
+
+================================================================================
+R524 — THE DESYNC IS SHORT/TRANSIENT BLOCKS. LONG-FRAME CORE IS CLEAN.
+================================================================================
+Ran R523's per-body bit trace (new AC4_BODYTRACE) on all 1410 real frames,
+core-only (A-SPX skipped), spec-correct (no MSFB5). Instrumented the exact
+spectral failure (new SPECERR dump: long_frame, num_window_groups,
+transf_length, section indices, max_sfb, computed line range).
+
+THE FINDING (decisive, overturns the campaign's "long-frame" assumption):
+  - Every hard body failure is "spectral line range" (sect_end_line > 2048),
+    329 of them. NONE are VLC-decode failures => the BIT POSITION entering
+    spectral is fine; the SECTION-to-LINE OFFSETS are wrong.
+  - ALL 329 failures have long_frame=0 (SHORT / transient blocks), with
+    num_window_groups 2..10 and short transf_length (128/256/512/1024). ZERO
+    long-frame bodies fail.
+  - Body census: long bodies 5831/5831 clean (100%); short bodies 3585 total,
+    329 hard-fail (9%). Short frames are 38% of all bodies.
+  - Of the WALL overreads (genuine over-consumption), 89% involve a short body.
+  => The LONG-FRAME core decode is CORRECT. The entire residual desync (the
+     526 core fails, the jumpy levels, most overreads) is the SHORT-FRAME /
+     transient-block path. Kraftwerk "Radioactivity" is percussive electronic
+     music; the AC-4 encoder switches to transient blocks ~38% of the time, and
+     the fork mishandles multi-window-group spectral offset construction.
+
+Mechanism of the failure: for a short frame asf_psy_elements builds
+sect_sfb_offset[g][sfb] per window group; when the group's max_sfb / sfb table
+interaction is wrong the group_offset accumulates past the 2048 transform, so
+sect_sfb_offset for higher groups exceeds 2048 -> range check fires. Example:
+f18 ch0 long=0 nwg=2 tl0=1024 g=1 msfb=56 -> line 2040..2212 (>2048).
+
+Why MSFB5 "helped": capping max_sfb at 31 (5 bits) keeps max_sfb <= num_sfb for
+the SHORT transforms more often, so group_offset doesn't run past 2048 as often
+=> fewer range failures. It was masking the short-frame offset bug, NOT the
+(correct) long-frame path. Confirmed dead-end: AC4_W3_LONG worse; AC4_SFBCLAMP
+(clamp sect_sfb_offset tail to max_sfb line) worse (646 vs 526) — because the
+real problem is the multi-group construction, not the max_sfb overshoot.
+
+R525 TARGET (sharp): audit the SHORT-FRAME path vs spec — asf_psy_elements
+multi-window-group construction (num_windows, num_window_groups from
+scale_factor_grouping, different_framing window insertion), get_transf_length(g)
+and get_sfb_offset per group, get_max_sfb(g) with the g>=window_to_group[nw0]
+index selection, and the group_offset accumulation. The long-frame path is a
+known-good reference to diff against. New env: AC4_BODYTRACE (per-body + SPECERR
++ WALL residual trace), AC4_SFBCLAMP (tested-worse, kept for the record).

@@ -1986,6 +1986,16 @@ static int asf_psy_elements(AC4DecodeContext *s, Substream *ss,
             ssch->sect_sfb_offset[g][sfb] = group_offset + sfb_offset[sfb] * ssch->scp.num_win_in_group[g];
         group_offset += sfb_offset[max_sfb] * ssch->scp.num_win_in_group[g];
         ssch->sect_sfb_offset[g][max_sfb] = group_offset;
+        /* R524: a section may overshoot max_sfb (section loop runs while
+         * k<max_sfb, last sect_end can exceed it). asf_spectral_data indexes
+         * sect_sfb_offset[sect_end] directly; beyond max_sfb it was stale
+         * garbage -> wrong sect_end_line -> spectral desync/fail. Clamp the
+         * tail to the max_sfb line so an overshooting section reads up to
+         * max_sfb and stops (spec-consistent; replaces the OVERSHOOT_SKIP
+         * band-aid which dropped the whole section). */
+        if (getenv("AC4_SFBCLAMP"))
+            for (int sfb = max_sfb + 1; sfb < 128; sfb++)
+                ssch->sect_sfb_offset[g][sfb] = group_offset;
         for (int sfb = 0; sfb < max_sfb; sfb++) {
             for (int j = ssch->sect_sfb_offset[g][sfb]; j < ssch->sect_sfb_offset[g][sfb+1]; j++) {
                 ssch->offset2sfb[j] = sfb;
@@ -2316,6 +2326,10 @@ static int ssf_data(AC4DecodeContext *s, Substream *ss,
     return ret;
 }
 
+static int ac4_frame_ctr;   /* frame index matching the DUMP_SPEC write order */
+static int ac4_frame_failed;
+static float ac4_last_spec[8][2048];   /* AC4_CONCEAL: last good frame's spectra */
+
 static int asf_section_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch)
 {
     GetBitContext *gb = &s->gbc;
@@ -2442,6 +2456,12 @@ static int asf_spectral_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
             sect_start_line = ssch->sect_sfb_offset[g][ssch->sect_start[g][i]];
             sect_end_line = ssch->sect_sfb_offset[g][ssch->sect_end[g][i]];
             if (sect_end_line > 2048 || sect_start_line < 0 || sect_start_line > sect_end_line) {
+                if (getenv("AC4_BODYTRACE"))
+                    fprintf(stderr, "SPECERR f%d ch%d long=%d nwg=%d tl0=%d g=%d i=%d/%d sstart=%d send=%d msfb=%d cb=%d line=%d..%d\n",
+                            ac4_frame_ctr, (int)(ssch - s->substream.ssch), ssch->scp.long_frame,
+                            ssch->scp.num_window_groups, ssch->scp.transf_length[0], g, i, ssch->num_sec_lsf[g],
+                            ssch->sect_start[g][i], ssch->sect_end[g][i], get_max_sfb(s, ssch, g),
+                            ssch->sect_cb[g][i], sect_start_line, sect_end_line);
                 av_log(s->avctx, AV_LOG_ERROR, "spectral line range %d..%d\n", sect_start_line, sect_end_line);
                 return AVERROR_INVALIDDATA;
             }
@@ -2533,9 +2553,7 @@ static int asf_spectral_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
     return 0;
 }
 
-static int ac4_frame_ctr;   /* frame index matching the DUMP_SPEC write order */
-static int ac4_frame_failed;
-static float ac4_last_spec[8][2048];   /* AC4_CONCEAL: last good frame's spectra */
+/* (ac4_frame_ctr/failed/last_spec moved above asf_section_data) */
 
 static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch)
 {
@@ -2648,25 +2666,48 @@ static int sf_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch,
     int ret;
 
     if (spec_frontend == SF_ASF) {
+        int bt = !!getenv("AC4_BODYTRACE");
+        int p_sect = get_bits_count(&s->gbc), p_spec, p_scf, p_snf, p_end;
         av_log(s->avctx, AV_LOG_TRACE, "AUDIT m=%d g=%d long=%d sect@%d\n",
                get_max_sfb(s, ssch, 0), ssch->scp.num_window_groups,
                ssch->scp.long_frame, get_bits_count(&s->gbc));
         ret = asf_section_data(s, ss, ssch);
-        if (ret < 0)
+        if (ret < 0) {
+            if (bt) fprintf(stderr, "BODY f%d ch%d FAIL=sect start=%d\n",
+                            ac4_frame_ctr, (int)(ssch - s->substream.ssch), p_sect);
             return ret;
+        }
+        p_spec = get_bits_count(&s->gbc);
         av_log(s->avctx, AV_LOG_TRACE, "POS spec@%d\n", get_bits_count(&s->gbc));
         ret = asf_spectral_data(s, ss, ssch);
-        if (ret < 0)
+        if (ret < 0) {
+            if (bt) fprintf(stderr, "BODY f%d ch%d FAIL=spec start=%d sect=%d\n",
+                            ac4_frame_ctr, (int)(ssch - s->substream.ssch), p_sect, p_spec);
             return ret;
+        }
+        p_scf = get_bits_count(&s->gbc);
         av_log(s->avctx, AV_LOG_TRACE, "POS scf@%d\n", get_bits_count(&s->gbc));
         ret = asf_scalefac_data(s, ss, ssch);
-        if (ret < 0)
+        if (ret < 0) {
+            if (bt) fprintf(stderr, "BODY f%d ch%d FAIL=scf start=%d sect=%d spec=%d\n",
+                            ac4_frame_ctr, (int)(ssch - s->substream.ssch), p_sect, p_spec, p_scf);
             return ret;
+        }
+        p_snf = get_bits_count(&s->gbc);
         av_log(s->avctx, AV_LOG_TRACE, "POS snf@%d\n", get_bits_count(&s->gbc));
         ret = asf_snf_data(s, ss, ssch);
-        if (ret < 0)
+        if (ret < 0) {
+            if (bt) fprintf(stderr, "BODY f%d ch%d FAIL=snf start=%d sect=%d spec=%d snf=%d\n",
+                            ac4_frame_ctr, (int)(ssch - s->substream.ssch), p_sect, p_spec, p_scf, p_snf);
             return ret;
+        }
+        p_end = get_bits_count(&s->gbc);
         av_log(s->avctx, AV_LOG_TRACE, "POS end@%d\n", get_bits_count(&s->gbc));
+        if (bt)
+            fprintf(stderr, "BODY f%d ch%d long=%d nwg=%d msfb=%d sect@%d spec@%d scf@%d snf@%d end@%d\n",
+                    ac4_frame_ctr, (int)(ssch - s->substream.ssch), ssch->scp.long_frame,
+                    ssch->scp.num_window_groups,
+                    get_max_sfb(s, ssch, 0), p_sect, p_spec, p_scf, p_snf, p_end);
     } else {
         ret = ssf_data(s, ss, ssch, iframe);
     }
@@ -3995,6 +4036,10 @@ static int channel_element_7x(AC4DecodeContext *s, int channel_mode, int iframe)
             acpl_config_1ch(s, ss, ACPL_FULL);
     }
 
+    if (getenv("AC4_BODYTRACE"))
+        fprintf(stderr, "CE7 f%d cm=%d pos_after_cfg=%d\n",
+                ac4_frame_ctr, ss->codec_mode, get_bits_count(gb));
+
     if (channel_mode == 6) {
         ret = mono_data(s, ss, &ss->ssch[7], 1, iframe);
         if (ret < 0)
@@ -4006,6 +4051,9 @@ static int channel_element_7x(AC4DecodeContext *s, int channel_mode, int iframe)
         companding_control(s, ss, 5);
 
     ss->coding_config = get_bits(gb, 2);
+    if (getenv("AC4_BODYTRACE"))
+        fprintf(stderr, "CE7 f%d cc=%d pos=%d\n",
+                ac4_frame_ctr, ss->coding_config, get_bits_count(gb));
     av_log(s->avctx, AV_LOG_DEBUG, "7x coding_config: %d\n", ss->coding_config);
     switch (ss->coding_config) {
     case 0:
@@ -4699,6 +4747,9 @@ static int ac4_substream(AC4DecodeContext *s, SubstreamInfo *ssinfo)
 
     align_get_bits(gb);
     consumed = (get_bits_count(gb) >> 3) - offset;
+    if (getenv("AC4_BODYTRACE"))
+        fprintf(stderr, "WALL f%d consumed=%d size=%d resid=%d\n",
+                ac4_frame_ctr, consumed, audio_size, consumed - audio_size);
     if (consumed > audio_size) {
         av_log(s->avctx, AV_LOG_ERROR, "substream audio data overread: %d\n", consumed - audio_size);
         if (!getenv("AC4_NEVER_FAIL"))
