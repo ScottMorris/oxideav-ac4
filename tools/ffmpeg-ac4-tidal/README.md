@@ -1930,3 +1930,35 @@ Diagnostic knobs added (all env-gated, banked in ac4dec.c): AC4_SFFLAT
 (now takes a limit, saturates over-ranged sfbs), AC4_ESCCAP=<n> (logs/rejects
 long escape runs). STATUS: framing proven; quant values proven (escape geo);
 sf value-origin settled (ref_sf useless); NEW frontier = sf↔quant pairing.
+
+### R519b addendum — escapes aren't the driver; it's large-quant + insufficient gain compensation
+
+Followed the sf↔quant pairing. Key refinements:
+- corr(sf-ref, log quant) ≈ 0 in both v0/v2, but v2's regression SLOPE is
+  steep (-9 sf-steps/quant-octave vs v0's -0.1): gains do move with quant,
+  but noisily.
+- The real structural difference: v2 uses LARGE quant coefficients heavily
+  (max_quant_idx>100 in 909 bands) vs v0 almost never (6 bands). v2 codes
+  loud bands as big-quant + a strongly-negative sf (escape band mean rel
+  -46 → gain 2^-11.5). v0 keeps quant tiny (rel ~-3).
+- Escape decode is NOT the main culprit: capping escape values (ESCCAP=1,
+  peak quant 123876→251) drops frame jump only 0.77→0.60 — still 3× atsc's
+  0.23. The geometric N_ext distribution only proves the post-trigger bits
+  are random, NOT that escapes fire legitimately, but capping shows their
+  magnitude isn't what's breaking the level.
+- CONCLUSION: v2's big-quant bands reconstruct ~25000× louder than normal
+  bands within a frame (net ~2000 vs ~0.08); which bands are "big" changes
+  frame-to-frame → the 0.6-0.8 decade energy jumps. For smooth output the
+  gain on big-quant bands needs to be ~22 steps MORE negative than we
+  compute (rel ~-68, not -46). So the gain OFFSET/exponent in the large-
+  negative-rel regime, or an sf floor clamp (sf can't go below 0 when ref
+  is low), is the suspect. NEXT: check whether escape-band sf is hitting
+  the 0 floor, and whether v2 sf validity range extends below 0.
+
+- CAVEAT for renders: outlier-clamping cannot rescue this. Per-frame robust
+  net-magnitude clamp (cap |coef| at K× frame median) only moves the jump
+  0.74→0.47 even at K=10 — the level error is in the BULK per-frame energy,
+  not a few outliers. No post-hoc render trick yields clean audio; the v2
+  quant/scalefactor magnitude decode itself must be fixed. This is genuine
+  frontier work — likely needs the v2 codebook/scalefactor spec tables or a
+  reference v2 decoder to cross-check.

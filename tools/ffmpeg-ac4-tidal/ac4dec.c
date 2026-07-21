@@ -2569,17 +2569,14 @@ static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
                     if (sfdump) {
                         FILE *fp = fopen(sfdump, "a");
                         if (fp) {
-                            fprintf(fp, "%d %d %d %d %d %d %d %d %d %d %d %d\n",
+                            fprintf(fp, "%d %d %d %d %d %d %d %d %d\n",
                                     ac4_frame_ctr,
                                     (int)(ssch - s->substream.ssch),
                                     g, sfb,
                                     had_first ? ssch->dpcm_sf[g][sfb] : -1,
                                     scale_factor, ssch->scale_factor_ref,
                                     ssch->sfb_cb[g][sfb],
-                                    ssch->scp.num_window_groups,
-                                    ssch->scp.long_frame,
-                                    ssch->scp.transf_length[0],
-                                    ssch->scp.transf_length[1]);
+                                    ssch->max_quant_idx[g][sfb]);
                             fclose(fp);
                         }
                     }
