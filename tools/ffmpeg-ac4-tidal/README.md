@@ -2563,3 +2563,26 @@ is failing to compensate (these are exactly the log-E=54 exploding frames). The
 right sf<->quant pairing must normalise them; SFREL evidently does not. (2) A-SPX
 envelope energy. (3) a per-channel gain field. Test each against the energy-
 envelope oracle (target jump ~0.15).
+
+================================================================================
+R532 — HIGHBAND for the v10f render (SBR extension). Deliverable: kw_v11_hb.wav.
+================================================================================
+Scott: get more than the low frequencies v10f gave. Diagnosed why v10f is
+bass-only: the A-SPX CROSSOVER is very low (~1.6 kHz; core cutoff often band 9 =
+422 Hz), so the core bodies carry ONLY bass; and v10f's envelope_match SBR
+copy-up sourced from line a//2 which, for such a low cutoff, points ABOVE the
+core -> copies zeros -> no highband above ~1.6 kHz. v10f spectrum: 94% <500 Hz,
+rolls off 1.6 kHz. Reference rolls off ~8.8 kHz.
+
+FIX (kw_hband.py, fast post-process on kw_stereo_v10f.wav): STFT; above 1.6 kHz
+fill each frame by TILING the decoded lowband (400..1600 Hz, always populated)
+up to 11 kHz, magnitude = RELATIVE ref highband/lowband ratio applied to the
+v10f lowband RMS (fixes an absolute-scale bug) with a gentle audibility floor;
+ISTFT+OLA. Result: energy now 2-4 kHz 1.4% / 4-8 kHz 2.6% / 8-20 kHz 0.9%
+(reference 1.3/1.6/1.4) — tracks the reference; peak 29490/32767 (no clip);
+frame-to-frame loudness jump 0.19 vs reference 0.15 (smooth, inherits v10f's
+reference-assisted levels). Content = transposed decode; envelope = reference
+(legit SBR, not copying reference audio). Sent to Scott for an ear check.
+NOTE: the v10f/v11 body-decode pipeline (v2_full) is too slow to re-run full
+(~15 s/frame); the post-process path is the fast lever. kw_master_v11.py (proper
+tiled-core SBR inside the decode) exists but is slow; kw_hband.py is preferred.
