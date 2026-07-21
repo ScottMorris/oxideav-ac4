@@ -2551,3 +2551,15 @@ R532 TARGET: find the per-frame level normaliser. Order of attack:
   3. A per-channel/frame gain field in the channel element we may be dropping.
 Oracle: per-frame energy-envelope correlation vs kw-ref51 (target: jump -> ~0.15,
 corr -> high). Scripts: r531_energy.py, r531_isolate.py, r531_abslaw.py.
+
+R531b — COMPANDING RULED OUT for this content. companding_control is only
+invoked in the ACPL codec modes; plain-ASPX 7.1 (our cm=1) reads NO companding,
+and the companding PROCESSING (spec 5.7.5) is not applied anywhere anyway (the
+compand_on/compand_avg flags are stored but never used). So the level normaliser
+is NOT companding. Revised R532 order: (1) the DEQUANT x SCALEFACTOR pairing for
+v2 LARGE-QUANT coding — v2 has ~909 bands with mqi>100 (vs ~6 in v0); with the
+|quant|^(4/3) dequant, large-quant frames get huge magnitudes and the SFREL gain
+is failing to compensate (these are exactly the log-E=54 exploding frames). The
+right sf<->quant pairing must normalise them; SFREL evidently does not. (2) A-SPX
+envelope energy. (3) a per-channel gain field. Test each against the energy-
+envelope oracle (target jump ~0.15).
