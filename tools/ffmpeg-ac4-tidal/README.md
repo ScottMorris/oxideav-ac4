@@ -2470,3 +2470,43 @@ implementation) to diff the transient-block bitstream against; (b) reverse-
 engineer the transient max_sfb semantics empirically from the wall constraint
 (brute-force per-frame the max_sfb interpretation that makes the WHOLE core
 consume exactly audio_size). New env: AC4_LFEPLUS1 (diagnostic, refuted).
+
+================================================================================
+R530 — THE E-AC-3 REFERENCE IS A WEAK (DIFFERENT-MASTER) ORACLE.
+================================================================================
+Per Scott: use the E-AC-3 5.1 reference (kw-ref51.wav) as an audio oracle to
+reverse-engineer the transient grammar. Built a per-frame 48-band log-energy
+correlator (jointbest-style, batched-FFT reference analysis) and characterized
+the oracle rigorously (r530_band3/tight/shuf.py).
+
+FINDINGS:
+- Best pairing: AC-4 ch3 vs ref ch1, mean band-corr ~0.47-0.52 on long frames.
+- Aligned (true time) vs SHUFFLED (random ref time) = 0.466 vs 0.393. The real
+  time-signal above the spectral-tilt baseline is only +0.073.
+- => the tracks ARE the same performance (real time-correlation exists) but a
+  DIFFERENT MASTER (a same-master ref would give ~0.8+). The +0.073 signal is
+  too weak for clean per-frame discrimination between grammar interpretations.
+- Long vs short/fail frames barely separate (0.43 vs 0.41 tight lag) because
+  concealed transients repeat a real long frame's spectra (contamination).
+- IMPORTANT SIDE FINDING: even the CLEAN long frames only weakly correlate
+  (0.47, +0.07 over baseline). If the long-frame decode were high fidelity vs a
+  same-performance master it would score higher. So decode FIDELITY is limited
+  even where the grammar parses cleanly (matches R519's level wall + the clicks
+  Scott heard) — the transient grammar is NOT the only fidelity gap.
+
+USABILITY: the oracle is unusable for single-frame grammar cracking, but the
++0.073 signal IS usable IN AGGREGATE: averaged over hundreds of transient
+frames, per-frame noise (~0.1) reduces as 1/sqrt(n), so two candidate decodes
+whose true signals differ by >=0.03 are distinguishable at many-sigma. So the
+path is candidate RANKING, not per-frame search.
+
+R531 PLAN: (a) implement 2-3 clean transient max_sfb candidates in the fork
+(offclamp, force-long, 2048-grid); decode each WITHOUT conceal so transients
+carry the candidate's own spectra; (b) score each by aggregate aligned-minus-
+shuffled band-corr on the transient frame set; pick the winner. (c) Separately,
+revisit long-frame level fidelity (SFREL) with the same aggregate oracle, since
+even long frames underperform. OPEN QUESTION FOR SCOTT: is the E-AC-3 the SAME
+master as the AC-4 or a different one? If same-master, 0.47 means the decode
+(even long frames) is substantially wrong and level fidelity is the priority;
+if different-master, 0.47 is near the ceiling and the oracle stays weak.
+Scripts: r530_corr.py, r530_band3.py, r530_tight.py, r530_shuf.py.
