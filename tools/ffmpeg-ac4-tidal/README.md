@@ -2340,3 +2340,47 @@ native-immersive short-block max_sfb + section-codebook semantics; (b) test the
 through the 2048 sfb grid instead of the partial-block table. New env:
 AC4_MSFBCLAMP (diagnostic: proves the crash is max_sfb-driven), AC4_RAWDUMP.
 Files: iframes_real.txt, kw_wrapped_fixed.ac4 (correct I-frames).
+
+================================================================================
+R527 — cb=15 IS A RED HERRING; max_sfb IS LIKELY IN FULL-BLOCK (2048) UNITS.
+================================================================================
+Chased the short-frame max_sfb=56 anomaly to a strong, evidence-backed
+hypothesis and cleared two suspects.
+
+CLEARED:
+1. Part 2 (TS 103 190-2) REUSES Part 1's ASF grammar verbatim (its element
+   table lists asf_transform_info..asf_snf_data, sf_info*, as "defined in
+   TS 103 190-1"). So there is NO separate short-block grammar; max_sfb=56
+   violates BOTH parts. num_sfb(1024)=49 confirmed from spec Table B.1 (the
+   fork's num_sfb_48 table is exactly right).
+2. cb=15 in the LFE is a RED HERRING. Strict mode (no CB15) fails 1407/1410 —
+   because the LFE carries cb=15 on ~73% of ALL frames (long and short). But
+   WITH CB15 tolerating it (skip spectral+scalefac), the 62% long frames decode
+   CLEANLY — which proves the fork's cb=15 handling yields CORRECT bit
+   alignment. So cb 12..15 is a real, valid element in this content and is NOT
+   the desync; the desync is specifically ch0/main-channel max_sfb on SHORT
+   frames.
+
+THE CLUE (short-frame max_sfb distribution, 11604 PSY groups):
+  - 9920/11604 (85.5%) already have max_sfb <= num_sfb(partial) — valid.
+  - 1684 (14.5%) exceed it; excess spread 1..27 (NOT a constant offset).
+  - max_sfb NEVER exceeds 63 = num_sfb(2048), the FULL block.
+  => max_sfb is read as 6 bits on the 0..63 FULL-BLOCK (2048) sfb grid, but the
+     fork maps it through the PARTIAL-BLOCK (1024/512/256/128) sfb_offset table.
+     When the full-grid value exceeds the partial table's num_sfb it indexes the
+     HSF-extension tail -> group_offset past 2048 -> crash. That is the whole
+     bug, and it is short-frame-only because long frames use the 2048 table
+     natively (so their max_sfb<=63 always fits).
+
+Band-aid clamps (not fixes): AC4_MSFBCLAMP (global clamp) 526->239 hard fails
+but 248->401 overreads; AC4_OFFCLAMP (offset-geometry-only clamp, section_data
+reads full max_sfb) 526->266 / 248->381. Both stop the crash but leave
+over-consumption because section_data still reads the full (too-large) max_sfb.
+The real fix must reinterpret max_sfb, not clamp it.
+
+R528 TARGET: test the full-block-units hypothesis directly — for short frames
+map the max_sfb / section boundaries through the FULL 2048 sfb grid (num_sfb=63,
+sfb_offset_48khz_2048), then derive per-partial-window line offsets from that,
+instead of indexing the partial-block table with a full-grid max_sfb. If correct
+this recovers the ~38% short/transient frames AND removes the overreads. New
+env: AC4_OFFCLAMP (diagnostic). Scripts: r527_probe.py.

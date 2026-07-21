@@ -2003,10 +2003,25 @@ static int asf_psy_elements(AC4DecodeContext *s, Substream *ss,
             av_log(s->avctx, AV_LOG_ERROR, "max_sfb=%d > sfb_max_size=%d\n", max_sfb, sfb_max_size);
             return AVERROR_INVALIDDATA;
         }
-        for (int sfb = 0; sfb < max_sfb; sfb++)
-            ssch->sect_sfb_offset[g][sfb] = group_offset + sfb_offset[sfb] * ssch->scp.num_win_in_group[g];
-        group_offset += sfb_offset[max_sfb] * ssch->scp.num_win_in_group[g];
-        ssch->sect_sfb_offset[g][max_sfb] = group_offset;
+        /* R527: for the OFFSET geometry only, bound max_sfb to num_sfb_48 so an
+         * out-of-range (short-block, fri=13) max_sfb doesn't index the
+         * HSF-extension tail of sfb_offset (which pushes group_offset past the
+         * 2048 transform and crashes spectral). section_data still reads the
+         * FULL max_sfb (its bit consumption is unchanged), so alignment holds;
+         * only the sfb->line mapping is capped. Every sfb>=eff_max maps to the
+         * transform end line. */
+        {
+            int eff_max = max_sfb;
+            if (getenv("AC4_OFFCLAMP")) {
+                int ns = num_sfb_48(transf_length_g);
+                if (eff_max > ns) eff_max = ns;
+            }
+            for (int sfb = 0; sfb < eff_max; sfb++)
+                ssch->sect_sfb_offset[g][sfb] = group_offset + sfb_offset[sfb] * ssch->scp.num_win_in_group[g];
+            group_offset += sfb_offset[eff_max] * ssch->scp.num_win_in_group[g];
+            for (int sfb = eff_max; sfb <= max_sfb; sfb++)
+                ssch->sect_sfb_offset[g][sfb] = group_offset;
+        }
         /* R524: a section may overshoot max_sfb (section loop runs while
          * k<max_sfb, last sect_end can exceed it). asf_spectral_data indexes
          * sect_sfb_offset[sect_end] directly; beyond max_sfb it was stale
