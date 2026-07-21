@@ -2510,3 +2510,44 @@ master as the AC-4 or a different one? If same-master, 0.47 means the decode
 (even long frames) is substantially wrong and level fidelity is the priority;
 if different-master, 0.47 is near the ceiling and the oracle stays weak.
 Scripts: r530_corr.py, r530_band3.py, r530_tight.py, r530_shuf.py.
+
+================================================================================
+R531 — THE DOMINANT PROBLEM IS PER-FRAME LEVEL, AND IT IS NOT IN THE SCALEFACTORS.
+================================================================================
+Scott: E-AC-3 "sounds pretty much the same, uses the surround field" => same/very
+close performance. Used the reference to attack LEVEL fidelity (the R519 wall +
+the clicks), since even clean long frames only weakly correlate (R530).
+
+MEASUREMENTS (per-frame log-energy envelope, decode vs kw-ref51):
+- Decode frame-to-frame |d logE| = 4.18 (all) / 5.80 (CLEAN-long consecutive) vs
+  reference 0.15. Clean-long energy spread p10..p90 = 16.8 nats = ~20,000,000x
+  swing. So the levels are essentially RANDOM per frame, and it is NOT a
+  concealment artifact — clean long frames are just as bad (worse).
+- SFREL energy-envelope corr vs ref = +0.030 (jump 5.11).
+- ABSOLUTE law (+0.5*ln2*ref_sf, i.e. don't cancel ref_sf) = +0.031 but jump
+  EXPLODES to 37.59 (confirms R519 "signed law explodes").
+- ref_sf alone vs ref energy = +0.001. ref_sf is DEFINITIVELY not loudness.
+
+KEY CLUE: the reference's per-frame loudness is nearly CONSTANT (jump 0.15). So
+the TRUE decode should have near-constant per-frame MDCT energy (normalised),
+and our wild 5.80 swing is the error. Neither scalefactor law (relative SFREL nor
+absolute) produces constant energy => the per-frame LEVEL NORMALISATION is NOT
+carried by the core scalefactors. It lives elsewhere: A-SPX envelope energy,
+the companding tool (per-QMF-slot gain we are NOT applying), a per-frame/channel
+global gain field, or the DRC/loudness EMDF metadata (the tiny substream).
+
+STRATEGIC REFRAME: the transient-block grammar (R524-R529) is a SECONDARY gap.
+The PRIMARY blocker to any listenable render is that per-frame levels are random.
+Even a perfect core+transient decode sounds like clicks/silence without the level
+normalisation. Fix level first.
+
+R532 TARGET: find the per-frame level normaliser. Order of attack:
+  1. COMPANDING — companding_control is parsed but the QMF-domain companding
+     PROCESSING (attenuate high-energy / boost low-energy slots, spec 5.7.5) is
+     likely not applied; it directly reshapes per-frame energy. Check if the
+     synthesis path applies it.
+  2. A-SPX envelope energy (aspx_data) — sets sub-band energies; skipped in
+     core-only runs. Enable and re-measure the energy envelope.
+  3. A per-channel/frame gain field in the channel element we may be dropping.
+Oracle: per-frame energy-envelope correlation vs kw-ref51 (target: jump -> ~0.15,
+corr -> high). Scripts: r531_energy.py, r531_isolate.py, r531_abslaw.py.
