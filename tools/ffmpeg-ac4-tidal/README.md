@@ -2384,3 +2384,44 @@ sfb_offset_48khz_2048), then derive per-partial-window line offsets from that,
 instead of indexing the partial-block table with a full-grid max_sfb. If correct
 this recovers the ~38% short/transient frames AND removes the overreads. New
 env: AC4_OFFCLAMP (diagnostic). Scripts: r527_probe.py.
+
+================================================================================
+R528 — THE "SHORT FRAMES" ARE MISIDENTIFIED LONG FRAMES (a +1-bit desync).
+================================================================================
+Refuted R527's full-block hypothesis (dimensionally: idx0=idx1=3 is two SEP-
+ARATE 1024 windows = 2048 lines; max_sfb=56 fits neither 1024 (49) nor 2048
+(63)-per-window, and sections extend to band 56 WITH spectral data, impossible
+for a 1024 window). The only consistent explanation: these are LONG frames read
+1 bit early so long_frame(=1) is misread as 0.
+
+CONFIRMED with a full ffmpeg-free decoder (r528_lfe.py): decode the LFE body
+completely (sections+spectral+scalefac+snf via the validated ac4scan parsers),
+read coding_config (cc-aware: +1 mode_2ch bit only for cc==0), then read ch0's
+transform_info at two positions. Result over 1410 dumps:
+  - shifting ch0 by +1 bit turns a failing 'short' (long=0, max_sfb>num_sfb)
+    into a VALID LONG header (long=1, max_sfb<=63) for 111 frames, plus 34 more
+    into a valid short; only 27 unfixed. So ~84% of failing frames are recovered
+    by a single +1-bit shift, and the majority are actually LONG frames.
+  - spread across ALL coding_config values (cc 0/1/2/3), so NOT the mode_2ch
+    artifact (that only affects cc==0, which is modelled).
+This is a REAL fork bug, not a model artifact: for sub0017 (=fork f18) the fork
+and the hand-decode AGREE on ch0's position (both long=0, max_sfb=56, same bit),
+so the +1 correction applies to the fork identically. hand-decode: shifting +1
+gives long_frame=1, max_sfb=63 (valid for 2048).
+
+=> The whole "38% short/transient blocks" picture (R524) is largely WRONG. Most
+of those are LONG frames desynced by a data-dependent 1-bit UNDER-consumption
+somewhere between codec_mode and ch0's sf_info — a grammar element that BOTH the
+fork AND ac4scan.py miss (they share the grammar). It is NOT: spectral/scalefac
+(most fix+1 frames are cb=15-only LFEs with no spectral), the snf bit (fix+1
+occurs with snf=0 and snf=1), or simply +1 per cb>=12 section (that fixes only
+~24). The missing bit is in the LFE body path or the codec_mode..coding_config
+region and is triggered by specific LFE content.
+
+R529 TARGET: pin the exact 1-bit element. Approach: for a set of fix+1 frames vs
+clean frames, bit-diff the LFE body decode (codec_mode -> LFE mono_data ->
+coding_config) against the byte-exact stream to find the one element whose true
+length is 1 bit more than the fork/ac4scan read. Candidates: an LFE
+companding/mode flag not read in ASPX mode; a cb 12..15 section carrying a 1-bit
+marker under some condition; or a snf/scalefac gating subtlety for max_quant_
+idx==0 sections. Scripts: r528_lfe.py, r527_probe.py.
