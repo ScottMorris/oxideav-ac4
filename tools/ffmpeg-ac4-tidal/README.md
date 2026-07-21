@@ -2235,3 +2235,55 @@ and get_sfb_offset per group, get_max_sfb(g) with the g>=window_to_group[nw0]
 index selection, and the group_offset accumulation. The long-frame path is a
 known-good reference to diff against. New env: AC4_BODYTRACE (per-body + SPECERR
 + WALL residual trace), AC4_SFBCLAMP (tested-worse, kept for the record).
+
+================================================================================
+R525 — HAND-VERIFIED THE SHORT-FRAME OVERFLOW + FOUND A FRAME-COUNTER DRIFT.
+================================================================================
+Drilled into the R524 short-frame failures with a raw-bit hand-decode and a
+direct (ffmpeg-free) dump decoder.
+
+1. MECHANISM PINNED (spec-checked). For a failing short body the group offset
+   accumulation `group_offset += sfb_offset[max_sfb] * num_win_in_group[g]`
+   (spec Pseudocode 4, fork matches EXACTLY) indexes sfb_offset[max_sfb] with
+   max_sfb > num_sfb_48(transf_length). The short sfb_offset tables include
+   HIGH-SAMPLING-FREQ EXTENSION bands beyond num_sfb (e.g. sfb_offset_48khz_1024
+   has 74 entries running to 4096; index 49 = 1024 is the real transform end).
+   So sfb_offset[56] returns an HSF-ext value (1920) instead of 1024 => group 1
+   offsets exceed 2048 => "spectral line range" crash. The guard uses
+   get_sfb_size (table length 74) instead of num_sfb_48 (49), so it never fires.
+
+2. max_sfb=56 IS SPEC-INVALID. Spec 4.3.6.2.2: max_sfb <= num_sfb. For a 1024
+   transform num_sfb=49, so 56 is impossible in a well-formed block => the parse
+   is already desynced by the time it reads ch0's max_sfb. Hand-decoded a fork
+   frame from raw bits: codec_mode=1, LFE(max_sfb=3), coding_config=1,
+   transform_info(long=0, idx0=idx1=3 -> 1024), max_sfb=111000=56 ALL land at
+   self-consistent bit positions, and the LFE's first section reads cb=15 —
+   which spec 4.3.6.3.1 says "shall not be used" (12..15 are not codebooks).
+   So the desync originates AT/BEFORE the LFE body, which is parsed first on
+   every frame and cascades. Unifies the two symptoms: long frames (num_sfb=63)
+   absorb a small wrong max_sfb silently (=> R519 jumpy levels); short frames
+   (num_sfb<=49) overflow and hard-crash.
+
+3. FRAME-COUNTER DRIFT (methodological, important for R526). The fork's
+   ac4_frame_ctr does NOT equal the dump index: RAWDUMP of "frame 18" showed
+   bytes 5f d7 f8..., but kw_wrapped.ac4 frame 18 == sub0018.bin (0b b2 5d...,
+   verified byte-exact, wrapper faithful). So the ffmpeg AC4 demuxer / counter
+   re-frames; per-frame hand-comparisons MUST use the actual RAWDUMP bytes, not
+   subNNNN.bin. (Aggregate R523/R524 stats are unaffected — they are the fork's
+   own decode of the real wrapped substreams.)
+
+4. Direct ffmpeg-free dump decoder (r525_direct.py) confirms the anomalies are
+   REAL, not a demuxer artifact (cb=15 appears in the raw dump bits). But that
+   toy decoder lacks iframe/aspx_config + full substream-header handling, so its
+   73% cb=15 rate overshoots the fork's true 38% short-frame rate — it is NOT a
+   reliable oracle. The FORK remains the reference (62% clean long frames prove
+   its substream/LFE model is right for the majority).
+
+R526 TARGET: find why the LFE body parse yields an invalid cb (12..15) on the
+failing frames while it is correct on the 62% clean ones. The LFE structure is
+fixed (codec_mode(2) -> [aspx_config if iframe] -> LFE mono_data: max_sfb(3) +
+sf_data), so the divergence is either (a) an iframe/aspx_config length the
+RAWSUB path mishandles, or (b) a substream-header field the RAWSUB TOC-bypass
+skips. Use RAWDUMP=<forkframe> + the drift-aware mapping to pull the exact
+bytes of a cb=15 frame and hand-walk the substream header. New env: AC4_RAWDUMP
+(hex dump audio_data of one fork frame), AC4_BODYTRACE/PSY/SPECERR traces.

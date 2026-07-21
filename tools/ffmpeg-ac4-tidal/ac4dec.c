@@ -1929,6 +1929,10 @@ static int num_sfb_48(int transf_length)
     return 0;
 }
 
+static int ac4_frame_ctr;   /* frame index matching the DUMP_SPEC write order */
+static int ac4_frame_failed;
+static float ac4_last_spec[8][2048];   /* AC4_CONCEAL: last good frame's spectra */
+
 static int asf_psy_elements(AC4DecodeContext *s, Substream *ss,
                             SubstreamChannel *ssch, int n_grp_bits)
 {
@@ -1978,6 +1982,12 @@ static int asf_psy_elements(AC4DecodeContext *s, Substream *ss,
         }
 
         max_sfb = get_max_sfb(s, ssch, g);
+        if (getenv("AC4_BODYTRACE") && ssch->scp.long_frame == 0)
+            fprintf(stderr, "PSY f%d ch%d long=%d nwg=%d nwin=%d idx0=%d idx1=%d g=%d tlg=%d nwing=%d sfbmax=%d msfb=%d go=%d\n",
+                    ac4_frame_ctr, (int)(ssch - s->substream.ssch), ssch->scp.long_frame,
+                    ssch->scp.num_window_groups, ssch->scp.num_windows,
+                    ssch->scp.transf_length_idx[0], ssch->scp.transf_length_idx[1],
+                    g, transf_length_g, ssch->scp.num_win_in_group[g], sfb_max_size, max_sfb, group_offset);
         if (max_sfb > sfb_max_size) {
             av_log(s->avctx, AV_LOG_ERROR, "max_sfb=%d > sfb_max_size=%d\n", max_sfb, sfb_max_size);
             return AVERROR_INVALIDDATA;
@@ -2325,10 +2335,6 @@ static int ssf_data(AC4DecodeContext *s, Substream *ss,
 
     return ret;
 }
-
-static int ac4_frame_ctr;   /* frame index matching the DUMP_SPEC write order */
-static int ac4_frame_failed;
-static float ac4_last_spec[8][2048];   /* AC4_CONCEAL: last good frame's spectra */
 
 static int asf_section_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch)
 {
@@ -4741,6 +4747,17 @@ static int ac4_substream(AC4DecodeContext *s, SubstreamInfo *ssinfo)
 
     offset = get_bits_count(gb) >> 3;
     av_log(s->avctx, AV_LOG_TRACE, "POS audio start@%d size=%d bits\n", get_bits_count(gb), audio_size * 8);
+    {
+        const char *rd = getenv("AC4_RAWDUMP");
+        if (rd && ac4_frame_ctr == atoi(rd)) {
+            const uint8_t *buf = gb->buffer + offset;
+            fprintf(stderr, "RAWDUMP f%d offset=%d iframe=%d cm=%d audio_size=%d bytes:",
+                    ac4_frame_ctr, offset, ssinfo->iframe[0], ssinfo->channel_mode, audio_size);
+            for (int i = 0; i < 48 && offset + i < (int)(gb->size_in_bits >> 3); i++)
+                fprintf(stderr, " %02x", buf[i]);
+            fprintf(stderr, "\n");
+        }
+    }
     ret = audio_data(s, ssinfo->channel_mode, ssinfo->iframe[0]);
     if (ret < 0)
         return ret;
