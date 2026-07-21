@@ -2425,3 +2425,48 @@ length is 1 bit more than the fork/ac4scan read. Candidates: an LFE
 companding/mode flag not read in ASPX mode; a cb 12..15 section carrying a 1-bit
 marker under some condition; or a snf/scalefac gating subtlety for max_quant_
 idx==0 sections. Scripts: r528_lfe.py, r527_probe.py.
+
+================================================================================
+R529 — HONEST CORRECTION: R528's +1-bit theory is REFUTED. Short frames are real.
+================================================================================
+Rigorously re-tested the R528 "+1 bit fixes misidentified long frames" claim
+using the FORK as oracle (not the weak header check R528 relied on, whose
+coincidental pass rate is ~37%).
+
+TESTS:
+1. Global +1 bit skip after the LFE (new AC4_LFEPLUS1): neverfail 526->496,
+   overread 248->227. Only net +30 frames — tiny.
+2. Frame-set diff of that +1: it RECOVERS 325 frames but BREAKS 295. That is
+   CHURN (nearly 50/50), not a localized fix.
+3. Correlated recover-vs-break against LFE features: NULL result —
+   recovered {snf1 60%, hicb 70%, locb 27%} vs broken {snf1 63%, hicb 72%,
+   locb 21%}. LFE structure does NOT predict which frames "need" +1. So the +1
+   pass/fail is coincidental concealment churn, not a real missing bit.
+
+DECISIVE PROOF THE LFE IS CORRECT: the 62% of frames that decode as CLEAN long
+frames (long_frame=1, valid body, wall-aligned) could not align through a wrong
+LFE parse. Since the LFE is the SAME code for every frame, the LFE body decode
+is bit-exact for ALL frames. Therefore the desync is NOT before ch0, and R528's
+premise (a 1-bit under-consumption in the LFE) is wrong.
+
+STANDING CONCLUSION (R524 reaffirmed): the failing 38% genuinely read
+long_frame=0 with max_sfb up to 63 (> num_sfb of the partial transform), which
+is spec-invalid under BOTH Part 1 and Part 2 (which reuses Part 1's ASF
+grammar). The clean 62% long frames prove the whole pipeline (framing, dumps,
+LFE, codec_mode, coding_config) is correct; the short/transient-block path
+carries values base AC-4 forbids. This is most plausibly a Dolby PROFILE grammar
+for transient blocks that the public ETSI spec does not document (e.g. a
+different max_sfb scale or an extra per-group field), not a bug we can derive
+from the spec alone.
+
+BEST-EFFORT RENDER PATH (pragmatic): AC4_OFFCLAMP/AC4_MSFBCLAMP recover ~287
+short frames from hard-crash (526->239 fails) by bounding the sfb->line mapping;
+combined with the 62% clean long frames that covers most of the track, at the
+cost of imperfect transient-block audio. Use this for listenable-render attempts
+while the transient grammar remains unknown.
+
+R530 OPTIONS: (a) obtain a reference AC-4 decode (Dolby ref tool / another
+implementation) to diff the transient-block bitstream against; (b) reverse-
+engineer the transient max_sfb semantics empirically from the wall constraint
+(brute-force per-frame the max_sfb interpretation that makes the WHOLE core
+consume exactly audio_size). New env: AC4_LFEPLUS1 (diagnostic, refuted).

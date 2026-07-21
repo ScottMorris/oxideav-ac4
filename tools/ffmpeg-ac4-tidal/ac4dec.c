@@ -4076,6 +4076,8 @@ static int channel_element_7x(AC4DecodeContext *s, int channel_mode, int iframe)
         ret = mono_data(s, ss, &ss->ssch[7], 1, iframe);
         if (ret < 0)
             return ret;
+        if (getenv("AC4_LFEPLUS1"))
+            skip_bits(gb, atoi(getenv("AC4_LFEPLUS1")));
     }
 
     if (ss->codec_mode == CM_ASPX_ACPL_1 ||
