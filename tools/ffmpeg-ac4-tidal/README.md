@@ -2139,3 +2139,54 @@ A-SPX EC data is the prime remaining suspect. That is the R523 target.
 
 Scripts banked: r522_align.py (mp4 stsz/stco/stsc sample extractor + dump
 byte-equality check).
+
+================================================================================
+R523 — BIT-BUDGET RESIDUAL TEST: the desync is in the ASF CORE body chain.
+================================================================================
+Leveraged R522's byte-exact dumps: since each substream's byte size is known
+exact, the fork's existing consumed-vs-audio_size meter (ac4_substream, line
+~4701) IS a per-frame bit-budget residual. Ran the real wrapped content
+(kw_wrapped.ac4, 1410 frames) under several configs and counted overread
+(consumed > wall = desync ran long) / underread (left bytes) / NEVERFAIL frames.
+
+  config (all: RAWSUB=6 OVERSHOOT_SKIP CB15 SFREL ENV_POW2 NEVER_FAIL)
+                                   overread  underread  NEVERFAIL(/1410)
+  spec-correct, A-SPX ON              254       609        726
+  spec-correct, A-SPX OFF (SKIP)      248       794        526   <- core alone
+  MSFB5,        A-SPX OFF              48       1242        141
+  W3_LONG,      A-SPX OFF             311        708        583   <- WORSE
+
+FINDINGS:
+1. The CORE ASF bodies desync ~526/1410 frames BY THEMSELVES (A-SPX disabled),
+   with GROSS overreads (histogram peaks at 84-94 bytes, plus 40 frames at
+   3 bytes). A-SPX only ADDS ~200 more fails (526->726). So the PRIMARY desync
+   is the ASF core body chain, not A-SPX. (Revises R522's "A-SPX is prime
+   suspect" — A-SPX is secondary; the core is where it starts.)
+2. n_sect_bits: forcing 3 for long frames (AC4_W3_LONG) makes it WORSE
+   (583 vs 526). The fork's n_sect_bits=5 for the 2048 long frame is CORRECT
+   (get_transf_length long-frame idx=4 => >2 => 5). Hypothesis killed.
+3. MSFB5 is a MASKING HACK, mechanism now understood. It cuts fails 526->141
+   but specifically by slashing OVERREADS (248->48) while BALLOONING underreads
+   (794->1242). i.e. reading max_sfb in 5 bits caps it at 31 (vs 63), so fewer
+   sfbs/sections are parsed => the body overshoots the wall less often, but
+   leaves more unconsumed. It is NOT realigning — it is truncating bands.
+   Confirmed by dumping the 6-bit max_sfb values (POS msfb trace, 4418 reads):
+   they spread plausibly across 0..63 with many small values (0,1,2,3,4,5,6),
+   which would NOT occur if the 6th bit were stream garbage. So n_msfb_bits=6
+   (spec table 106) reads SANE values. MSFB5 must stop being treated as signal.
+
+NET: the header is spec-exact (R522), the dumps are byte-exact (R522), and the
+core ASF bodies still overshoot the wall on ~526 frames reading SANE max_sfb.
+=> The bug is in how the fork walks the sf_data body chain across the 8 channels
+   (asf_section_data -> asf_spectral_data -> asf_scalefac_data -> asf_snf_data,
+   sequenced through LFE mono_data + five_channel_data + additional
+   two_channel_data). One body over-consumes and cascades. The per-body brute
+   force validation (ac4scan/jointbest) can't see this because it re-finds each
+   body at a fresh offset; the fork must start body N where body N-1 ended.
+
+R524 TARGET (sharp): instrument per-BODY consumed vs the point where the next
+body's parse can first be validated, to find WHICH of the 8 bodies overreads
+first; then diff THAT body's fork reader (asf_spectral_data sign/ext order
+Pseudocode 20, asf_scalefac_data chain, asf_snf_data gating) bit-for-bit vs
+ac4scan.py on the exact frame. Logs banked: specA.log/noaspx.log/msfb5.log/
+w3.log/trace6.log residual histograms.
