@@ -2055,3 +2055,87 @@ When the spec-exact parser lands the anchor 10/10 WITHOUT MSFB5, the upstream
 +1-bit delta is found — and that should fix core levels AND the highband.
 
 Env knobs added: AC4_TRACE (per-frame aspx_elements entry trace).
+
+================================================================================
+R522 — THE HEADER CHAIN IS SPEC-EXACT. R521 KEYSTONE REFUTED.
+================================================================================
+Executed the R521 "decisive move" but as a line-by-line SPEC AUDIT of the fork's
+header/config/framing readers (rather than a from-scratch parser), diffing each
+reader against ETSI TS 103 190-1 syntax tables. Result: EVERY reader upstream of
+and including the A-SPX framing is bit-for-bit spec-conformant.
+
+Verified reader-vs-spec, all EXACT MATCHES:
+  - asf_transform_info   vs Table 37  — long_frame(1); if !long: 2 idx of 2b.
+  - asf_psy_info         vs Table 38  — max_sfb[0] n_msfb_bits; dual/side/diff
+                                        framing branches; n_grp_bits loop.
+  - n_msfb_bits          vs Table 106 — 2048@48k = 6 (fork DEFAULT correct;
+                                        MSFB5's 5 is spec-WRONG, confirmed).
+  - companding_control   vs Table 49  — sync_flag; nc compand_on; need_avg.
+  - chparam_info         vs Table 47  — sap_mode(2); sap_mode==1 ms_used loop;
+                                        sap_mode==3 sap_data.
+  - sap_data             vs Table 48  — sap_coeff_all; per-g loops; delta_code
+                                        _time; dpcm_alpha huff.
+  - 7_X_channel_element  vs Table 33  — codec_mode(2); aspx_config(iframe,
+                                        !SIMPLE); LFE mono_data; coding_config
+                                        (2); switch; b_use_sap_add_ch(1)+2
+                                        chparam + additional two_channel_data;
+                                        mono_data(0) if cc 0/2; aspx_data chain.
+  - aspx_config          vs Table 50  — all 15 bits in exact order
+                                        (qme,sf3,st2,scale,interp,preflat,
+                                        limiter,noise_sbg2,numenvfixfix,fresmode2).
+  - aspx_framing         vs Table 53  — int_class VLC; FIXFIX 1<<envbits (POW2,
+                                        already fixed R520); FIX/VARVAR rel-bord
+                                        widths = 1 + (num_aspx_timeslots>8) [=2],
+                                        matching "2(1)" spec note; ptr_bits =
+                                        ceil(log2(num_env+2)).
+  - num_aspx_timeslots               — 2048/64=32 qmf slots / num_ts_in_ats(2)
+                                        = 16 (>8 => 2-bit rel bords). Valid
+                                        tab_border case. Consistent.
+
+CONCLUSION — the R521 keystone ("a +1-bit desync UPSTREAM of asf_psy_info
+masked by MSFB5") is FALSE. There is no missing/extra bit in the header chain;
+it implements the spec exactly. Therefore MSFB5 does NOT fix a real header bug —
+its -1 bit is a COINCIDENTAL global downshift that happens to re-align a subset
+of frames (which is why it only gets 141/1410 fails, not 0). The true desync is
+NOT in the grammar we just audited.
+
+REDIRECTION — the desync must live in one of:
+  (1) aspx_ec_data / aspx_hfgen_iwc — the deepest, least-audited readers
+      (Huffman envelope+noise data, add_harmonic, tna_mode). An error here
+      corrupts the bit position for everything after it in the frame AND, via
+      A-SPX delta coding, propagates into the next frame — matching the "P-frame
+      levels get jumpy" + "~40% band desync" symptoms exactly. Per-channel, so
+      it also explains why a per-channel MSFB downshift coincidentally helps.
+  (2) The RAWSUB substream framing — kw4/sub*.bin dumps + fabricated TOC
+      (channel_mode forced to 6). If the dumps aren't byte-exact audio-substream
+      payloads, every frame starts slightly off => the ~40% anchor miss and the
+      variable (not fixed) desync. This is independently testable and cheap.
+
+NEXT: (a) sanity-check the substream-dump byte alignment against the real
+demuxed audio substream (cheap, rules RAWSUB in/out); then (b) audit
+aspx_ec_data (Tables 57-59) + aspx_hfgen_iwc (Tables 55-56) reader-vs-spec the
+same way. Stop trusting MSFB5 as a signal — it is noise.
+
+R522b — RAWSUB DUMPS ARE BYTE-EXACT (branch 2 RULED OUT, done this round).
+Tested r522_align.py: extracted the real AC-4 samples from kw-fixedstco.mp4
+(stsz count=9423, stco/stsc chunk map) and parsed each frame's v2 TOC
+(r516_toc). For every sampled frame (0,1,2,23,24,25,48,100,500,1000,1409) the
+audio substream (the larger of the 2 sus_sizes) matched kw4/sub<fr>.bin
+BYTE-FOR-BYTE, not just in length:
+  frame 0: sample 2325 = TOC(19) + tiny-EMDF(10) + audio(2296); dump = 2296B,
+           content identical. Same clean accounting on all frames.
+=> The dumps ARE exact audio-substream payloads and RAWSUB wrapping is faithful.
+   The substream boundary / TOC framing is NOT the desync source.
+
+NET (R522): both non-body hypotheses are dead. The header/config/framing
+grammar is spec-exact AND the substream extraction is byte-exact. The residual
+desync (jumpy levels, ~40% A-SPX band desync) lives strictly INSIDE the body
+decode, downstream of aspx_framing — i.e. aspx_ec_data (Huffman envelope/noise,
+Tables 57-59) and/or aspx_hfgen_iwc (add_harmonic / tna_mode, Tables 55-56),
+which are the only deep readers not yet audited line-by-line. The ASF core
+bodies (section/spectral/scalefac/snf) are already validated spec-exact by
+ac4scan.py + jointbest.py (real per-body correlations vs the ref master), so
+A-SPX EC data is the prime remaining suspect. That is the R523 target.
+
+Scripts banked: r522_align.py (mp4 stsz/stco/stsc sample extractor + dump
+byte-equality check).
