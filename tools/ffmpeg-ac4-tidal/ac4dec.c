@@ -2409,7 +2409,15 @@ static int ext_decode(AC4DecodeContext *s)
 
     ext_val = get_bits(gb, N_ext + 4);
 
-    return (1 << (N_ext + 4)) + ext_val;
+    {
+        const char *cap = getenv("AC4_ESCCAP");
+        int r = (1 << (N_ext + 4)) + ext_val;
+        if (cap && N_ext > atoi(cap)) {
+            av_log(s->avctx, AV_LOG_DEBUG, "ESC N_ext=%d val=%d\n", N_ext, r);
+            return 16;   /* diagnostic: reject implausibly long escape runs */
+        }
+        return r;
+    }
 }
 
 static int asf_spectral_data(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch)
@@ -2561,27 +2569,42 @@ static int asf_scalefac_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
                     if (sfdump) {
                         FILE *fp = fopen(sfdump, "a");
                         if (fp) {
-                            fprintf(fp, "%d %d %d %d %d %d %d %d\n",
+                            fprintf(fp, "%d %d %d %d %d %d %d %d %d %d %d %d\n",
                                     ac4_frame_ctr,
                                     (int)(ssch - s->substream.ssch),
                                     g, sfb,
                                     had_first ? ssch->dpcm_sf[g][sfb] : -1,
                                     scale_factor, ssch->scale_factor_ref,
-                                    ssch->sfb_cb[g][sfb]);
+                                    ssch->sfb_cb[g][sfb],
+                                    ssch->scp.num_window_groups,
+                                    ssch->scp.long_frame,
+                                    ssch->scp.transf_length[0],
+                                    ssch->scp.transf_length[1]);
                             fclose(fp);
                         }
                     }
                 }
-                if (getenv("AC4_SFREL")) {
+                if (getenv("AC4_SFFLAT")) {
+                    /* diagnostic: gains=1, pure quant magnitudes. If frame
+                     * energy smooths out, the scalefactor chain is the bug;
+                     * if still jumpy, the quant values are. */
+                    ssch->sf_gain[g][sfb] = 1.f;
+                } else if (getenv("AC4_SFREL")) {
                     /* v2 law candidate: gains relative to the frame's
                      * leading 8-bit scale_factor (ref_sf), not the
                      * absolute v0/v1 -100 offset. Kills the 2^26
                      * blowup (ref_sf~207 -> 2^((207-100)/4)=1.2e8). */
                     int rel = scale_factor - ssch->scale_factor_ref;
-                    if (getenv("AC4_SFCLAMP") && (rel < -120 || rel > 120)) {
-                        /* clean-body excursion p99 = 81; beyond +/-120 is a
-                         * desynced chain (dpcm=0 runs) — mute those sfbs */
-                        ssch->sf_gain[g][sfb] = 0.f;
+                    if (getenv("AC4_SFINV")) rel = -rel;   /* test inverse exponent */
+                    const char *cl = getenv("AC4_SFCLAMP");
+                    int lim = cl ? atoi(cl) : 0;
+                    if (lim && (rel < -lim || rel > lim)) {
+                        /* v0 clean-body excursion tops out at ~21; v2 reaches
+                         * ~101 -> spurious 2^25 bands. Clamp the gain (not
+                         * mute) so an over-ranged sfb saturates at the limit
+                         * instead of exploding. */
+                        ssch->sf_gain[g][sfb] =
+                            powf(2.f, 0.25f * (rel < 0 ? -lim : lim));
                     } else
                         ssch->sf_gain[g][sfb] = powf(2.f, 0.25f * rel);
                 } else if (getenv("AC4_SFSIGNED")) {

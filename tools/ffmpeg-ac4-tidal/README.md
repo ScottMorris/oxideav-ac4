@@ -1885,3 +1885,48 @@ noise-dominated (weak real signal under shape-noise) — NOT delivered as
 music. Spectrogram banked as the diagnostic. STATUS: framing proven,
 scalefactor law settled (SFREL), level source identified (quant energy);
 sole remaining bug = spectral-shape/value incoherence in the core decode.
+
+## Round 519 (07-21) — R518 CORRECTED: the wall is per-frame LEVEL, and v2 gains ANTI-compensate
+
+R518's "shape-noise is the wall" was WRONG — that persistence metric can't
+tell good decodes from bad (the known-good atsc3 v0 decode scores the SAME
++0.02..0.04 excess; the high absolute corr was just low-freq bias). New
+validated diagnosis using atsc3 (v0, decodes clean through THIS decoder) and
+the reference master as controls:
+
+1. THE WALL = per-frame LEVEL (energy), not spectral shape. Frame-to-frame
+   log-energy |Δ|: reference master (same song, E-AC-3) 0.07 (p90 0.21);
+   atsc3 v0 decode 0.13; Tidal v2 SFREL 0.79 (p90 5.05). My decode is 6-11×
+   too jumpy — that IS the clicking. The song is NOT dynamic; the decode is.
+
+2. ref_sf is exhaustively useless for level. Scanned gain exponent β over
+   level = qE + β·ref_sf: minimum is at β=0 (pure SFREL). corr(ref_sf,
+   log quantE) = ±0.05. Sign flip (SFINV) identical. In v0 ref_sf is nearly
+   CONSTANT (p5 152 / p50 158 / p95 163); in v2 my read is wild (7→234).
+   Same 8-bit field, same position (aspx still lands, no desync) — so the
+   v2 value genuinely differs, but no interpretation of it recovers level.
+
+3. Escape codes decode CORRECTLY. N_ext run-length is textbook geometric
+   (1966→882→420→194→86→42, each ~½) across 3626 escapes — bit-sync holds
+   through them. The large quant values (peak 123876) are LEGITIMATE escape
+   codes meant to be compensated by small scalefactor gains.
+
+4. THE SMOKING GUN: v2 gains ANTI-compensate. gains-off (SFFLAT) vs gains-on:
+     atsc3 v0:  0.23 → 0.13  (gains HELP, as they must)
+     Tidal v2:  0.77 → 1.59  (gains HURT — applying them DOUBLES the jump)
+   Scalefactor gains are landing on the wrong bands relative to their quant
+   content. The sf↔sfb pairing / chain assignment is broken in v2. Also,
+   even gains-off v2 is 3× jumpier than v0 (0.77 vs 0.23) — v2 leans harder
+   on scalefactors (heavy escape use), so getting the pairing right matters
+   more.
+
+NEXT TARGET (bounded, concrete): asf_scalefac_data chain-to-sfb assignment.
+The dpcm chain must be walking sfbs in a different order / with a different
+gating rule in v2, so gains pair with the wrong quant bands. Compare per-sfb
+(sf, max_quant_idx) pairing v0 vs v2; a correct decode anti-correlates them.
+
+Diagnostic knobs added (all env-gated, banked in ac4dec.c): AC4_SFFLAT
+(gains=1, isolates quant vs chain), AC4_SFINV (exponent sign), AC4_SFCLAMP=<n>
+(now takes a limit, saturates over-ranged sfbs), AC4_ESCCAP=<n> (logs/rejects
+long escape runs). STATUS: framing proven; quant values proven (escape geo);
+sf value-origin settled (ref_sf useless); NEW frontier = sf↔quant pairing.
