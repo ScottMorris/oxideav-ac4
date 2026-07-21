@@ -3226,6 +3226,10 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
     int source_band_low;
     int idx[6];
 
+    if (getenv("AC4_TRACE"))
+        fprintf(stderr, "TRACE f%d ch%d aspx_elements enter\n",
+                ac4_frame_ctr, (int)(ssch - s->substream.ssch));
+
     ssch->master_reset = ((ss->prev_aspx_start_freq != ss->aspx_start_freq) +
                           (ss->prev_aspx_stop_freq != ss->aspx_stop_freq) +
                           (ss->prev_aspx_master_freq_scale != ss->aspx_master_freq_scale)) * iframe;
@@ -3305,8 +3309,18 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
         sbg = ssch->num_sbg_master;
     }
 
+    int patch_iters = 0;
     do {
         int odd;
+
+        /* A desynced frame can make this loop non-terminating without ever
+         * incrementing num_sbg_patches (the sbg_patch_num_sb<=0 branch), so
+         * the patch-count guard below never fires. Bound the iterations:
+         * num_sbg_master <= 64, so a valid stream converges well within it. */
+        if (++patch_iters > 128) {
+            av_log(s->avctx, AV_LOG_ERROR, "aspx patch loop stuck pos=%d\n", get_bits_count(&s->gbc));
+            return AVERROR_INVALIDDATA;
+        }
 
         j = sbg;
         sb = ssch->sbg_master[j];
@@ -3318,6 +3332,13 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
             odd = (sb - 2 + ssch->sba) % 2;
         }
 
+        /* sbg_patch_* are size 6; a desynced frame can drive this loop past
+         * the bound (spec guarantees <=6 for valid streams). Guard the write
+         * so a bad frame fails cleanly instead of overrunning / hanging. */
+        if (ssch->num_sbg_patches >= FF_ARRAY_ELEMS(ssch->sbg_patch_num_sb)) {
+            av_log(s->avctx, AV_LOG_ERROR, "aspx patch overrun pos=%d\n", get_bits_count(&s->gbc));
+            return AVERROR_INVALIDDATA;
+        }
         ssch->sbg_patch_num_sb[ssch->num_sbg_patches] = FFMAX(sb - usb, 0);
         ssch->sbg_patch_start_sb[ssch->num_sbg_patches] = ssch->sba - odd - FFMAX(sb - usb, 0);
         if (ssch->sbg_patch_num_sb[ssch->num_sbg_patches] > 0) {

@@ -2011,3 +2011,47 @@ core desync (A-SPX anchor was 6/10; core-only still 141/1410 hard-fails),
 pointing to one more MSFB5-style width delta in the core ASF path. Best next
 move now that the spec is in hand: build a spec-exact ASF parser and diff
 bit positions vs the fork on real frames to localize it.
+
+## Round 521 (07-21) — A-SPX HANG FIXED (full-track decode with highband enabled); MSFB5 exposed as a hack masking an upstream desync
+
+Chasing "all of it" — highband + core desync together.
+
+HIGHBAND / A-SPX HANG — FIXED. With AC4_ENV_POW2 the A-SPX parse was correct
+but the decode HUNG at frame 49 ch4. Traced (AC4_TRACE) to aspx_elements()
+(the HF master-band / patch-table derivation, spec 5.7.6). TWO unbounded
+loops on desynced frames:
+  1. the do-while writing sbg_patch_num_sb[num_sbg_patches] past its size-6
+     array (guarded: bail when num_sbg_patches >= 6);
+  2. the same do-while spinning forever WITHOUT incrementing num_sbg_patches
+     (the sbg_patch_num_sb<=0 branch), so guard #1 never fires — bounded to
+     128 iters (num_sbg_master <= 64, valid streams converge fast).
+Result: A-SPX now decodes the FULL 1410 frames (rc=0, no hang). But it still
+desyncs on ~40% of channel-frames (421 patch-loop bails, 584 total fails)
+and the output is mostly silent/HF-less — because the A-SPX band params
+depend on the core grammar, which is still slightly wrong (below).
+
+KEYSTONE — MSFB5 IS A HACK, NOT THE GRAMMAR. Cross-checked against the spec
+now that it's local:
+  - TS 103 190-1 table 106 (n_msfb_bits): transform length 2048 @ 48 kHz =>
+    6 bits. The fork's DEFAULT get_msfb_bits already implements table 106
+    exactly (6 for 384..2048, 5 for 192..256, 4 below). num_sfb_48(2048)=63
+    => max_sfb legitimately needs 6 bits. So 6 is physically and spec-correct.
+  - MSFB5 forces 5 bits for transf>=384, CONTRADICTING the spec — yet it
+    empirically syncs BETTER (core hard-fails 141 vs 526 with the correct 6).
+  => MSFB5's -1 bit is masking a +1-bit desync UPSTREAM of asf_psy_info
+     (in asf_transform_info / asf_psy_info grouping / or a v2 field we don't
+     read). frame_rate_index=13 is the special native-immersive mode (table
+     83: 23.44 fps, resampling ratio = 1, frame_len_base 2048) — a prime
+     place for a v2 grammar wrinkle. This upstream 1-bit delta is THE residual
+     core desync causing (a) the jumpy per-frame levels (R519), (b) A-SPX
+     anchor only 6/10, (c) the 40% A-SPX band-param desync.
+
+NEXT (the decisive move): build a spec-exact ASF parser (transform_info ->
+psy_info -> section_data -> spectral -> scalefac, per tables 37-41, with
+n_msfb_bits from table 106) and diff bit positions vs the fork on real frames
+(extract from kw-fixedstco.mp4 via stsz/stco + r516_toc), using the
+aspx_config anchor (nsbgm=6 xover=7 sf=7 st=1 scale=1) as the sync checkpoint.
+When the spec-exact parser lands the anchor 10/10 WITHOUT MSFB5, the upstream
++1-bit delta is found — and that should fix core levels AND the highband.
+
+Env knobs added: AC4_TRACE (per-frame aspx_elements entry trace).
