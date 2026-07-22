@@ -3000,3 +3000,15 @@ right (48k immersive stereo). END-TO-END recipe for any Atmos-AC4 mp4:
  5. render = drop probe-dup frame, concat ssch->pcm per channel, 256-smp fade-in.
  -> little_green_full.wav (3:29) / .flac (18.8MB; WAV 38MB > 30MB send limit). Custom
  ffmpeg build is DECODE-ONLY (no encoders); use /usr/bin/ffmpeg for flac/mp3.
+
+R550 — "BEAT IT" FIX: whole-track silence was a RENDER bug, not decode. Thriller's
+Beat It came out 100% silent (4.2MB FLAC, RMS 1) despite only 20 parse-fails. Cause:
+2 decode-glitch frames (439-440) held 768 NaN samples + one blown ~7.5e7 value; the
+render's normalize-by-max makes max()==NaN/huge -> every sample divides to 0/tiny ->
+the ENTIRE track collapses to silence. Billie Jean survived only because its PCM
+stayed finite. FIX (render, not decoder): before normalizing, conceal glitch frames
+-- zero any frame that is non-finite OR whose |mag|>1e6 (real core PCM peaks ~1e4) --
+and nan_to_num the result. Beat It 4.2MB/silent -> 31.5MB/rms5143/0.5%sil; Human
+Nature (also crushed, rms 87) -> 31.5MB/rms4861. Full Thriller album now real audio.
+Baked into museum/code/extract_and_decode.py. The underlying 2 NaN frames are a
+separate decoder-robustness item (bad scalefactor/A-SPX value -> NaN in dequant/synth).
