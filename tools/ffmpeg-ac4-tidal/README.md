@@ -2831,3 +2831,20 @@ now measurable vs the 0.95 stereo-downmix oracle. R542: test whether the
 ABSOLUTE scalefactor law (restore 2^(0.25*ref_sf) per frame) fixes the pumping
 on the CORRECT stereo decode (R531 rejected it on the 7.1 garbage; re-test now).
 Tools: PIL spectrogram gen; stereo-downmix oracle; adaptive coherent subtraction.
+
+R542 — ★ THE LEVEL LAW: ABSOLUTE (ref_sf) is CORRECT; ref_sf IS loudness (R531
+corrected). On the CORRECT stereo decode, per-frame level vs the 0.95 stereo-
+downmix oracle: SFREL corr -0.03 (jump 0.77) vs ABSOLUTE (+0.5*ln2*ref_sf per
+frame) corr +0.838 (jump 0.62); ref_sf ALONE vs ref loudness +0.750. => ref_sf
+IS the per-frame loudness anchor; the SFREL law CANCELS exactly the value that
+carries loudness -> every frame gets a wrong ~random level = the PUMPING Scott
+heard. R531's "ref_sf not loudness" was an artifact of the 7.1 GARBAGE decode
+(wrong channel element). FIX (kw_abs.wav): multiply each frame/channel scaled_
+spec by 2^(0.25*(ref_sf - median)) before IMDCT -> frame-rate pump 1.3x -> 1.0x
+(flat). Sent to Scott (level-only, no EQ). => The core decoder fix is: use the
+ABSOLUTE scalefactor law (2^(0.25*(sf - CONST))) NOT the relative SFREL
+(2^(0.25*(sf - ref_sf))) - the first coded band's sf = ref_sf sets the frame's
+absolute level. This is THE last major bug. Remaining polish: (1) combine with
+the static EQ tilt fix (kw_eq) for the muffle; (2) the 9-13kHz squeak excess.
+NEXT: fold ABSOLUTE law into the fork properly + combine with EQ for the final
+render.
