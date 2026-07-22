@@ -2866,3 +2866,30 @@ decoder problem" was ONE wrong assumption (7.1 vs immersive-stereo, R535); once
 corrected, everything fell out - all frames decode, full band, and the level law
 (R542), window+M/S (R538-539), and companding all became clean fixes. Remaining
 polish: the 9-13 kHz squeak excess (residual) if it persists.
+
+R544 — CHARACTERIZED the 9-13 kHz "squeak" (Scott's annotated spectrogram: what's
+above 11 kHz in our decode that's dark in the reference?). Evidence-based answer:
+it is a BROADBAND NOISE CARPET, not fixed tones.
+ - per-bin floor (p10 over time) is FLAT ~40-60 mag across 9-14.5 kHz — no discrete
+   spikes (0 always-on bins) = a hiss carpet, not tonal squeaks;
+ - present from t=0: in the INTRO (0-11s, before Geiger@12s / keyboards@26s, i.e. no
+   real HF source) our 10.5-13.5 kHz = 6.1x the reference. Content that has no source
+   yet MUST be artifact;
+ - independent of the music: corr(highband, bass) = -0.19;
+ - LOW energy (transient peaks dominate mean-square, floor ~0% of energy) but very
+   AUDIBLE because it's constant + in the ear's sensitive band while the music is
+   intermittent — that's why Scott hears strong "digital squeaks" that barely show in
+   energy meters.
+ - NOT all high-band excess is artifact: the E-AC-3 5.1 reference is a DULL rolled-off
+   master (intro 189, Geiger 150), so our decode legitimately has more genuine highs;
+   during keyboards the reference (4049) even exceeds us (3282). So the fix must keep
+   real transients and only remove the constant carpet.
+ROOT CAUSE (most likely): un-applied COMPANDING — AC-4's QMF-domain anti-noise tool
+(spec 5.7.5), active on 97% of our frames, parsed but never applied. It exists
+specifically to suppress this temporally-smeared HF quantization noise. Proper fix is
+in the decoder (apply companding); possibly compounded by noise-fill in empty HF bands.
+QUICK DSP MITIGATION (kw_denoise.py -> kw_denoise.wav): estimate the carpet per-bin
+from the intro mean (no real HF there), over-subtract 1.8x above 9 kHz with a steep
+Wiener mask^2. Result: intro artifact 6.1x -> 2.0x ref; Geiger 59% kept, keyboards
+65% kept. Sent Scott kw_denoise.wav + squeak_denoise.png (before/after/ref, 9kHz &
+11kHz lines marked). This is a band-aid; companding in the decoder is the real cure.
