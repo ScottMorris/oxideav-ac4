@@ -2732,3 +2732,16 @@ SFREL/level law — the 8-11 kHz spike + the per-frame jump (0.77). New env:
 AC4_ASPXDUMP. R538: solve the core scalefactor level law now that the decode is
 correct (re-examine SFREL vs absolute with clean stereo data; the top-band
 inflation is the tell).
+
+R537b — RENDER TUNING from Scott's ear on kw_ims2: "muddier, missing the Geiger-
+counter sounds, added digital clicks/squeaks; kw_ims was better." => per-band
+reference-shaping is WRONG: it (a) cuts the real high-transient content (Radio-
+activity's Geiger clicks live at 8-11 kHz, which the dull E-AC-3 ref lacks) and
+(b) adds squeaks from per-band gain jumps. LESSON: do NOT shape the core to the
+reference; keep the raw decode. Also: the OLA output per-frame jump is only ~0.2
+(OLA smooths the 0.77 spectral jump), so NATIVE levels are fine — the reference-
+borrow itself was adding misalignment pops. kw_native.wav (render_ims.py: raw
+core IMDCT+OLA + gentle self-AGC, NO reference) = smoother (jump 0.19), keeps
+more highs (8.2% >8 kHz), no squeaks. Sent to Scott. Preferred render path:
+native + AGC, no per-band shaping. Core SFREL level law (the 8-11 kHz inflation)
+is still the deep fix (R538) but the raw sound is already the closest yet.
