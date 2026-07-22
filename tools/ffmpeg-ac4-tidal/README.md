@@ -2641,3 +2641,44 @@ level; bass 83%->75%), + TONAL peak-sharpening of the SBR highband (|mag|^1.8
 normalized -> emphasize peaks over noise floor), + a touch louder highband.
 Spectrum 75/16/2.6/4.9/1.6% vs ref 80/16/1.3/1.6/1.4 (brighter than the dull
 master). No clip, 99% active. Sent for ear check.
+
+################################################################################
+R535 — ★★★★★ BREAKTHROUGH: THE CONTENT IS IMMERSIVE STEREO (2ch), NOT 7.1.
+################################################################################
+Online research (Kostya's SBR-across-codecs blog + FFmpeg-devel) pointed to Paul
+B. Mahol's AC-4 decoder being the sole (WIP/RFC, unmerged) implementation — and
+to a mailing-list patch "avcodec/ac4dec: process immersive stereo" stating: for
+presentation_version == 2, channel_mode 6 is remapped to channel_mode 1
+(IMMERSIVE STEREO, a 2-channel core), NOT 7.1. Our fork lacks that remap, and
+AC4_RAWSUB=6 forced channel_element_7x (8 channels) all along.
+
+TEST (decisive): decode the SAME byte-exact dumps as channel_mode 1
+(channel_pair_element) vs 6 (7_X), core-only:
+  RAWSUB=6 (7.1) : overread 248, NEVERFAIL 526/1410
+  RAWSUB=1 (IMS) : overread 0,   NEVERFAIL 0/1410   <-- EVERY frame clean, exact wall
+Verification:
+  - WALL residual median 4 bytes (core consumes ~all of audio_size; A-SPX tail).
+  - Core spectral extent: 7.1 mis-parse ch0 median 4.6 kHz vs IMS ch0 median
+    11+ kHz (FULL BAND).
+  - Band-energy correlation vs kw-ref51: 7.1 = 0.536, IMS = 0.829 (!!). 0.83 is
+    a CORRECT decode (noise floor ~0.39; a same/near-same master).
+
+=> EVERYTHING this session's "hard" problems were artifacts of the wrong channel
+   element:
+   - The "38% transient/short-block grammar" mystery (R524-R529): GONE. Those
+     frames are not transient — they were mis-parsed as 7.1. As IMS all decode.
+   - The "missing A-SPX highband / bass-only": GONE. The 2-channel IMS core is
+     FULL BAND; the real mids/highs/beeps are in the core, no SBR needed.
+   - The R531 "random levels": likely a 7.1-mixing artifact too (re-check).
+   The memory/README "plain 7.1, NOT immersive" conclusion was WRONG (like the
+   R528 +1-bit theory) — corrected here.
+
+RENDER: kw_ims.wav (render_ims, 2ch IMDCT+OLA, levels borrowed from ref for
+smoothness) — full band, 100% active, sent to Scott. This is the first CORRECT
+full decode of the track.
+
+R536 NEXT: (1) render straight from the IMS decode and re-check if levels are
+now native-correct (drop the reference-borrow). (2) enable A-SPX (aspx_data_2ch)
++ ACPL for the true top octave + spatial field. (3) add the channel_mode-6->1
+version-2 remap to the fork so the normal (non-RAWSUB) path decodes IMS. (4)
+RAWSUB=1 is the recipe now, not RAWSUB=6.
