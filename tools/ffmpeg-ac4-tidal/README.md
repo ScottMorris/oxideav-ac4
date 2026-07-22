@@ -2984,3 +2984,19 @@ synthesis short-block transform (R547, AC4_DUMP_PCM). THE FULL WORKING RECIPE:
  kw_pcm clear, so this is refinement not a blocker. DELIVERABLES: kw_radioactivity_60s.wav
  (60s), blue_little_green.wav (12.8s), decode_spectrograms.png — all from ssch->pcm concat,
  tiny 256-smp safety fade-in, no hand-DSP.
+
+R549 — FULL-TRACK PIPELINE (Scott: get a longer Little Green from the source mp4;
+"is the probe tool up to date?"). The riptide project's OWN extractor is the right
+tool: src/tidal/ac4decode.rs extract_ac4_samples() walks MP4 boxes (moov/trak/mdia/
+minf/stbl/stsd fourcc=='ac-4', stsz sizes, sequential from mdat.body_start when
+sum(stsz)==mdat_len) — ffprobe misreads the track as "44100 mono", riptide reads it
+right (48k immersive stereo). END-TO-END recipe for any Atmos-AC4 mp4:
+ 1. extract AC-4 samples from mp4 via the box walk above (4893 for Little Green, 3:29);
+ 2. per frame, classify I vs P via b_iframe_global (TOC bit: after u(2)ver[+vb], u(10)seq,
+    optional wait_frames, u(1)fs, u(4)fri, then u(1)=iframe); strip the TOC: I-frame=29B,
+    P-frame=22B (validated: sub==sample[toc:] reproduced all 300 known joni subs, 0 mism);
+ 3. wrap_subs.py <subs> out.ac4 <iframe_list> (cadence 24 for LG, 204 iframes);
+ 4. decode AC4_RAWSUB=1 AC4_NEVER_FAIL=1 AC4_DUMP_PCM=out.bin (only 1 fail / 4893!);
+ 5. render = drop probe-dup frame, concat ssch->pcm per channel, 256-smp fade-in.
+ -> little_green_full.wav (3:29) / .flac (18.8MB; WAV 38MB > 30MB send limit). Custom
+ ffmpeg build is DECODE-ONLY (no encoders); use /usr/bin/ffmpeg for flac/mp3.
