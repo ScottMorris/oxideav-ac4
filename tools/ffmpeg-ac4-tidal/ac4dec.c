@@ -3335,6 +3335,10 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
         return AVERROR_INVALIDDATA;
     }
     ssch->num_sb_aspx = ssch->sbg_sig_highres[ssch->num_sbg_sig_highres] - ssch->sbx;
+    if (getenv("AC4_ASPXDUMP"))
+        fprintf(stderr, "ASPX f%d ch%d sbx=%d sbz=%d num_sb_aspx=%d xover=%dHz stop=%dHz start_freq=%d stop_freq=%d\n",
+                ac4_frame_ctr, (int)(ssch - s->substream.ssch), ssch->sbx, ssch->sbz,
+                ssch->num_sb_aspx, ssch->sbx*375, ssch->sbz*375, ss->aspx_start_freq, ss->aspx_stop_freq);
 
     ssch->num_sbg_sig_lowres = ssch->num_sbg_sig_highres - floorf(ssch->num_sbg_sig_highres / 2.);
     ssch->sbg_sig_lowres[0] = ssch->sbg_sig_highres[0];

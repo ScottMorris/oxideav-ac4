@@ -2702,3 +2702,33 @@ needed). kw_blue.wav (Joni Mitchell "Blue", 12.8s) sent to Scott as a
 cross-genre sanity check. OPEN: the per-frame LEVEL problem is universal (kw IMS
 native jump 0.77 vs ref 0.15, corr -0.04) — NOT a 7.1 artifact; still the main
 audio-quality blocker (pops/stutter). R537: solve the native level normalisation.
+
+################################################################################
+R537 — A-SPX INVESTIGATION: A-SPX is NEGLIGIBLE here; the real lever is CORE LEVEL.
+################################################################################
+Scott: do A-SPX first. Findings on the CORRECT stereo (RAWSUB=1) decode:
+1. A-SPX now PARSES PERFECTLY: A-SPX enabled (no SKIP_ASPX) = 0 NEVERFAIL, 0
+   overread, 0 aspx errors on all 1410 frames. The ~40% A-SPX desync (R521) was
+   ENTIRELY the 7.1 mis-parse. So the whole stereo decode incl highband is right.
+2. But A-SPX is TINY: new AC4_ASPXDUMP shows sbx=53 => crossover ~19,875 Hz,
+   num_sb_aspx=3 => A-SPX only spans 19.9-21 kHz (aspx_start_freq=7 = the highest
+   crossover). The ASF CORE is nearly FULL BAND (0-20 kHz). A-SPX is inaudible
+   air; NOT the missing highband.
+3. The fork's A-SPX SYNTHESIS is broken anyway (dumps ~100% into 16-24 kHz), and
+   my renders use DUMP_SPEC (the core MDCT), not the fork PCM — so A-SPX is moot.
+4. THE REAL ISSUE = CORE LEVEL. The core scaled_spec has a 45% energy SPIKE at
+   8-11 kHz (with a dip at 2-5 kHz) — unnatural for music = the SFREL level law
+   inflating the top core bands = the "digital noise" Scott hears. Per-band
+   energy vs reference is uncorrelated in every band (level problem), while the
+   within-frame SHAPE matches (0.83).
+FIX/RENDER: kw_ims_shaped.py (kw_ims2.wav) — correct stereo decode + per-band
+reshape of the whole core toward the reference spectral shape (attenuate bands
+the ref has silent -> kills the 8-11 kHz garbage). Result matches ref balance
+(0-500 81.6/79.7, 500-2k 15.9/15.9, tames the spike). Sent to Scott.
+
+NET: A-SPX is a non-lever for this content (core is full-band). The single
+remaining blocker for clean NATIVE audio (no reference crutch) is the CORE
+SFREL/level law — the 8-11 kHz spike + the per-frame jump (0.77). New env:
+AC4_ASPXDUMP. R538: solve the core scalefactor level law now that the decode is
+correct (re-examine SFREL vs absolute with clean stereo data; the top-band
+inflation is the tell).
