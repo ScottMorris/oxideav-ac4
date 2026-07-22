@@ -6308,12 +6308,11 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
     ac4_frame_failed = 0;
 
-    if (getenv("AC4_DUMP_SPEC")) {
-        FILE *fp = fopen(getenv("AC4_DUMP_SPEC"), "ab");
+    if (getenv("AC4_DUMP_SPEC_PRE")) {  /* pre-stereo-processing (M/S) */
+        FILE *fp = fopen(getenv("AC4_DUMP_SPEC_PRE"), "ab");
         if (fp) {
             for (int ch = 0; ch < 8; ch++)
-                fwrite(s->substream.ssch[ch].scaled_spec,
-                       sizeof(float), 2048, fp);
+                fwrite(s->substream.ssch[ch].scaled_spec, sizeof(float), 2048, fp);
             fclose(fp);
         }
     }
@@ -6334,6 +6333,15 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     case 6:
         m7channel_processing(s, &s->substream);
         break;
+    }
+
+    if (getenv("AC4_DUMP_SPEC")) {  /* POST stereo-processing (proper L/R) */
+        FILE *fp = fopen(getenv("AC4_DUMP_SPEC"), "ab");
+        if (fp) {
+            for (int ch = 0; ch < 8; ch++)
+                fwrite(s->substream.ssch[ch].scaled_spec, sizeof(float), 2048, fp);
+            fclose(fp);
+        }
     }
 
     for (int ch = 0; ch < avctx->channels; ch++)

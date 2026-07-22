@@ -2769,3 +2769,21 @@ NEXT: if companding helps, the real decoder-side companding is QMF-domain (spec
 5.7.5) and per-A-SPX-interval; my time-domain per-64-sample approx should be
 close. Remaining: core SFREL level (8-11 kHz keyboard/Geiger tonal content is
 REAL - confirmed flatness 0.10, 13 peaks/frame - do NOT cut it).
+
+R539 — ★ THE MUFFLE = M/S RENDERED AS L/R (dump was BEFORE stereo_processing).
+Scott on kw_compand: still muffled + high squeaks + stuttery, "artifacts from the
+opening, move around, DON'T show in spectrograms/tooling." => a PHASE/stereo
+problem (magnitude spectrograms hide phase), not spectral. ROOT: AC4_DUMP_SPEC
+was at line ~6311, BEFORE the channel_mode-1 stereo_processing() call (~6327)
+that converts the coded mid/side channels to L/R on scaled_spec. So every render
+this whole time used the M/S spectra AS L/R -> the highs phase-cancel (the
+muffle) and the stereo scrambles (stutter/artifacts). PROOF: pre vs post
+stereo_processing differs by 115% (M/S active); ch0<->ch1 correlation flips
+-0.04 (decorrelated M/S) -> 0.93 (correlated L/R). Band-energy corr vs ref
+UNCHANGED (0.829 M/S vs 0.831 L/R) — confirming it is invisible to spectral
+tooling, exactly as Scott heard. FIX: moved the dump to AFTER stereo_processing
+(new AC4_DUMP_SPEC_PRE keeps the old location). Re-render from the L/R spectra:
+kw_stereo.wav (kw_stereo_render.py = spec post-stereo + alpha=3.0 window +
+companding). Sent to Scott. This should lift the muffle + fix the stereo.
+Combined R538+R539 fixes: correct window (alpha 3.0), decoder companding, and
+proper L/R (post stereo-processing).
