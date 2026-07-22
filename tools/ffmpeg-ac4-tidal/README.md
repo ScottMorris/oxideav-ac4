@@ -3012,3 +3012,26 @@ and nan_to_num the result. Beat It 4.2MB/silent -> 31.5MB/rms5143/0.5%sil; Human
 Nature (also crushed, rms 87) -> 31.5MB/rms4861. Full Thriller album now real audio.
 Baked into museum/code/extract_and_decode.py. The underlying 2 NaN frames are a
 separate decoder-robustness item (bad scalefactor/A-SPX value -> NaN in dequant/synth).
+
+R551 — ★★★ ROOT CAUSE of the NaN/blowup frames AND every parse-fail: the WRAPPER'S
+FIXED TOC STRIP. Scott: "let's find the root cause." Traced Beat It's blowup frame
+end-to-end. It is NOT quant_lut OOB (added AC4_QLUTTRACE: never fires, |x|<8192 always)
+and NOT the dequant law. Stage trace (new AC4_STAGETRACE across dequant/stereo/reorder/
+synth) localized the 2.18e10 value to DEQUANT, one band, born from an anomalous
+scale_factor anchor: ref_sf=219 on that frame vs ~145 on every neighbor -> the absolute
+law 2^((219-100)/4)=9e8 gain -> 2e10 spectral -> 7.5e7 PCM spike. AC4_BODYTRACE showed
+WHY: that frame's audio_size parsed as -1808073937 (garbage) -> body desynced -> the
+8-bit sf anchor read from the wrong bit position. And DECISIVE: parsing the real TOC
+(r516_toc) shows the desync frame has an 18-BYTE TOC, not 19 -> true audio-substream
+offset = toc_bytes+sus_sizes[0] = 18+3 = 21, but the pipeline stripped a FIXED 22 ->
+one byte too many -> whole-body desync. The fixed 29(I)/22(P) strip is wrong on ANY
+frame whose TOC != 19 bytes (wait_frames/payload_base/program_id/seq shift it): 23-100
+such frames PER TRACK. FIX = ac4_toc.py: parse each frame's TOC, strip the exact
+toc_bytes + bytes-before-the-largest-substream. RESULT across 5 tracks (fixed -> true):
+Beat It 20 fails/2 blow/max 7.5e7 -> 0/0/max 12434; Human Nature 28/2 -> 0/0; Billie
+Jean 94/0 -> 0/0; Thriller 20/0 -> 0/0; Wanna Be Startin' 29/0 -> 0/0. EVERY parse-fail
+AND blowup on EVERY track was this one bug -- AC4_CONCEAL and the R550 render-side
+blowup-masking were both band-aids over it. Also added defense-in-depth in the decoder:
+ac4_substream now rejects audio_size < 0 (the >131072 guard let the int-overflow
+negative pass as valid). Wired into batch_album.py + museum/code/extract_and_decode.py
+(+ ac4_toc.py companion). This closes the per-frame-parse-fail saga going back to R519.

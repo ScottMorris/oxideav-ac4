@@ -4771,7 +4771,13 @@ static int ac4_substream(AC4DecodeContext *s, SubstreamInfo *ssinfo)
     audio_size = get_bits(gb, 15);
     if (get_bits1(gb))
         audio_size += variable_bits(gb, 7) << 15;
-    if (audio_size > 131072) {
+    if (audio_size > 131072 || audio_size < 0) {
+        /* audio_size < 0: variable_bits(7)<<15 overflowed int on a desynced
+         * frame (garbage continuation bits). The old > check let negatives
+         * pass as "valid" -> runaway scalefactor -> 1e10 dequant blowup that
+         * poisoned normalization. Fail here so CONCEAL repeats the last good
+         * frame instead. (The real fix is upstream: strip the exact per-frame
+         * TOC/substream offset so desync never happens -- see ac4_toc.py.) */
         av_log(s->avctx, AV_LOG_ERROR, "invalid audio_size: %d\n", audio_size);
         return AVERROR_INVALIDDATA;
     }
@@ -4893,6 +4899,21 @@ static int compute_window(AC4DecodeContext *s, float *w, int N,
     return 0;
 }
 
+static void ac4_stagetrace(const char *stage, int frm, int ch, const float *a, int n)
+{
+    if (!getenv("AC4_STAGETRACE")) return;
+    int nnan=0, ninf=0, nbig=0; float mx=0; int kmx=-1;
+    for (int i=0;i<n;i++) {
+        float v=a[i];
+        if (isnan(v)) nnan++;
+        else if (isinf(v)) ninf++;
+        else { float av=fabsf(v); if (av>mx){mx=av;kmx=i;} if (av>1e6f) nbig++; }
+    }
+    if (nnan||ninf||nbig)
+        fprintf(stderr, "STAGE %s f%d ch%d nan=%d inf=%d big=%d maxfinite=%g@%d\n",
+                stage, frm, ch, nnan, ninf, nbig, mx, kmx);
+}
+
 static void scale_spec(AC4DecodeContext *s, int ch)
 {
     Substream *ss = &s->substream;
@@ -4905,7 +4926,13 @@ static void scale_spec(AC4DecodeContext *s, int ch)
         int x = ssch->quant_spec[k];
         int sfb = ssch->offset2sfb[k];
         int g = ssch->offset2g[k];
+        int ax = FFABS(x);
 
+        if (getenv("AC4_QLUTTRACE") && ax >= 8192) {
+            fprintf(stderr, "QLUTOOB f%d ch%d k%d x=%d lut_oob=%g gain=%g\n",
+                    ac4_frame_ctr, (int)(ssch - s->substream.ssch), k, x,
+                    quant_lut[ax], ssch->sf_gain[g][sfb]);
+        }
         ssch->scaled_spec[k] = ssch->sf_gain[g][sfb] * copysignf(quant_lut[FFABS(x)], x);
     }
 }
@@ -5449,7 +5476,9 @@ static void prepare_channel(AC4DecodeContext *s, int ch)
     SubstreamChannel *ssch = &ss->ssch[ch];
 
     spectral_reordering(s, ssch);
+    ac4_stagetrace("reorder", ac4_frame_ctr, ch, ssch->spec_reord, 2048);
     spectral_synthesis(s, ssch);
+    ac4_stagetrace("synth", ac4_frame_ctr, ch, ssch->pcm, s->frame_len_base);
 
     /* AC4_DUMP_PCM: core time-domain output AFTER correct short-block IMDCT +
      * window switching + stereo processing, BEFORE the QMF/A-SPX stages that
@@ -6303,8 +6332,10 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     if (get_bits_left(gb) < 0)
         av_log(s->avctx, AV_LOG_WARNING, "overread\n");
 
-    for (int ch = 0; ch < avctx->channels; ch++)
+    for (int ch = 0; ch < avctx->channels; ch++) {
         scale_spec(s, ch);
+        ac4_stagetrace("dequant", ac4_frame_ctr, ch, s->substream.ssch[ch].scaled_spec, 2048);
+    }
 
     if (getenv("AC4_CONCEAL")) {
         if (ac4_frame_failed) {
@@ -6347,6 +6378,9 @@ static int ac4_decode_frame(AVCodecContext *avctx, AVFrame *frame,
         m7channel_processing(s, &s->substream);
         break;
     }
+
+    for (int ch = 0; ch < avctx->channels; ch++)
+        ac4_stagetrace("stereo", ac4_frame_ctr, ch, s->substream.ssch[ch].scaled_spec, 2048);
 
     if (getenv("AC4_DUMP_SPEC")) {  /* POST stereo-processing (proper L/R) */
         FILE *fp = fopen(getenv("AC4_DUMP_SPEC"), "ab");
