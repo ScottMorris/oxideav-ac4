@@ -2960,3 +2960,23 @@ window (TDAC w^2+w_shift^2 = 1.0000 flat, KBD is fine), no periodic dup frames.
  too dark and the squeak+brightness are entangled in the out-of-range bins. NOTE the
  native full decode (decode_channel->qmf_synthesis) is ALSO dark (Blue 0% >8k) => A-SPX
  highband is negligible for this content, consistent with sbx~20kHz.
+
+R548 — ★★★ BREAKTHROUGH / IT WORKS. Scott on kw_pcm.wav + blue_pcm.wav: "other than a
+tiny stutter at the very start of Little Green the decode is FLAWLESS — all the clicks
+are gone, it's just her and her guitar and the background reverb and her mic sounds.
+kw_pcm had no beginning stutter, audio clear as day. Did we do it?!" YES. Recognizable,
+clean, listenable audio decoded from Tidal AC-4 immersive stereo — a proprietary Dolby
+codec with NO working OSS decoder (ffmpeg ships a non-functional stub; we instrumented
+it). CORRECTS R540-R545: the "9-13kHz squeak carpet" was NOT source content / not un-
+fixable — it was OUR long-only IMDCT aliasing the 13% (Blue) / 21% (KW) short/transient
+frames into HF garbage. R545's core-dequant audit was correct (dequant IS spec-exact);
+the AUDIBLE clicks were the render, resolved by using the decoder's own spectral_
+synthesis short-block transform (R547, AC4_DUMP_PCM). THE FULL WORKING RECIPE:
+ 1. RAWSUB=1 immersive-stereo decode (channel_mode 1, NOT 7.1/JOC);
+ 2. spec-exact core dequant: |q|^(4/3), ksf=2^((sf-100)/4), DPCM sf from ref_sf;
+ 3. stereo_processing (M/S+SAP) in MDCT domain -> proper L/R;
+ 4. spectral_synthesis: correct short-block IMDCT + KBD-alpha window switching;
+ 5. dump ssch->pcm (AC4_DUMP_PCM), concatenate per channel. Done. No hand-DSP/EQ.
+ Remaining polish: (a) tiny stutter at the very START of Blue (first short frames /
+ overlap priming, localized); (b) the brightness/max_sfb open question (kw_pcm darker
+ than ref at 8-20k) — but Scott finds kw_pcm clear, so this is refinement not a blocker.
