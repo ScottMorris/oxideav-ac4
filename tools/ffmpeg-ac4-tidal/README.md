@@ -2745,3 +2745,27 @@ core IMDCT+OLA + gentle self-AGC, NO reference) = smoother (jump 0.19), keeps
 more highs (8.2% >8 kHz), no squeaks. Sent to Scott. Preferred render path:
 native + AGC, no per-band shaping. Core SFREL level law (the 8-11 kHz inflation)
 is still the deep fix (R538) but the raw sound is already the closest yet.
+
+R538 — POST-ECHO diagnosed: WRONG MDCT WINDOW + MISSING COMPANDING. Scott on
+kw_native: high-pitched squeaks that LAG (follow) the keyboard/transient sounds,
+vanish during smooth/bass, "like a reflection/echo/reverb lost in decoding,
+digital not analog." = classic POST-ECHO. Two causes found:
+1. WINDOW: my render hardcoded KBD alpha=4.0; the fork uses kbd_window_alpha[j][i]
+   and for our content (frame_len_base_idx=0, 2048 long = transf idx 4) the real
+   alpha is 3.0 (kbd_window_alpha[0][4]). Wrong synth window => imperfect TDAC =>
+   residual time-domain aliasing (mirror/echo). Fixed to 3.0 (~4% RMS change).
+2. COMPANDING (the big one): AC4_COMPANDDUMP shows compand_on=1 on 1362/1411
+   frames (97%!) for the stereo ASPX mode (channel_pair CM_ASPX calls
+   companding_control(2)). The fork PARSES compand_on but NEVER applies the
+   processing. Companding = AC-4's pre/post-echo tool: encoder COMPRESSES the
+   temporal envelope, decoder must EXPAND. Not expanding => echo/reverb tails
+   stay boosted vs transients = the lagging squeaks.
+FIX: kw_compand.py applies decoder-side companding EXPANSION in the render: per
+64-sample QMF slot, gain = L_slot^((1-0.65)/0.65)=L^0.5385, normalised per frame,
+slot-boundary-smoothed. Crest factor 4.17->4.99 (sharper transients, suppressed
+tails) + alpha=3.0 window. kw_compand.wav sent to Scott.
+New env: AC4_COMPANDDUMP, AC4_ASPXDUMP. render_ims.py now uses alpha=3.0.
+NEXT: if companding helps, the real decoder-side companding is QMF-domain (spec
+5.7.5) and per-A-SPX-interval; my time-domain per-64-sample approx should be
+close. Remaining: core SFREL level (8-11 kHz keyboard/Geiger tonal content is
+REAL - confirmed flatness 0.10, 13 peaks/frame - do NOT cut it).

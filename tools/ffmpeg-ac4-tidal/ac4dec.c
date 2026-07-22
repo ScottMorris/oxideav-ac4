@@ -2834,6 +2834,9 @@ static int companding_control(AC4DecodeContext *s, Substream *ss, int num_chan)
     if (need_avg == 1)
         ss->compand_avg = get_bits1(gb);
 
+    if (getenv("AC4_COMPANDDUMP"))
+        fprintf(stderr, "COMPAND f%d sync=%d on0=%d on1=%d avg=%d\n",
+                ac4_frame_ctr, sync_flag, ss->compand_on[0], ss->compand_on[1], ss->compand_avg);
     return 0;
 }
 

@@ -5,7 +5,7 @@ sp=np.fromfile(spec,dtype=np.float32).astype(np.float64); nf=sp.size//(8*N); sp=
 mx=np.abs(sp).max(axis=2,keepdims=True); sp=sp*np.where(mx>1e6,1e4/np.maximum(mx,1e-9),1.0)
 n_=np.arange(2*N); k_=np.arange(N); BASIS=np.cos(np.pi/N*(n_[:,None]+0.5+N/2)*(k_[None,:]+0.5))
 from numpy import i0
-xg=np.arange(N+1)/N; kern=i0(np.pi*4.0*np.sqrt(np.clip(1-(2*xg-1)**2,0,1))); cs=np.cumsum(kern[:N]); KBDh=np.sqrt(cs/cs[-1]); WIN=np.concatenate([KBDh,KBDh[::-1]])
+xg=np.arange(N+1)/N; kern=i0(np.pi*3.0*np.sqrt(np.clip(1-(2*xg-1)**2,0,1))); cs=np.cumsum(kern[:N]); KBDh=np.sqrt(cs/cs[-1]); WIN=np.concatenate([KBDh,KBDh[::-1]])
 L=(nf-1)*N; out=np.zeros((L+2*N,2))
 for ci,ch in enumerate([0,1]):
     t=(sp[1:,ch,:]@BASIS.T)*WIN
