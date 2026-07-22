@@ -2977,6 +2977,10 @@ synthesis short-block transform (R547, AC4_DUMP_PCM). THE FULL WORKING RECIPE:
  3. stereo_processing (M/S+SAP) in MDCT domain -> proper L/R;
  4. spectral_synthesis: correct short-block IMDCT + KBD-alpha window switching;
  5. dump ssch->pcm (AC4_DUMP_PCM), concatenate per channel. Done. No hand-DSP/EQ.
- Remaining polish: (a) tiny stutter at the very START of Blue (first short frames /
- overlap priming, localized); (b) the brightness/max_sfb open question (kw_pcm darker
- than ref at 8-20k) — but Scott finds kw_pcm clear, so this is refinement not a blocker.
+ Remaining polish: (a) the "opening stutter" Scott heard on Little Green was a VLC-on-
+ phone playback/sync issue, NOT a decode bug — blue_pcm's opening is a clean fade-in from
+ silence (per-256-smp envelope 0,0,8,41,84,182... no chop); nothing to fix. (b) the
+ brightness/max_sfb open question (kw_pcm darker than ref at 8-20k) — but Scott finds
+ kw_pcm clear, so this is refinement not a blocker. DELIVERABLES: kw_radioactivity_60s.wav
+ (60s), blue_little_green.wav (12.8s), decode_spectrograms.png — all from ssch->pcm concat,
+ tiny 256-smp safety fade-in, no hand-DSP.
