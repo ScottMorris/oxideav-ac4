@@ -2892,4 +2892,35 @@ QUICK DSP MITIGATION (kw_denoise.py -> kw_denoise.wav): estimate the carpet per-
 from the intro mean (no real HF there), over-subtract 1.8x above 9 kHz with a steep
 Wiener mask^2. Result: intro artifact 6.1x -> 2.0x ref; Geiger 59% kept, keyboards
 65% kept. Sent Scott kw_denoise.wav + squeak_denoise.png (before/after/ref, 9kHz &
-11kHz lines marked). This is a band-aid; companding in the decoder is the real cure.
+11kHz lines marked). This is a band-aid.
+
+R545 — DECODER AUDIT (Scott: "stop hand-DSP, find what we turned OFF from the bad 7.1
+assumption; I bet Blue needs different tuning"). Verdict: NO missing tool causes the
+9-13 kHz squeak — the core decode is SPEC-EXACT there. Trail:
+ - Carpet is DECODER-LEVEL not post-processing: it's present in the raw post-stereo
+   scaled_spec dumps, before any render EQ.
+ - Ruled OUT every candidate tool:
+   * SNF (spectral noise fill, asf_snf_data) — parsed but 0% used in the KW bitstream
+     (BODYTRACE: every frame snf_data_exists=0). Cannot be the source.
+   * COMPANDING — parsed, not applied, BUT spec 5.7.5.2 confines it to the QMF subband
+     range [sb0=aspx_xover_band, sb1], i.e. the A-SPX interval only. Our sbx~53 ~=
+     19.9 kHz, so companding never touches 9-13 kHz. (This OVERTURNS the R544 guess.)
+   * Speech predictor (predictor_presence/lag) — SSF/speech-frontend only; our music
+     is ASF (spec_frontend==SF_ASF). Never invoked.
+ - Verified the CORE path is spec-exact vs TS 103 190-1 clause 5.1.3.2 / Pseudocode 21:
+   rec_spec=sign(q)*|q|^(4/3) (quant_lut i^4/3 ✓); ksf=2^((sf-100)/4) (default sf_gain
+   ✓); scale_factor=reference_scale_factor then +=dpcm_sf-60 (ac4dec.c:2596,2612 ✓).
+   SFREL vs ABSOLUTE differ only by a PER-FRAME scalar (ref_sf vs 100) => identical
+   per-band SHAPE => the carpet shape is spec-exact regardless of law.
+ => CONCLUSION: the 9-13 kHz energy is AUTHENTIC core-coded MDCT content — the encoder
+   spent (few) bits on the HF region, producing coarse noise-like coefficients that a
+   correct decoder faithfully reproduces. The E-AC-3 5.1 "reference" lacks it only
+   because it's a DIFFERENT, darker/rolled-off master. The squeak is in the SOURCE, not
+   a decoder bug. Reducing it = a mastering/psychoacoustic choice (kw_denoise), not a
+   decode fix.
+ - BLUE generalization test (Scott's bet, CONFIRMED): decoded joni_wrap.ac4 through the
+   identical path. Raw-dump high(9-13k)/low ratios: KW quiet-frame 0.34 vs BLUE 0.066
+   (KW ~5x more HF); both show high-band ~independent of music (corr KW +0.47, Blue
+   -0.18). So the HF level is CONTENT-DRIVEN (Kraftwerk electronic >> Joni acoustic),
+   which is exactly why a KW-tuned EQ can't be right for Blue. Rendered blue_raw.wav
+   (same IMDCT+KBD alpha=3.0, ZERO per-track tuning) and sent it.
