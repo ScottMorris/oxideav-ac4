@@ -2810,3 +2810,24 @@ still off. (2) the fixed-freq squeaks - identify (aliasing? window? a specific
 bin). (3) the deep fix is the CORE SFREL LEVEL LAW / spectral tilt (now testable
 against the 0.95 stereo-downmix oracle). Reusable: stereo-downmix ref is the
 oracle to use from now on, not the raw 5.1.
+
+R541 — RESIDUAL ANALYSIS reveals TWO artifacts (Scott's subtract idea + ear).
+Scott on kw_eq: "sounds fade into background when other sounds appear, keyboard
+hits make it wobble, things fade in/out of presence" = PUMPING. On the residual:
+"mostly quiet upper-band + some squeaks." Adaptive coherent subtraction (ours
+minus best-fit reference per band) leaves 73% energy but perceptually the low-mid
+music cancelled and the artifacts remain. Residual spectral analysis:
+1. 49% of residual energy is at 9-13 kHz = the high-band SQUEAK excess (our
+   artifact - doesn't cancel vs ref; matches the 8-12kHz 2.4x tilt).
+2. PERSISTENT tones at EXACT multiples of 23.4 Hz (23,47,70,94,...) in 98% of
+   frames = the AC-4 FRAME RATE (frame_rate_index=13 = 23.44 fps). => the PUMPING
+   is per-frame LEVEL MODULATION at the frame rate (each frame normalised to
+   wrong energy -> sidebands at fr). This is the SFREL/level bug, now with a
+   clear signature.
+Generated spectrograms.png (PIL, no matplotlib/pip in image) - ours/ref/residual;
+sent to Scott. => TWO separate bugs: (A) per-frame LEVEL modulation = pumping
+(the big one, core level law); (B) 9-13 kHz high-band excess = squeaks. Both
+now measurable vs the 0.95 stereo-downmix oracle. R542: test whether the
+ABSOLUTE scalefactor law (restore 2^(0.25*ref_sf) per frame) fixes the pumping
+on the CORRECT stereo decode (R531 rejected it on the 7.1 garbage; re-test now).
+Tools: PIL spectrogram gen; stereo-downmix oracle; adaptive coherent subtraction.
