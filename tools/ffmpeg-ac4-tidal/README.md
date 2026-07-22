@@ -2629,3 +2629,15 @@ Keeps v11_hb's instrument-like character (same clean decode underneath). Sent to
 Scott. NEXT if good: the mids are BOOSTED-but-incomplete (v10f under-decoded
 them); a proper fuller-mid render needs re-running the clean v2_full pipeline
 with wider envelope clip (slow ~1 hr, parallelize) OR real A-SPX for >2 kHz.
+
+R534b — Scott on v13: "the sweeps are better! melody coming through as a haunting
+ghost in the upper freqs but still distant; lower sounds taking shape; sweeps
+sweeping but lost as clean ANALOGUE noise vs digital; has the sweeps but not the
+creeps or the beeps." => direction confirmed strongly. Needs: (1) melody FORWARD
+(mids/upper louder), (2) highband cleaner/more TONAL (sweeps read as tones not
+hiss), (3) the distinct beeps (500 Hz-4 kHz tones) sharper.
+v14 (kw_v14.py): brighter tilt (rising boost toward 2 kHz; mids 12%->16% = ref
+level; bass 83%->75%), + TONAL peak-sharpening of the SBR highband (|mag|^1.8
+normalized -> emphasize peaks over noise floor), + a touch louder highband.
+Spectrum 75/16/2.6/4.9/1.6% vs ref 80/16/1.3/1.6/1.4 (brighter than the dull
+master). No clip, 99% active. Sent for ear check.
