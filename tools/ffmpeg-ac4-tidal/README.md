@@ -2924,3 +2924,16 @@ assumption; I bet Blue needs different tuning"). Verdict: NO missing tool causes
    -0.18). So the HF level is CONTENT-DRIVEN (Kraftwerk electronic >> Joni acoustic),
    which is exactly why a KW-tuned EQ can't be right for Blue. Rendered blue_raw.wav
    (same IMDCT+KBD alpha=3.0, ZERO per-track tuning) and sent it.
+
+R546 — DUMP GOTCHA: probe-duplicated first frame. Scott heard a "pause then catch-up"
+at the start of blue_raw.wav. Cause: AC4_DUMP_SPEC opens the dump in APPEND mode, and
+ffmpeg's avformat_find_stream_info decodes the first frame ONCE to detect params, THEN
+the main pass re-decodes it — so frame[0] is written twice, bit-identical (verified
+frame0==frame1, frame1!=frame2; 300 input subs -> 301 dumped frames). -probesize 32
+-analyzeduration 0 does NOT suppress it. That doubled ~42 ms = the startup stutter, and
+it shifts all downstream alignment by one frame (2048 smp) — likely part of why the KW
+renders needed hand-tuned LAG. The polished KW renders (kw_stereo_render.py:11, kw_best)
+already dropped frame 0 via sp[1:] so they were clean (kw_best frame0/frame1 corr 0.00);
+only the quick blue_raw render exposed it. FIX (standard for all renders): drop leading
+bit-identical dup frame(s): while array_equal(sp[0],sp[1]): sp=sp[1:]. Applied ->
+blue_fixed.wav (300 frames, glitch gone), sent to Scott.
