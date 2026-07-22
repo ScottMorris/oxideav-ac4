@@ -5451,6 +5451,19 @@ static void prepare_channel(AC4DecodeContext *s, int ch)
     spectral_reordering(s, ssch);
     spectral_synthesis(s, ssch);
 
+    /* AC4_DUMP_PCM: core time-domain output AFTER correct short-block IMDCT +
+     * window switching + stereo processing, BEFORE the QMF/A-SPX stages that
+     * muffle the RAWSUB path. frame_len_base new samples per channel per frame;
+     * concatenate per channel to reconstruct. Fixes the transient stutter that
+     * a long-only re-IMDCT of scaled_spec produced on short/transient frames. */
+    if (getenv("AC4_DUMP_PCM")) {
+        FILE *fp = fopen(getenv("AC4_DUMP_PCM"), "ab");
+        if (fp) {
+            fwrite(ssch->pcm, sizeof(float), s->frame_len_base, fp);
+            fclose(fp);
+        }
+    }
+
     qmf_analysis(s, ssch);
 }
 

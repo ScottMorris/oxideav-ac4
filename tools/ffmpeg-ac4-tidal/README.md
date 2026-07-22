@@ -2937,3 +2937,26 @@ already dropped frame 0 via sp[1:] so they were clean (kw_best frame0/frame1 cor
 only the quick blue_raw render exposed it. FIX (standard for all renders): drop leading
 bit-identical dup frame(s): while array_equal(sp[0],sp[1]): sp=sp[1:]. Applied ->
 blue_fixed.wav (300 frames, glitch gone), sent to Scott.
+
+R547 — ★ THE STUTTER IS SHORT/TRANSIENT BLOCKS. Scott: blue_fixed still stutters,
+vocals go "bbbborn nnnn" (flutter on consonant/transient onsets; song ID'd as Joni's
+"Little Green"). Root cause: our render IMDCTs every frame as ONE long 2048 block, but
+AC-4 splits transient frames into short sub-transforms. BODYTRACE long_frame flag:
+BLUE 38/301 (13%) short, KW 295/1410 (21%) short (num_window_groups 2..7). Rendering
+short frames as long = garbled transients = the stutter. Not the dup-frame, not the
+window (TDAC w^2+w_shift^2 = 1.0000 flat, KBD is fine), no periodic dup frames.
+ FIX: use the decoder's OWN transform. spectral_synthesis() (ac4dec.c:5181) already
+ does correct short-block IMDCT + window switching (compute_window handles N/N_prev
+ transitions) and writes time-domain ssch->pcm — AFTER stereo_processing, BEFORE the
+ QMF/A-SPX stages. Added AC4_DUMP_PCM (dumps ssch->pcm, frame_len_base samples/ch/frame
+ right after spectral_synthesis in prepare_channel). Render = just concatenate per ch,
+ NO Python IMDCT, short blocks correct. -> kw_pcm.wav, blue_pcm.wav (crest at short
+ frames DROPS: KW 3.12->2.69, Blue 3.02->2.72 = less aliasing/stutter). Sent both.
+ TRADEOFF / OPEN Q: kw_pcm is DARKER — 8-20kHz kw_best 1.4% (== ref 1.4%) vs kw_pcm
+ 0.5%. The correct synthesis path clips to coded max_sfb (spectral_reordering:4841) and
+ excludes the extra bins our unclipped re-IMDCT rendered. Those extra bins carried BOTH
+ the squeak carpet AND (coincidentally?) matched the reference brightness. Unresolved:
+ is get_max_sfb correct in RAWSUB mode, or is it clipping real HF? If real, kw_pcm is
+ too dark and the squeak+brightness are entangled in the out-of-range bins. NOTE the
+ native full decode (decode_channel->qmf_synthesis) is ALSO dark (Blue 0% >8k) => A-SPX
+ highband is negligible for this content, consistent with sbx~20kHz.
