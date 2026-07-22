@@ -2787,3 +2787,26 @@ kw_stereo.wav (kw_stereo_render.py = spec post-stereo + alpha=3.0 window +
 companding). Sent to Scott. This should lift the muffle + fix the stereo.
 Combined R538+R539 fixes: correct window (alpha 3.0), decoder companding, and
 proper L/R (post stereo-processing).
+
+R540 — STEREO-DOWNMIX REFERENCE = much better oracle (0.95); the muffle is a
+SPECTRAL TILT. Scott: still muffled, "gets quieter when more sound shows up,"
+squeaks at fixed-ish frequencies (digital, not in real track), overtones lost
+above. Findings:
+- Magnitudes are CLEAN on the correct stereo decode (max ~12k, nothing hits the
+  1e6 clamp) => the inverting-clamp is INACTIVE and there are NO HF magnitude
+  blow-ups. The squeaks are NOT blow-ups (likely aliasing/fixed tones - TBD).
+- Scott's idea: downmix the 5.1 ref to STEREO (ITU: L'=L+.707C+.707Ls etc).
+  Result: band-corr with our decode 0.948 (vs 0.83 for 5.1) - a MUCH better
+  oracle. Best global lag 769 samp (16 ms).
+- The tilt problem (ours vs stereo-downmix): 3-5 kHz = 0.54x (MISSING mids = the
+  MUFFLE); 8-12 kHz = 2.4x (EXCESS = harsh/squeaks ON TOP of real keyboards);
+  1.5-3 kHz = 0.70x. So the SFREL level law gets the spectral TILT wrong: too
+  dark in the presence band, too hot at 8-12 kHz.
+FIX: kw_eq.wav = STATIC EQ (one fixed curve, no per-frame clicks) = sqrt(ref/ours)
+per bin, log-smoothed, bounded 0.35..3.0 (keeps keyboards). New balance: 3-5 kHz
+4.7%->7.0% (ref 8.8), 8-12 kHz 25%->15% (ref 10.5). Sent to Scott.
+OPEN: (1) "quieter when more sound" - not the clamp; likely SFREL per-frame level
+still off. (2) the fixed-freq squeaks - identify (aliasing? window? a specific
+bin). (3) the deep fix is the CORE SFREL LEVEL LAW / spectral tilt (now testable
+against the 0.95 stereo-downmix oracle). Reusable: stereo-downmix ref is the
+oracle to use from now on, not the raw 5.1.
