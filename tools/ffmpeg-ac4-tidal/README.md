@@ -2682,3 +2682,23 @@ now native-correct (drop the reference-borrow). (2) enable A-SPX (aspx_data_2ch)
 + ACPL for the true top octave + spatial field. (3) add the channel_mode-6->1
 version-2 remap to the fork so the normal (non-RAWSUB) path decodes IMS. (4)
 RAWSUB=1 is the recipe now, not RAWSUB=6.
+
+R536 — IMS/STEREO FINDING GENERALIZES across all test tracks. Wrapped + decoded
+the other captures as channel_mode 1 (stereo) vs 6 (7.1), core-only:
+  Kraftwerk (kw, 1410f): RAWSUB=1 = 0 fail  | RAWSUB=6 = 526 fail
+  spk (2412f)          : RAWSUB=1 = 0 fail  | RAWSUB=6 = 1313 fail
+  Blue/joni (300f)     : RAWSUB=1 = 0 fail  | RAWSUB=6 = 120 fail
+All three: stereo_codec_mode = 1 (ASPX) on EVERY frame — 2-channel core + high-
+band, NO A-CPL coupling, NO A-JOC objects. => Tidal's AC-4 delivery is uniformly
+2-channel immersive-stereo (a stereo track wearing a 7.1 presentation label);
+the Atmos/surround lives in the E-AC-3+JOC versions, not the AC-4.
+Verification: I-frame marking barely matters with SKIP_ASPX (kw 0.829 correct
+vs 0.823 all-P). kw band-corr vs kw-ref51 = 0.829 (correct decode). spk vs
+spk-ref51 only 0.32 and joni vs the various refs 0.39-0.67 — band-corr is a
+noisy track-matcher and some ref<->dump pairings are uncertain/different masters;
+the DECODES are structurally clean (0 fails) regardless. render_ims.py = generic
+2ch IMDCT+OLA render with self-contained AGC level-smoothing (no reference
+needed). kw_blue.wav (Joni Mitchell "Blue", 12.8s) sent to Scott as a
+cross-genre sanity check. OPEN: the per-frame LEVEL problem is universal (kw IMS
+native jump 0.77 vs ref 0.15, corr -0.04) — NOT a 7.1 artifact; still the main
+audio-quality blocker (pops/stutter). R537: solve the native level normalisation.
