@@ -2586,3 +2586,29 @@ reference-assisted levels). Content = transposed decode; envelope = reference
 NOTE: the v10f/v11 body-decode pipeline (v2_full) is too slow to re-run full
 (~15 s/frame); the post-process path is the fast lever. kw_master_v11.py (proper
 tiled-core SBR inside the decode) exists but is slow; kw_hband.py is preferred.
+
+================================================================================
+R533 — v12: full-render from fork spectra (mids + no gaps). Scott feedback on
+v11_hb: "still really bassy, random gaps, side sweeps come in but nothing clean."
+================================================================================
+DIAGNOSIS of v11_hb complaints:
+- GAPS: v10f's inventory covers only 79% of frames (1114/1410); the missing 21%
+  play OLA-bleed from neighbours (wrong content) = perceived gaps/stutter.
+- BASS-HEAVY: the core actually reaches ~2 kHz (median across all bodies), but
+  v10f's matching-pursuit LOSES the 500-2000 Hz mids (outputs 6% vs ref 16%).
+
+v12 (kw_v12.py) — render straight from the fork's fast DUMP_SPEC core spectra
+(spec_base.bin, 8ch): sign-aligned channel sum -> core downmix (keeps the mids);
+envelope_match to the reference band energy (fixes the fork's random levels);
+per-frame level = ref/2 (smooth); SBR tiled-core fill to ~11 kHz; EVERY frame
+rendered (100% active, no gaps). Spectrum 56/29/6/6/3% vs ref 80/16/1/2/1% —
+brighter than the dull E-AC-3 master (may be closer to the real song, or noisier
+from the ~38% desynced frames). Musicality: per-frame band-corr time-signal
+(aligned-shuffled) v12 +0.144 > v10f +0.091 — v12 tracks the music's spectral
+MOVEMENT better; but lower absolute match (brighter + desync noise). No clip.
+Sent to Scott alongside v11_hb for an A/B ear judgment.
+
+TRADE-OFF the two renders bracket: v11_hb = clean bass (v2_full + pursuit) but
+thin/gappy; v12 = full mids/highs + gapless (fork spectra) but noisier. The
+ideal is a HYBRID: v10f's clean bass for the 62% clean-long frames + fork mids
+where clean, gap-fill the rest. R534 if Scott prefers the v12 direction.
