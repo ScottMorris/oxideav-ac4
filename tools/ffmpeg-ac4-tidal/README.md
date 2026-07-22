@@ -2848,3 +2848,21 @@ absolute level. This is THE last major bug. Remaining polish: (1) combine with
 the static EQ tilt fix (kw_eq) for the muffle; (2) the 9-13kHz squeak excess.
 NEXT: fold ABSOLUTE law into the fork properly + combine with EQ for the final
 render.
+
+R543 — COMPLETE RENDER (kw_best.wav) = all fixes combined. Scott's spectrogram
+read confirmed the diagnoses: (a) bass DUCKS under sweeps in AC-4 but stays even
+in E-AC-3 = the PUMPING (level law), fixed by ABSOLUTE law; (b) ~10 kHz "cutoff
+line" = the core content natural rolloff (95% energy <11 kHz; keyboards stack
+vertically right at that edge); (c) fixed-freq artifacts everywhere = the level
+modulation. Made pumping_fix.png (before/after spectrogram showing the bass
+holding under the absolute law). kw_best.wav pipeline (kw_stereo_render pattern):
+1. RAWSUB=1 immersive-stereo decode (not 7.1);
+2. DUMP_SPEC AFTER stereo_processing (proper M/S->L/R);
+3. ABSOLUTE level law: scaled_spec *= 2^(0.25*(ref_sf-median)) per frame/ch;
+4. IMDCT with KBD alpha=3.0 + KBD OLA;
+5. static tilt EQ toward the 0.95 stereo-downmix reference (bounded 0.35-3.0).
+Sent to Scott as the culmination. THE JOURNEY (this session): the entire "hard
+decoder problem" was ONE wrong assumption (7.1 vs immersive-stereo, R535); once
+corrected, everything fell out - all frames decode, full band, and the level law
+(R542), window+M/S (R538-539), and companding all became clean fixes. Remaining
+polish: the 9-13 kHz squeak excess (residual) if it persists.
