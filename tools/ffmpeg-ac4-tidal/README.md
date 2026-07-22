@@ -2612,3 +2612,20 @@ TRADE-OFF the two renders bracket: v11_hb = clean bass (v2_full + pursuit) but
 thin/gappy; v12 = full mids/highs + gapless (fork spectra) but noisier. The
 ideal is a HYBRID: v10f's clean bass for the 62% clean-long frames + fork mids
 where clean, gap-fill the rest. R534 if Scott prefers the v12 direction.
+
+R533b — Scott A/B verdict: v11_hb "sounds like actual instruments / the song";
+v12 (fork spectra) "is all digital noise, loosely organized clicks/frequencies,
+couldn't guess the song." => the CLEAN v2_full body decode (v10f/v11_hb) is the
+only path that yields recognizable audio; the FORK core decode is too corrupted
+(level randomness + 38% desync) to render musically. ABANDON the fork-spectra
+render direction. Stay on v10f + post-process.
+
+R534 — v13 (kw_hband2.py): improve v11_hb per the feedback (still bassy + gaps).
+FAST post-process of kw_stereo_v10f.wav: (1) REBALANCE each STFT frame's lowband
+toward the reference band SHAPE -> mids 500-2 kHz 5.8% -> 12.0% (ref 15.9%),
+bass 94% -> 82.9% (ref 79.7%); (2) SBR highband to 11 kHz; (3) GAP FILL: hold
+silent frames from neighbours at 0.6x -> 99% active. No clip, loudness jump 0.19.
+Keeps v11_hb's instrument-like character (same clean decode underneath). Sent to
+Scott. NEXT if good: the mids are BOOSTED-but-incomplete (v10f under-decoded
+them); a proper fuller-mid render needs re-running the clean v2_full pipeline
+with wider envelope clip (slow ~1 hr, parallelize) OR real A-SPX for >2 kHz.
